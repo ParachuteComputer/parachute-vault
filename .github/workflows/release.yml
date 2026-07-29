@@ -1,46 +1,142 @@
-# Release workflow — triggered by pushing a semver tag.
+# Release workflow — publishes on merge to main, and on an explicit tag push.
 #
-# Tag conventions (matches governance rule 2 — https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md):
-#   - rc:     v<X>.<Y>.<Z>-rc.<N>   (e.g. v0.4.8-rc.7)
-#   - stable: v<X>.<Y>.<Z>          (e.g. v0.4.8)
+# ## Why this changed (2026-07-29)
 #
-# Release flow:
-#   1. Code-touching PR merges to main, bumping `version` in package.json
-#      (rc.N → rc.N+1 for the rc chain; or drop -rc.N suffix for stable).
-#   2. After merge, push a matching tag:
-#        git tag v$(grep '"version"' package.json | cut -d'"' -f4) && git push --tags
-#   3. CI runs tests, then publishes to npm (with provenance attestation,
-#      dist-tag = rc or latest).
+# This used to be tag-only: merge the PR, then remember to `git tag && git
+# push`. The tag push was the release signal. In practice the remembering is
+# the weak link — four PRs merged in one session with no tags pushed, so
+# nothing published, and the operator only discovered it when asking why their
+# box didn't have the changes. A release step that is easy to forget is a
+# release step that gets forgotten.
 #
-# Operator setup (one-time):
+# Governance rule 2 already requires that every code-touching PR bump `version`
+# in package.json. So **package.json's version IS the per-PR release intent** —
+# the tag was a second, manual, forgettable copy of a decision the PR had
+# already made. This workflow acts on the version directly.
+#
+# ## The trap this deliberately avoids
+#
+# The obvious alternative — a workflow that pushes a tag on merge, letting the
+# existing tag trigger fire — does NOT work. Per GitHub's documented rule,
+# "events triggered by the GITHUB_TOKEN will not create a new workflow run"
+# (only workflow_dispatch and repository_dispatch are exceptions). You would
+# get tags with no releases. Collapsing tag-and-publish into ONE workflow
+# sidesteps the recursion problem entirely: nothing needs to trigger anything.
+#
+# ## Safety properties
+#
+#   - **Idempotent.** Publishing is skipped when that exact version already
+#     exists on npm. Re-running, a revert, or a merge that didn't bump the
+#     version is a no-op — it cannot double-publish.
+#   - **Gated.** The full typecheck + test suite must pass first, unchanged.
+#   - **main only.** Other branches never publish.
+#   - **rc vs stable stays a human decision.** The dist-tag is derived from the
+#     version string, so promoting to `latest` still requires someone to
+#     deliberately drop the `-rc.N` suffix in a PR.
+#   - The tag is still created, as a RECORD of what shipped. Nothing triggers
+#     off it any more, so GITHUB_TOKEN pushing it is fine.
+#
+# The manual tag path still works and is unchanged — push `v0.7.5-rc.4` and it
+# publishes exactly as before. Useful for re-releasing, or for a version that
+# landed before this workflow existed.
+#
+# ## Operator setup (one-time, unchanged)
+#
 #   - npmjs.com → package @openparachute/vault → Settings → Trusted Publishers
-#     → "Add a new publisher" → GitHub Actions
-#       org=ParachuteComputer, repo=parachute-vault, workflow=release.yml,
-#       environment=(blank)
-#   - No NPM_TOKEN secret needed — the workflow uses OIDC (Trusted Publishing).
+#     → GitHub Actions: org=ParachuteComputer, repo=parachute-vault,
+#       workflow=release.yml, environment=(blank)
+#   - No NPM_TOKEN secret — OIDC Trusted Publishing.
 #
-# Why tag-triggered (not push-to-main):
-#   - tag = explicit release signal; main commits without a tag don't publish.
-#   - Preserves a deliberate gate (you push the tag when you mean to ship).
-#   - Tag-as-canonical means the tag itself is the audit trail of what was
-#     released and when.
+#   NOTE: the trusted-publisher rule is pinned to the WORKFLOW FILENAME. That
+#   is why this logic lives in release.yml rather than a new file — a separate
+#   workflow would fail to publish with a 403 no matter how correct it was.
 
 name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+  # Manual re-run, e.g. after a transient npm failure.
+  workflow_dispatch:
 
 concurrency:
-  # Don't let two releases race on the same tag.
+  # Don't let two releases race. Keyed on ref so a tag push and a main push
+  # don't block each other spuriously.
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Decide whether there is anything to publish, BEFORE spending a test run.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      should_publish: ${{ steps.decide.outputs.should_publish }}
+      dist_tag: ${{ steps.decide.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3
+      - id: decide
+        name: compare package.json version against npm
+        run: |
+          set -euo pipefail
+          VERSION=$(bun -e "console.log(require('./package.json').version)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # rc vs stable is derived from the version string itself, so
+          # promoting to `latest` stays a deliberate act in a PR.
+          if [[ "$VERSION" =~ -rc\. ]]; then
+            echo "dist_tag=rc" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+          # A tag push is an explicit "release this" — honour it. npm will
+          # refuse a true duplicate, which is the correct failure.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::package.json version ($VERSION) doesn't match tag ($TAG_VERSION)"
+              exit 1
+            fi
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "Tag push for $VERSION — publishing."
+            exit 0
+          fi
+
+          # Branch push: publish only if this exact version isn't on npm yet.
+          # The REGISTRY is the source of truth rather than the tag list —
+          # what matters is whether the artifact exists, not whether anyone
+          # remembered to record it.
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://registry.npmjs.org/@openparachute%2fvault/$VERSION" || echo "000")
+          if [ "$CODE" = "200" ]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "@openparachute/vault@$VERSION is already published — nothing to do."
+          elif [ "$CODE" = "404" ]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "@openparachute/vault@$VERSION is not on npm — will publish."
+          else
+            # Anything else (network blip, registry 5xx) is ambiguous. Refuse
+            # rather than guess: a false "not published" would double-publish,
+            # and a false "published" would silently skip a real release.
+            echo "::error::couldn't determine whether $VERSION is published (HTTP $CODE) — refusing to guess"
+            exit 1
+          fi
+
   test:
     name: test
+    needs: plan
+    if: needs.plan.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -60,10 +156,13 @@ jobs:
 
   publish-npm:
     name: publish to npm
-    needs: test
+    needs: [plan, test]
+    if: needs.plan.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # `contents: write` so the post-publish tag can be pushed. Nothing
+      # triggers off that tag — it's a record — so GITHUB_TOKEN is fine.
+      contents: write
       # Required for npm provenance attestation + Trusted Publishing OIDC.
       id-token: write
     steps:
@@ -80,29 +179,31 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - name: install deps
         run: bun install --frozen-lockfile
-      - name: verify package.json version matches tag
-        # Defense against tag-vs-package.json drift. If they don't match,
-        # we'd publish under the wrong version.
-        run: |
-          PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::package.json version ($PKG_VERSION) doesn't match tag ($TAG_VERSION)"
-            exit 1
-          fi
       - name: publish
         # Trusted Publishing: npm verifies the OIDC token from this workflow
         # against the package's configured trusted publisher rule
         # (org=ParachuteComputer, repo=parachute-vault, workflow=release.yml).
-        # No NPM_TOKEN secret needed; `id-token: write` permission above
-        # makes the OIDC token available to npm CLI.
+        # No NPM_TOKEN secret needed; `id-token: write` above makes the OIDC
+        # token available to the npm CLI.
         run: |
-          # Detect rc vs stable from tag name. Tag pattern in `on:` above
-          # enforces the shape, so this is just disambiguation.
-          if [[ "$GITHUB_REF_NAME" =~ -rc\. ]]; then
-            DIST_TAG=rc
+          echo "publishing @openparachute/vault@${{ needs.plan.outputs.version }} with dist-tag=${{ needs.plan.outputs.dist_tag }}"
+          npm publish --tag "${{ needs.plan.outputs.dist_tag }}" --access public --provenance
+
+      - name: tag the released commit
+        # A RECORD of what shipped, not a trigger. Best-effort by design: a
+        # failure here must not fail a release that already succeeded on npm.
+        # The artifact is published; re-running would just hit the idempotency
+        # check in `plan` and do nothing.
+        if: github.ref_type != 'tag'
+        continue-on-error: true
+        run: |
+          TAG="v${{ needs.plan.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already exists — leaving it alone"
           else
-            DIST_TAG=latest
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "tagged $TAG"
           fi
-          echo "publishing with dist-tag=$DIST_TAG"
-          npm publish --tag "$DIST_TAG" --access public --provenance
