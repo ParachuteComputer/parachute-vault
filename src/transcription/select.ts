@@ -13,8 +13,8 @@
  * The active provider is chosen by the `TRANSCRIPTION_PROVIDER` env var
  * (persisted in `~/.parachute/vault/.env`), resolved here so the worker boot
  * (`server.ts`) and the capability flag (`capability.ts`) agree on one source
- * of truth. Unset ⇒ `scribe-http`, so no config change means no behavior
- * change.
+ * of truth. Unset ⇒ `whisper-cpp` UNLESS a scribe is actually reachable, in
+ * which case `scribe-http` (see `resolveTranscriptionProviderName`).
  *
  * The `transcribe-cli` binary, GGUF model, and runtime shared libraries live
  * under `$PARACHUTE_HOME/transcription/` (parallel to the vault's other
@@ -30,6 +30,7 @@ import { join } from "path";
 import { homedir } from "os";
 import { existsSync, readFileSync } from "fs";
 import { DEFAULT_MODEL_ID } from "./models.ts";
+import { resolveScribeUrl } from "../scribe-discovery.ts";
 
 export const TRANSCRIPTION_PROVIDERS = [
   "whisper-cpp",
@@ -54,34 +55,65 @@ export type TranscriptionProviderName = (typeof TRANSCRIPTION_PROVIDERS)[number]
 export const DEFAULT_PARAKEET_MLX_MODEL = "mlx-community/parakeet-tdt-0.6b-v3";
 export const DEFAULT_ONNX_ASR_MODEL = "nemo-parakeet-tdt-0.6b-v3";
 
+/** Injection seam: "is a scribe actually reachable from here?" */
+export interface ProviderResolveDeps {
+  scribeConfiguredImpl?: () => boolean;
+}
+
+/**
+ * The default provider when nothing is configured.
+ *
+ * This used to be an unconditional `scribe-http`, which was the wrong default
+ * the moment scribe stopped shipping: a fresh box resolved to a provider with
+ * no backend, so it accepted audio and transcribed nothing (vault#643 made that
+ * visible; it did not make it correct). `whisper-cpp` is the right default —
+ * it's local, and `transcription install` now installs a binary + model and
+ * verifies a real transcription before claiming success (vault#636), which is
+ * the precondition this flip was waiting on.
+ *
+ * But flipping unconditionally would break the boxes that DO have a working
+ * scribe: their config is the absence of config, so "unset" can't be read as
+ * "wants local". So the default asks whether a scribe is actually reachable —
+ * the same `SCRIBE_URL`-then-`services.json` resolution the provider itself
+ * uses — and defers to it when one is. A working box keeps working; a box with
+ * nothing gets the provider it can actually install.
+ *
+ * Deliberately NOT a migration that writes `TRANSCRIPTION_PROVIDER` to `.env`:
+ * pinning a value at upgrade time would freeze whichever answer was true that
+ * day, and an operator who later removes scribe would stay pinned to a dead
+ * provider — the exact failure being fixed here.
+ */
+function defaultProviderName(
+  env: NodeJS.ProcessEnv,
+  deps: ProviderResolveDeps,
+): TranscriptionProviderName {
+  const scribeConfigured =
+    deps.scribeConfiguredImpl ?? (() => resolveScribeUrl(env, undefined, { warn: undefined }) !== undefined);
+  return scribeConfigured() ? "scribe-http" : "whisper-cpp";
+}
+
 /**
  * Resolve the configured provider name. `TRANSCRIPTION_PROVIDER` selects it;
- * unset (or blank) ⇒ `scribe-http`. An unrecognized value warns once and falls
- * back rather than failing boot — a typo shouldn't take transcription offline
- * hard.
- *
- * NOTE on the default: `scribe-http` remains the fallback for now because
- * flipping it is a separate, riskier change — see the `whisper-cpp` entry in
- * `models.ts`. On a box with nothing configured, `scribe-http` with no
- * SCRIBE_URL means transcription doesn't run at all, which vault#643 now
- * reports honestly instead of silently skipping. Making `whisper-cpp` the
- * default is the follow-up, once `transcription install` can guarantee a
- * runnable binary + model.
+ * unset (or blank) ⇒ {@link defaultProviderName}. An unrecognized value warns
+ * once and falls back rather than failing boot — a typo shouldn't take
+ * transcription offline hard.
  */
 export function resolveTranscriptionProviderName(
   env: NodeJS.ProcessEnv = process.env,
   logger: { warn?: (...args: unknown[]) => void } = console,
+  deps: ProviderResolveDeps = {},
 ): TranscriptionProviderName {
   const raw = env.TRANSCRIPTION_PROVIDER?.trim();
-  if (!raw) return "scribe-http";
+  if (!raw) return defaultProviderName(env, deps);
   if ((TRANSCRIPTION_PROVIDERS as readonly string[]).includes(raw)) {
     return raw as TranscriptionProviderName;
   }
+  const fallback = defaultProviderName(env, deps);
   logger.warn?.(
-    `[transcribe] unknown TRANSCRIPTION_PROVIDER="${raw}" — falling back to scribe-http. ` +
+    `[transcribe] unknown TRANSCRIPTION_PROVIDER="${raw}" — falling back to ${fallback}. ` +
       `Valid values: ${TRANSCRIPTION_PROVIDERS.join(", ")}.`,
   );
-  return "scribe-http";
+  return fallback;
 }
 
 /** The ecosystem root (shared with `config.ts`'s `configDirPath`), per-call so
