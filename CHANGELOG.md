@@ -4,6 +4,28 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.5-rc.6] - 2026-07-29
+
+**The admin SPA no longer tells a signed-in operator they're signed out (#642).**
+
+Found live: a box whose scope-guard couldn't reach its revocation list rejected
+every hub-issued JWT with `revocation_unavailable`. Vault's routes map that 401
+straight to `SignInBanner`, so a fully-signed-in operator was told **"You're not
+signed in to the hub."** Signing in again could never help — and the recovery
+poll made it worse, because it tested the token MINT (which worked fine) rather
+than the request that was failing: mint ok → reload → 401 → banner → mint ok →
+… every five seconds, forever.
+
+The banner now probes the mint before it commits to any copy. A mint that
+succeeds *proves* the session is fine, so the failure gets named for what it is
+— the server rejecting a token we can obtain on demand — the server's own
+message is shown verbatim (the only written record of the cause), the useless
+sign-in CTA is dropped, and the retry backs off to 30s since only the server
+healing can change the outcome. A genuinely signed-out operator sees exactly
+what they saw before, including the 5s recovery poll.
+
+Pairs with `@openparachute/scope-guard` 0.5.1, which fixes the underlying
+revocation-origin hairpin that produced the 401.
 ## [0.7.5-rc.5] - 2026-07-29
 
 **`transcription install` now produces a setup that works — and proves it.**

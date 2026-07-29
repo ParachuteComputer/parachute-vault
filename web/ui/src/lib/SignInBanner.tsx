@@ -39,10 +39,35 @@
  * background tab doesn't spam the hub once a minute for a session that
  * may never materialize. The poll resumes on `visibilitychange`.
  */
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { ensureToken } from "./auth.ts";
 
 const POLL_INTERVAL_MS = 5000;
+
+/**
+ * Retry cadence for the `token-rejected` case. Deliberately slow: nothing the
+ * SPA does can fix a server-side rejection, so this is a "has the server come
+ * back?" check, not a recovery loop. See `Diagnosis`.
+ */
+const REJECTED_RETRY_INTERVAL_MS = 30_000;
+
+/**
+ * What actually went wrong, as opposed to what the HTTP status suggests.
+ *
+ *   - `probing`        — we haven't asked yet. Render neutral copy.
+ *   - `signed-out`     — the token mint fails too. The operator really does
+ *                        need to sign in; the sign-in CTA is correct.
+ *   - `token-rejected` — the token mint SUCCEEDS, but the API still 401s. The
+ *                        operator is signed in; the resource server is
+ *                        refusing a token we can obtain on demand.
+ *
+ * vault#642: everything used to be rendered as `signed-out`. On a box whose
+ * scope-guard couldn't reach its revocation list, the vault rejected every
+ * hub-issued JWT — and this banner told a fully-signed-in operator they
+ * weren't signed in, then looped forever, because its recovery poll tested
+ * the MINT (which worked) rather than the request that was failing.
+ */
+type Diagnosis = "probing" | "signed-out" | "token-rejected";
 
 export interface SignInBannerProps {
   /** Vault name for the default per-vault poll (`ensureToken(vaultName)`).
@@ -69,18 +94,63 @@ export interface SignInBannerProps {
   status?: number | null;
   /** Called when the poll succeeds. Parent re-fires its data load. */
   onRecovered: () => void;
+  /**
+   * The failing response's message, when the caller has one. Shown verbatim in
+   * the `token-rejected` state — it's the only place the real cause (e.g.
+   * "revocation list unavailable") is written down, and swallowing it is what
+   * made the original incident undiagnosable from the UI.
+   */
+  serverMessage?: string;
 }
 
-export function SignInBanner({ vaultName, status, onRecovered, ensure }: SignInBannerProps) {
+export function SignInBanner({
+  vaultName,
+  status,
+  onRecovered,
+  ensure,
+  serverMessage,
+}: SignInBannerProps) {
   // A 403 (`not_admin`) can never recover for this session — the operator is
   // signed in but isn't the hub admin. Polling would re-mint forever with no
   // payoff, so we don't start the poll at all. See vault#451.
   const isForbidden = status === 403;
 
+  // Which failure are we actually looking at? See `Diagnosis` + vault#642.
+  const [diagnosis, setDiagnosis] = useState<Diagnosis>("probing");
+
+  // Probe once on mount: can we mint a token at all?
+  //
+  // This is the whole fix. A mint that SUCCEEDS proves the operator's hub
+  // session is fine, which means the 401 that put this banner on screen came
+  // from the resource server rejecting a token we can happily obtain — not
+  // from being signed out. Telling them to sign in is then both false and
+  // useless.
   useEffect(() => {
     if (isForbidden) return;
     let cancelled = false;
+    void (async () => {
+      const result = await (ensure ? ensure() : ensureToken(vaultName ?? ""));
+      if (cancelled) return;
+      setDiagnosis(result.kind === "ok" ? "token-rejected" : "signed-out");
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultName, ensure, isForbidden]);
+
+  useEffect(() => {
+    if (isForbidden || diagnosis === "probing") return;
+    let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+
+    // When the mint works but the API still 401s, re-minting can never change
+    // the outcome — only the SERVER healing can. Retrying the parent's load on
+    // the sign-in cadence is what produced the 5-second infinite loop this
+    // banner used to spin in: mint ok → onRecovered() → parent reloads → 401 →
+    // banner → mint ok → … Back off hard, and retry the LOAD rather than the
+    // mint, since the load is the thing that might start working.
+    const interval =
+      diagnosis === "token-rejected" ? REJECTED_RETRY_INTERVAL_MS : POLL_INTERVAL_MS;
 
     const poll = async () => {
       if (cancelled) return;
@@ -93,13 +163,21 @@ export function SignInBanner({ vaultName, status, onRecovered, ensure }: SignInB
       if (typeof document !== "undefined" && document.visibilityState !== "visible") {
         return;
       }
+      if (diagnosis === "token-rejected") {
+        // Ask the parent to retry its data load. If the server has recovered
+        // it succeeds and this banner unmounts; if not, we come back here and
+        // wait another full interval.
+        onRecovered();
+        timer = setTimeout(() => void poll(), interval);
+        return;
+      }
       const result = await (ensure ? ensure() : ensureToken(vaultName ?? ""));
       if (cancelled) return;
       if (result.kind === "ok") {
         onRecovered();
         return;
       }
-      timer = setTimeout(() => void poll(), POLL_INTERVAL_MS);
+      timer = setTimeout(() => void poll(), interval);
     };
 
     // Fire a single tick on resume so a tab that returns from background
@@ -126,7 +204,10 @@ export function SignInBanner({ vaultName, status, onRecovered, ensure }: SignInB
         document.removeEventListener("visibilitychange", onVisibility);
       }
     };
-  }, [vaultName, onRecovered, isForbidden, ensure]);
+    // `diagnosis` is load-bearing here: without it the effect closes over the
+    // initial "probing" value, returns early forever, and NO poll is ever
+    // scheduled — neither the sign-in recovery nor the server-healed retry.
+  }, [vaultName, onRecovered, isForbidden, ensure, diagnosis]);
 
   // 403: signed in but not the hub admin. Don't offer sign-in (it loops);
   // point them at their account home instead. No auto-refresh — this state
@@ -145,12 +226,57 @@ export function SignInBanner({ vaultName, status, onRecovered, ensure }: SignInB
     );
   }
 
+  // The mint works, so the operator IS signed in — the vault is refusing a
+  // token we can obtain on demand. Offering a sign-in link here is worse than
+  // useless: it's false, and following it lands them right back here. Say what
+  // actually happened and surface the server's own reason, which is the only
+  // written record of the cause.
+  if (diagnosis === "token-rejected") {
+    return (
+      <div className="warn-banner" role="status">
+        <p style={{ margin: "0 0 0.5rem" }}>
+          <strong>You're signed in, but this vault rejected the request.</strong>{" "}
+          That's a problem on the server, not with your session — signing in
+          again won't change it.
+        </p>
+        {serverMessage ? (
+          <p
+            className="dim"
+            style={{
+              margin: "0 0 0.5rem",
+              fontSize: "0.85rem",
+              fontFamily: "var(--mono, monospace)",
+            }}
+          >
+            {serverMessage}
+          </p>
+        ) : null}
+        <p className="dim" style={{ margin: 0, fontSize: "0.85rem" }}>
+          Retrying every 30 seconds. If it persists, check the vault's logs —
+          this usually means the vault can't reach the hub it validates tokens
+          against.
+        </p>
+      </div>
+    );
+  }
+
   const next = composeNext();
   const loginHref = `/login?next=${encodeURIComponent(next)}`;
   const headline =
     status === 404
       ? "This hub doesn't host a vault by that name."
       : "You're not signed in to the hub.";
+
+  // `probing` renders the sign-in copy WITHOUT the claim that you're signed
+  // out — one tick, and guessing wrong in that tick is what this whole change
+  // is about.
+  if (diagnosis === "probing") {
+    return (
+      <div className="warn-banner" role="status">
+        <p style={{ margin: 0 }}>Checking your session…</p>
+      </div>
+    );
+  }
 
   return (
     <div className="warn-banner" role="status">

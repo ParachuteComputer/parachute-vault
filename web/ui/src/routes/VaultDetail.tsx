@@ -21,7 +21,7 @@ import { McpConnectCard } from "./McpConnectCard.tsx";
 type State =
   | { kind: "loading" }
   | { kind: "ok"; vault: VaultDetailResult }
-  | { kind: "auth-required"; status: number | null }
+  | { kind: "auth-required"; status: number | null; message?: string }
   | { kind: "missing" }
   | { kind: "error"; message: string };
 
@@ -60,7 +60,11 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
         if (cancelled) return;
         if (err instanceof HttpError) {
           if (err.status === 401 || err.status === 403) {
-            setState({ kind: "auth-required", status: err.status });
+            // Carry the server's message through. On a 401 whose real cause is
+            // server-side (vault#642 — e.g. "revocation list unavailable"),
+            // this string is the only written record of what went wrong, and
+            // the banner shows it rather than guessing "you're signed out".
+            setState({ kind: "auth-required", status: err.status, message: err.message });
             return;
           }
           if (err.status === 404) {
@@ -93,7 +97,12 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
         <h2>
           Vault <code>{name}</code>
         </h2>
-        <SignInBanner vaultName={name ?? ""} status={state.status} onRecovered={onRecovered} />
+        <SignInBanner
+          vaultName={name ?? ""}
+          status={state.status}
+          serverMessage={state.message}
+          onRecovered={onRecovered}
+        />
         {isPerVaultMount ? null : <Link to="/">← Back to vaults</Link>}
       </div>
     );
