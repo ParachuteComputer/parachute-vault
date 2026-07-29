@@ -18,9 +18,10 @@
  *   - Creates a temp dir (`os.tmpdir() + /parachute-import-<rand>`).
  *   - Resolves the authed clone URL (stored credentials, supplied per-call
  *     PAT, or none).
- *   - Shells `git clone --depth 1 <authedUrl> <tempDir>` with a 60s
- *     timeout and `GIT_TERMINAL_PROMPT=0` so bad credentials fail fast
- *     rather than blocking on a stdin prompt.
+ *   - Shells `git clone --depth 1 --progress <authedUrl> <tempDir>` with
+ *     `GIT_TERMINAL_PROMPT=0` so bad credentials fail fast rather than
+ *     blocking on a stdin prompt. Bounded by a STALL timeout (no progress
+ *     output for 10 min), not a wall-clock one — see `cloneTimeoutMs`.
  *   - Validates the clone looks like a vault export — `.parachute/vault.yaml`
  *     must be present. Refuses with a clear error otherwise.
  *   - On `mode: "replace"`: wipes notes + tags via `store.deleteNote()` /
@@ -128,13 +129,58 @@ export interface ImportOpts {
   spawn?: GitSpawn;
   /** Override the post-clone import path (test seam — assume cloned dir is a vault export). */
   importer?: typeof importPortableVault;
-  /** Override the clone timeout (default 60s; test seam to shorten). */
+  /**
+   * Absolute wall-clock cap on the clone. **Defaults to 0 — disabled.**
+   *
+   * This used to default to 60s, which is why importing any vault bigger than
+   * a demo failed with "git clone timed out after 60s" (vault#640). A clone's
+   * duration is a function of vault size and link speed; there is no honest
+   * wall-clock number that fits both a 200-note vault and a 40k-note one. The
+   * bound that actually distinguishes "big" from "broken" is
+   * `cloneStallTimeoutMs` below. Tests set this to force the timeout branch.
+   */
   cloneTimeoutMs?: number;
+  /**
+   * How long the clone may emit NO progress output before we call it wedged.
+   * Defaults to `DEFAULT_CLONE_STALL_TIMEOUT_MS` (10 min); `0` disables.
+   */
+  cloneStallTimeoutMs?: number;
+  /**
+   * Progress sink. Called as the import moves between stages and as git
+   * reports clone progress. The job registry wires this to the record the
+   * status endpoint serves; direct callers can omit it.
+   */
+  onProgress?: (update: ImportProgress) => void;
   /**
    * Override the git-presence probe (test seam — defaults to `Bun.which`).
    * Inject a fn returning `null` to exercise the git-not-installed path.
    */
   which?: (cmd: string) => string | null;
+}
+
+/**
+ * Default stall bound: ten minutes of total silence from `git clone`.
+ *
+ * Sized off what git actually does — with `--progress` it repaints the
+ * counter every few hundred milliseconds while it's moving, so ten minutes of
+ * nothing means the transfer is dead, not slow. Generous enough to cover a
+ * remote that's slow to enumerate objects on a very large repo before the
+ * first byte lands.
+ */
+export const DEFAULT_CLONE_STALL_TIMEOUT_MS = 10 * 60_000;
+
+/** Coarse stage the import is in. Drives the SPA's progress copy. */
+export type ImportStage = "cloning" | "importing" | "syncing";
+
+/** A progress tick handed to `ImportOpts.onProgress`. */
+export interface ImportProgress {
+  stage: ImportStage;
+  /**
+   * Human-readable detail for the current stage — for `cloning` this is the
+   * most recent `git --progress` line ("Receiving objects:  47% …").
+   * Absent when the stage has no finer detail to report.
+   */
+  detail?: string;
 }
 
 /**
@@ -185,13 +231,38 @@ export interface ImportResult {
  */
 export type GitSpawn = (
   argv: string[],
-  options: { cwd?: string; timeoutMs: number },
+  options: GitSpawnOptions,
 ) => Promise<GitSpawnResult>;
+
+export interface GitSpawnOptions {
+  cwd?: string;
+  /**
+   * Wall-clock cap on the whole command. `0` disables it — the default for
+   * clones (see `ImportOpts.cloneTimeoutMs`). Tests pass a small number to
+   * exercise the timeout branch.
+   */
+  timeoutMs: number;
+  /**
+   * Cap on the gap BETWEEN progress lines. This — not `timeoutMs` — is what
+   * bounds a real clone: a 4 GB vault legitimately takes an hour, but a clone
+   * that has emitted nothing for 10 minutes is wedged (dead TCP connection,
+   * auth prompt we failed to suppress, remote hang). `0` disables it.
+   */
+  stallTimeoutMs?: number;
+  /**
+   * Called for each line git writes to stderr, which with `--progress` is
+   * where "Receiving objects:  47% (…)" lands. Drives the job's live progress
+   * detail and resets the stall timer.
+   */
+  onProgress?: (line: string) => void;
+}
 
 export interface GitSpawnResult {
   exitCode: number;
   stderr: string;
   timedOut: boolean;
+  /** True when the kill came from the stall timer rather than `timeoutMs`. */
+  stalled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,8 +415,27 @@ export function authedCloneUrl(
 // ---------------------------------------------------------------------------
 
 /**
- * Run a git command with a hard timeout + non-interactive env. Returns
- * exit code + stderr text + timeout flag.
+ * Run a git command with a non-interactive env, streaming stderr so the
+ * caller sees progress while it runs. Returns exit code + stderr text +
+ * timeout flags.
+ *
+ * **Why stderr is STREAMED, not buffered (vault#640).** The previous
+ * implementation awaited `proc.exited` and only then drained `proc.stderr`.
+ * That made progress structurally unobservable — the import was a black box
+ * until it finished — and it forced the caller to bound the clone with a
+ * wall-clock timeout, because a wedged clone and a slow one look identical
+ * when you can't see output. A 60s cap was the result, and it made vaults
+ * above a few thousand notes simply un-importable.
+ *
+ * Streaming lets us bound the RIGHT thing: the gap between progress lines
+ * (`stallTimeoutMs`). A big clone runs as long as it needs to as long as it's
+ * still moving; a wedged one dies in minutes. `timeoutMs` remains as an
+ * optional absolute ceiling (0 = disabled) mainly so tests can force the
+ * timeout branch deterministically.
+ *
+ * Draining stderr concurrently also fixes a latent deadlock: git blocks
+ * writing to a full stderr pipe, so a clone chatty enough to fill the pipe
+ * buffer would hang forever against the old await-then-read order.
  */
 export const defaultGitSpawn: GitSpawn = async (argv, options) => {
   let proc;
@@ -375,20 +465,74 @@ export const defaultGitSpawn: GitSpawn = async (argv, options) => {
     throw err;
   }
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
+  let stalled = false;
+  const kill = () => {
     try {
       proc.kill();
     } catch {
       // already exited
     }
-  }, options.timeoutMs);
+  };
+
+  const absoluteTimer =
+    options.timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          kill();
+        }, options.timeoutMs)
+      : null;
+
+  // Stall timer — rearmed on every line git emits. This is the real guard.
+  let stallTimer: ReturnType<typeof setTimeout> | null = null;
+  const stallMs = options.stallTimeoutMs ?? 0;
+  const armStall = () => {
+    if (stallMs <= 0) return;
+    if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      stalled = true;
+      timedOut = true;
+      kill();
+    }, stallMs);
+  };
+  armStall();
+
+  // Drain stderr line-by-line. git writes progress with `\r` (carriage
+  // return, no newline) so it can repaint one line in a terminal — split on
+  // BOTH so "Receiving objects: 47%" surfaces as it happens rather than
+  // arriving as one giant line at the end.
+  const collected: string[] = [];
+  let pending = "";
+  const emit = (line: string) => {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) return;
+    collected.push(trimmed);
+    armStall();
+    try {
+      options.onProgress?.(trimmed);
+    } catch {
+      // A throwing progress callback must never take down the clone.
+    }
+  };
+  const drain = (async () => {
+    const decoder = new TextDecoder();
+    for await (const chunk of proc.stderr) {
+      pending += decoder.decode(chunk, { stream: true });
+      const parts = pending.split(/[\r\n]+/);
+      pending = parts.pop() ?? "";
+      for (const part of parts) emit(part);
+    }
+    if (pending.length > 0) emit(pending);
+  })().catch(() => {
+    // Stream errors (killed process mid-read) aren't interesting — the exit
+    // code and the timeout flags already describe what happened.
+  });
+
   const exitCode = await proc.exited;
-  clearTimeout(timer);
-  const stderr = new TextDecoder()
-    .decode(await new Response(proc.stderr).arrayBuffer())
-    .trim();
-  return { exitCode, stderr, timedOut };
+  await drain;
+  if (absoluteTimer) clearTimeout(absoluteTimer);
+  if (stallTimer) clearTimeout(stallTimer);
+
+  return { exitCode, stderr: collected.join("\n").trim(), timedOut, stalled };
 };
 
 // ---------------------------------------------------------------------------
@@ -427,7 +571,12 @@ export async function cloneAndImport(opts: ImportOpts): Promise<ImportResult> {
   const spawn = opts.spawn ?? defaultGitSpawn;
   const importer = opts.importer ?? importPortableVault;
   const workDirRoot = opts.workDirRoot ?? tmpdir();
-  const cloneTimeoutMs = opts.cloneTimeoutMs ?? 60_000;
+  // 0 = no absolute ceiling; the stall bound is the real guard. See the
+  // `cloneTimeoutMs` docstring on ImportOpts for why the old 60s default was
+  // wrong rather than merely too small.
+  const cloneTimeoutMs = opts.cloneTimeoutMs ?? 0;
+  const cloneStallTimeoutMs =
+    opts.cloneStallTimeoutMs ?? DEFAULT_CLONE_STALL_TIMEOUT_MS;
 
   const authResult = authedCloneUrl(opts.remoteUrl, opts.auth, opts.vaultName);
   if (!authResult) {
@@ -440,15 +589,25 @@ export async function cloneAndImport(opts: ImportOpts): Promise<ImportResult> {
 
   const tempDir = mkdtempSync(join(workDirRoot, "parachute-import-"));
   try {
+    opts.onProgress?.({ stage: "cloning" });
     const cloneResult = await spawn(
-      ["git", "clone", "--depth", "1", authedUrl, tempDir],
-      { timeoutMs: cloneTimeoutMs },
+      // `--progress` forces the progress meter even though our stderr is a
+      // pipe, not a tty. Without it git stays silent, the stall timer has
+      // nothing to observe, and the operator watches a spinner with no
+      // information for the length of a multi-GB transfer.
+      ["git", "clone", "--depth", "1", "--progress", authedUrl, tempDir],
+      {
+        timeoutMs: cloneTimeoutMs,
+        stallTimeoutMs: cloneStallTimeoutMs,
+        onProgress: (line) => opts.onProgress?.({ stage: "cloning", detail: line }),
+      },
     );
     if (cloneResult.timedOut) {
-      throw new CloneFailedError(
-        `git clone timed out after ${Math.floor(cloneTimeoutMs / 1000)}s. ` +
-          `Check the network connection or try a shallower remote. URL: ${redactRemoteUrl(opts.remoteUrl)}`,
-      );
+      const why = cloneResult.stalled
+        ? `git clone stalled — no progress for ${Math.floor(cloneStallTimeoutMs / 60_000)} minutes. ` +
+          `The remote stopped responding, or the credential was rejected without an error.`
+        : `git clone exceeded its ${Math.floor(cloneTimeoutMs / 1000)}s limit.`;
+      throw new CloneFailedError(`${why} URL: ${redactRemoteUrl(opts.remoteUrl)}`);
     }
     if (cloneResult.exitCode !== 0) {
       // Redact any leaked URLs in stderr — git error messages echo them.
@@ -469,6 +628,7 @@ export async function cloneAndImport(opts: ImportOpts): Promise<ImportResult> {
     // Delegate to the importer. `blowAway: true` for replace mode triggers
     // the wipe-then-import path (deletes notes via the public store API
     // so hooks fire); `false` for merge does upsert-by-id.
+    opts.onProgress?.({ stage: "importing" });
     const stats: ImportStats = await importer(opts.store, {
       inDir: tempDir,
       blowAway: opts.mode === "replace",

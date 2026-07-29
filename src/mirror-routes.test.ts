@@ -34,6 +34,7 @@ import {
   handleAuthPat,
   handleMirrorGet,
   handleMirrorImport,
+  handleMirrorImportStatus,
   handleMirrorPushNow,
   handleMirrorPut,
   handleMirrorRunNow,
@@ -42,6 +43,7 @@ import {
   _resetImportInFlightForTest,
   type GitSpawn,
 } from "./mirror-import.ts";
+import { _resetImportJobsForTest, type ImportJob } from "./mirror-import-jobs.ts";
 import { writeVaultConfig } from "./config.ts";
 import { clearVaultStoreCache } from "./vault-store.ts";
 import { exportVaultToDir } from "../core/src/portable-md.ts";
@@ -1984,6 +1986,7 @@ describe("handleMirrorImport", () => {
     if (home) fs.rmSync(home, { recursive: true, force: true });
     if (fixture) fs.rmSync(fixture, { recursive: true, force: true });
     _resetImportInFlightForTest();
+    _resetImportJobsForTest();
     clearVaultStoreCache();
   });
 
@@ -2034,6 +2037,7 @@ describe("handleMirrorImport", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/a/b.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "" },
       }),
     });
@@ -2051,6 +2055,7 @@ describe("handleMirrorImport", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/a/b.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "magic" },
       }),
     });
@@ -2069,6 +2074,7 @@ describe("handleMirrorImport", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/a/b.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "none" },
       }),
     });
@@ -2100,6 +2106,7 @@ describe("handleMirrorImport", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/a/b.git",
         mode: "replace",
+        wait: true,
         credentials: { kind: "none" },
       }),
     });
@@ -2121,6 +2128,7 @@ describe("handleMirrorImport", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/a/b.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_secret_xyz" },
       }),
     });
@@ -2143,6 +2151,7 @@ describe("handleMirrorImport", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/a/b.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "none" },
       }),
     });
@@ -2169,6 +2178,7 @@ describe("handleMirrorImport", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/a/b.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "none" },
       }),
     });
@@ -2210,6 +2220,7 @@ describe("handleMirrorImport", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/a/b.git",
         mode: "merge",
+        wait: true,
         credentials: null,
       }),
     });
@@ -2246,6 +2257,7 @@ describe("handleMirrorImport", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/a/b.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_per_call_only" },
       }),
     });
@@ -2272,6 +2284,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
     if (home) fs.rmSync(home, { recursive: true, force: true });
     if (fixture) fs.rmSync(fixture, { recursive: true, force: true });
     _resetImportInFlightForTest();
+    _resetImportJobsForTest();
     clearVaultStoreCache();
   });
 
@@ -2286,6 +2299,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_import_token_abc" },
         enable_sync: true,
       }),
@@ -2330,6 +2344,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_import_token_abc" },
         enable_sync: false,
       }),
@@ -2365,6 +2380,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "none" },
         enable_sync: true,
       }),
@@ -2392,7 +2408,12 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
     expect(readCredentials("default")).toBeNull();
   });
 
-  test("enable_sync defaults to true when omitted", async () => {
+  // vault#641 — the default INVERTED. Import is a read; it must not arm a
+  // write to the source repo unless the operator says so. Pinned as its own
+  // test because the old default (ON, vault#416) was the single most dangerous
+  // thing about this flow: pulling a vault onto a new box silently repointed
+  // backup at the repo you pulled from.
+  test("enable_sync defaults to FALSE when omitted — import never arms push-back on its own", async () => {
     home = tmp("import-sync-default-");
     await bootstrapVault(home);
     fixture = await buildExportFixture();
@@ -2403,8 +2424,44 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
-        credentials: { kind: "pat", token: "ghp_default_on_token" },
-        // enable_sync omitted — should default ON.
+        wait: true,
+        credentials: { kind: "pat", token: "ghp_default_off_token" },
+        // enable_sync omitted — must default OFF.
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      sync_enabled: boolean;
+      sync_warning?: string;
+    };
+    expect(body.sync_enabled).toBe(false);
+    // Not a failure — the operator didn't ask. No scary warning either.
+    expect(body.sync_warning).toBeUndefined();
+    // The decisive assertion: nothing was wired up.
+    expect(readMirrorConfigForVault("default")?.auto_push ?? false).toBe(false);
+  });
+
+  test("enable_sync: true still opts in explicitly", async () => {
+    home = tmp("import-sync-optin-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        wait: true,
+        enable_sync: true,
+        credentials: { kind: "pat", token: "ghp_opt_in_token" },
       }),
     });
     const res = await handleMirrorImport(
@@ -2448,6 +2505,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_import_token_abc" },
         enable_sync: true,
       }),
@@ -2500,6 +2558,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_import_token_abc" },
         enable_sync: true,
       }),
@@ -2555,6 +2614,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_import_token_abc" },
         enable_sync: true,
         override: true,
@@ -2602,6 +2662,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_same_token" },
         enable_sync: true,
       }),
@@ -2650,6 +2711,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_import_token_abc" },
         enable_sync: true,
       }),
@@ -2693,6 +2755,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "pat", token: "ghp_import_token_abc" },
         enable_sync: true,
       }),
@@ -2724,6 +2787,7 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       body: JSON.stringify({
         remote_url: "https://github.com/aaron/my-vault.git",
         mode: "merge",
+        wait: true,
         credentials: { kind: "none" },
         enable_sync: "yes",
       }),
@@ -2768,6 +2832,161 @@ function seedSiblingVault(name: string, originUrl: string): void {
     `[remote "origin"]\n\turl = ${originUrl}\n`,
   );
 }
+
+// ---------------------------------------------------------------------------
+// vault#640 — the ASYNC import transport.
+//
+// The semantic tests above (what gets imported, how sync gets wired, which
+// credential is picked) run through `wait: true`, the back-compat synchronous
+// path. That's deliberate, not laziness: both paths call the SAME `runImport`
+// closure, so transport and semantics are genuinely orthogonal and testing
+// each import behaviour twice would buy nothing. This block covers the part
+// that IS different — the job lifecycle the SPA actually drives.
+// ---------------------------------------------------------------------------
+describe("handleMirrorImport — async job transport (vault#640)", () => {
+  let home: string;
+  let fixture: string;
+
+  afterEach(() => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+    if (fixture) fs.rmSync(fixture, { recursive: true, force: true });
+    _resetImportInFlightForTest();
+    _resetImportJobsForTest();
+    clearVaultStoreCache();
+  });
+
+  /** POST an import, asserting the 202, and hand back the job record. */
+  async function startImport(
+    spawn: GitSpawn,
+    body: Record<string, unknown> = {},
+  ): Promise<ImportJob> {
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: { kind: "none" },
+        ...body,
+      }),
+    });
+    const res = await handleMirrorImport(req, "default", spawn);
+    expect(res.status).toBe(202);
+    return (await res.json()) as ImportJob;
+  }
+
+  /** Poll the status route until the job leaves `running`. */
+  async function pollUntilDone(jobId: string, vault = "default"): Promise<ImportJob> {
+    for (let i = 0; i < 200; i++) {
+      const res = handleMirrorImportStatus(vault, jobId);
+      const job = (await res.json()) as ImportJob;
+      if (job.status !== "running") return job;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("import job never reached a terminal state");
+  }
+
+  test("POST returns 202 with a running job, not the result", async () => {
+    home = tmp("import-async-202-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+
+    const job = await startImport(spawnCloneSuccess(fixture));
+    expect(job.job_id).toBeTruthy();
+    expect(job.status).toBe("running");
+    expect(job.stage).toBe("cloning");
+    expect(job.vault_name).toBe("default");
+
+    await pollUntilDone(job.job_id);
+  });
+
+  test("polling reaches succeeded and carries the import result", async () => {
+    home = tmp("import-async-ok-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+
+    const started = await startImport(spawnCloneSuccess(fixture));
+    const done = await pollUntilDone(started.job_id);
+
+    expect(done.status).toBe("succeeded");
+    expect(done.finished_at).toBeTruthy();
+    expect(done.result?.notes_imported).toBe(2);
+    expect(done.error).toBeUndefined();
+  });
+
+  test("a clone failure lands on the job as clone_failed, with the token redacted", async () => {
+    home = tmp("import-async-fail-");
+    await bootstrapVault(home);
+
+    const started = await startImport(spawnCloneFail, {
+      credentials: { kind: "pat", token: "ghp_secret_xyz" },
+    });
+    const done = await pollUntilDone(started.job_id);
+
+    expect(done.status).toBe("failed");
+    expect(done.error?.error_type).toBe("clone_failed");
+    expect(JSON.stringify(done)).not.toContain("ghp_secret_xyz");
+  });
+
+  test("a second import while one is running → 409 carrying the in-flight job_id", async () => {
+    home = tmp("import-async-conflict-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+
+    const first = await startImport(spawnCloneSuccess(fixture));
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: { kind: "none" },
+      }),
+    });
+    const res = await handleMirrorImport(req, "default", spawnCloneSuccess(fixture));
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error_type: string; job_id?: string };
+    expect(body.error_type).toBe("concurrent_import");
+    // The second tab can attach to the running import instead of being stuck.
+    expect(body.job_id).toBe(first.job_id);
+
+    await pollUntilDone(first.job_id);
+  });
+
+  test("a finished job frees the vault for the next import", async () => {
+    home = tmp("import-async-serial-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+
+    const first = await startImport(spawnCloneSuccess(fixture));
+    await pollUntilDone(first.job_id);
+
+    const second = await startImport(spawnCloneSuccess(fixture));
+    expect(second.job_id).not.toBe(first.job_id);
+    await pollUntilDone(second.job_id);
+  });
+
+  test("status is scoped to the vault — another vault's admin can't read the job", async () => {
+    home = tmp("import-async-scope-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+
+    const started = await startImport(spawnCloneSuccess(fixture));
+    const res = handleMirrorImportStatus("some-other-vault", started.job_id);
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error_type: string };
+    expect(body.error_type).toBe("job_not_found");
+
+    await pollUntilDone(started.job_id);
+  });
+
+  test("unknown job id → 404 job_not_found", async () => {
+    home = tmp("import-async-404-");
+    await bootstrapVault(home);
+    const res = handleMirrorImportStatus("default", "no-such-job");
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error_type: string };
+    expect(body.error_type).toBe("job_not_found");
+  });
+});
 
 describe("cross-vault remote-clobber guard (vault#482)", () => {
   let home: string;

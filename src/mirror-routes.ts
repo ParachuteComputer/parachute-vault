@@ -76,8 +76,17 @@ import {
   cloneAndImport,
   type GitSpawn,
   type ImportAuth,
+  type ImportProgress,
   type ImportResult,
 } from "./mirror-import.ts";
+import {
+  ImportJobConflictError,
+  getImportJob,
+  getRunningImportJob,
+  startImportJob,
+  type ImportJob,
+  type ImportJobError,
+} from "./mirror-import-jobs.ts";
 import { redactToken } from "./export-watch.ts";
 import {
   findConflictingVault,
@@ -1668,12 +1677,24 @@ export async function applyCredentialsToMirror(
 //   - Sync setup throws → import result still returned (success);
 //     `sync_enabled: false` + a warning. Import success is never lost.
 //
-// Response:
-//   200 { notes_imported, tags_imported, attachments_imported,
-//         notes_deleted?, warnings, sync_enabled, sync_warning? }
-//   400 { error, error_type, message }  — validation / not-a-vault-export
-//   409 { error, error_type, message }  — concurrent import for this vault
-//   502 { error, message }              — clone failed (auth, network, …)
+// Response (vault#640 — ASYNC by default):
+//   202 { job_id, vault_name, status, stage, started_at, … }
+//                                       — import started; poll the status route
+//   400 { error, error_type, message }  — validation
+//   409 { error, error_type, message, job_id? }
+//                                       — an import is already running here
+//   503 { error, error_type, message }  — git isn't installed on this box
+//
+// Terminal outcomes (not-a-vault-export, clone failure, import counts) arrive
+// on the JOB record, not this response:
+//   GET /vault/<name>/.parachute/mirror/import/<job_id>
+//     200 { status: "running",   stage, detail? }
+//     200 { status: "succeeded", result: { notes_imported, … } }
+//     200 { status: "failed",    error: { error_type, message } }
+//     404 { error_type: "job_not_found" }
+//
+// `{ "wait": true }` in the POST body restores the old synchronous 200 shape
+// for scripted callers. See the note in the handler.
 //
 // Admin-gated upstream in routing.ts.
 // ---------------------------------------------------------------------------
@@ -1681,10 +1702,13 @@ export async function applyCredentialsToMirror(
 /**
  * `POST /vault/<name>/.parachute/mirror/import`. See block comment above.
  *
- * Synchronous response: imports complete in <30s for typical vaults
- * (a 1k-note vault clones+imports in well under that bound on Aaron's hardware).
- * If/when bigger vaults arrive we promote to async polling — for now the
- * synchronous path keeps the UI flow simple.
+ * Starts a background job and returns 202 immediately. Before vault#640 this
+ * ran the whole clone-and-import inside the request; that could not work for a
+ * real vault, because hub fronts this route with
+ * `Bun.serve({ idleTimeout: 255 })` and kills anything past ~4 minutes
+ * regardless of what vault does. The 60s clone cap the old code carried was a
+ * symptom of the same constraint, and it made every non-trivial vault
+ * un-importable with "git clone timed out after 60s".
  *
  * `spawnOverride` is a test seam: lets the test inject a fake git binary.
  * Production callers omit it; `cloneAndImport` falls back to `defaultGitSpawn`.
@@ -1712,6 +1736,7 @@ export async function handleMirrorImport(
     credentials?: unknown;
     enable_sync?: unknown;
     override?: unknown;
+    wait?: unknown;
   };
   try {
     body = (await req.json()) as Record<string, unknown>;
@@ -1804,10 +1829,22 @@ export async function handleMirrorImport(
     );
   }
 
-  // vault#416: `enable_sync` defaults TRUE when omitted — the default-on UX.
-  // Only a literal `false` opts out; any other type is a validation error so
-  // a malformed body never silently flips the default.
-  let enableSync = true;
+  // `enable_sync` defaults FALSE when omitted (vault#641).
+  //
+  // vault#416 shipped this default-ON: importing a repo silently turned that
+  // repo into this vault's push target. That inverts the risk. Import is a
+  // READ — the operator is pulling a vault onto a new box — and the natural
+  // reading of "import from this repo" does not include "and start writing
+  // back to it." Default-on meant the safe intent (pull a copy) required
+  // noticing and unchecking a box, while the destructive one (rewire backup,
+  // potentially clobbering the repo a DIFFERENT box is backing up to) was what
+  // you got by not reading carefully. Worse, it made the credential question
+  // incoherent: operators reasonably refused to supply a token to *read* a
+  // private repo because supplying it appeared to arm a write.
+  //
+  // Opting in is now explicit. Only a literal `true` enables it; any
+  // non-boolean is a validation error so a malformed body can't flip it.
+  let enableSync = false;
   if ("enable_sync" in body && body.enable_sync !== undefined) {
     if (typeof body.enable_sync !== "boolean") {
       return Response.json(
@@ -1815,13 +1852,21 @@ export async function handleMirrorImport(
           error: "enable_sync invalid",
           error_type: "validation",
           field: "enable_sync",
-          message: "enable_sync must be a boolean (defaults to true when omitted).",
+          message: "enable_sync must be a boolean (defaults to false when omitted).",
         },
         { status: 400 },
       );
     }
     enableSync = body.enable_sync;
   }
+
+  // Back-compat seam: `wait: true` restores the pre-vault#640 synchronous
+  // response (200 + the ImportResult body) for scripted callers that read the
+  // result straight off the POST. It inherits the new stall-based timeout, so
+  // it is no longer capped at 60s — but it is still subject to whatever
+  // request timeout sits between the caller and vault, which is exactly why it
+  // is no longer the default. The SPA never sets it.
+  const wait = body.wait === true;
 
   // vault#482: cross-vault clobber override for the sync-enable step. Default
   // off; a literal `true` lets the operator deliberately point this vault's
@@ -1837,22 +1882,13 @@ export async function handleMirrorImport(
   const store = getVaultStore(vaultName);
   const assets = assetsDir(vaultName);
 
-  let result: ImportResult;
+  // Preflight git BEFORE the job starts. `cloneAndImport` preflights too, but
+  // doing it here keeps "git isn't installed" a synchronous, actionable 503
+  // instead of a job the operator has to poll to discover was doomed.
   try {
-    result = await cloneAndImport({
-      vaultName,
-      remoteUrl: remote_url,
-      auth,
-      mode,
-      store,
-      assetsDir: assets,
-      spawn: spawnOverride,
-      which: whichOverride,
-    });
+    ensureGitAvailable(whichOverride);
   } catch (err) {
     if (err instanceof GitNotInstalledError) {
-      // 503 Service Unavailable — the server isn't configured to do this
-      // yet (git missing). The message tells the operator how to fix it.
       return Response.json(
         {
           error: "git not installed",
@@ -1862,82 +1898,188 @@ export async function handleMirrorImport(
         { status: 503 },
       );
     }
-    if (err instanceof ImportConflictError) {
+    throw err;
+  }
+
+  /**
+   * The actual work, shared by the async (default) and `wait: true` paths.
+   * Runs the clone+import, then optionally wires push-back. Every failure
+   * after a SUCCESSFUL import is non-fatal — an import is never lost to a
+   * sync-setup error.
+   */
+  const runImport = async (
+    onProgress: (update: ImportProgress) => void,
+  ): Promise<ImportResult> => {
+    const result = await cloneAndImport({
+      vaultName,
+      remoteUrl: remote_url,
+      auth,
+      mode,
+      store,
+      assetsDir: assets,
+      spawn: spawnOverride,
+      which: whichOverride,
+      onProgress,
+    });
+
+    if (enableSync) {
+      onProgress({ stage: "syncing" });
+      try {
+        const manager = managerOverride ?? getMirrorManager(vaultName) ?? undefined;
+        const outcome = await enableSyncToImportedRepo({
+          vaultName,
+          remoteUrl: remote_url,
+          auth,
+          manager,
+          override,
+        });
+        result.sync_enabled = outcome.sync_enabled;
+        if (outcome.warning) result.sync_warning = outcome.warning;
+      } catch (err) {
+        // Defense-in-depth: enableSyncToImportedRepo is written to not throw
+        // (it catches its own write/credential/reload errors), but a future
+        // edit or an unexpected throw must NOT take down a successful import.
+        const msg = redactToken((err as Error).message ?? String(err));
+        console.warn(
+          `[mirror-import] sync-enable threw after a successful import (non-fatal): ${msg}`,
+        );
+        result.sync_enabled = false;
+        result.sync_warning =
+          "Import succeeded, but enabling Sync failed. Set up Sync separately from the Git remote section.";
+      }
+    }
+    return result;
+  };
+
+  // ---- Back-compat synchronous path (`wait: true`) ------------------------
+  if (wait) {
+    try {
+      const result = await runImport(() => {});
+      return Response.json(result, {
+        headers: { "Access-Control-Allow-Origin": "*" },
+      });
+    } catch (err) {
+      const { error_type, message } = classifyImportError(err);
+      return Response.json(
+        { error: importErrorTitle(error_type), error_type, message },
+        { status: importErrorStatus(error_type) },
+      );
+    }
+  }
+
+  // ---- Async path (default) ----------------------------------------------
+  let job: ImportJob;
+  try {
+    job = startImportJob(vaultName, runImport, classifyImportError);
+  } catch (err) {
+    if (err instanceof ImportJobConflictError) {
+      const existing = getRunningImportJob(vaultName);
       return Response.json(
         {
           error: "Import already running",
           error_type: "concurrent_import",
           message: err.message,
+          // Hand back the in-flight job so a second tab can attach to the
+          // running import's progress rather than just being told "no".
+          job_id: existing?.job_id,
         },
         { status: 409 },
       );
     }
-    if (err instanceof NotAVaultExportError) {
-      return Response.json(
-        {
-          error: "Not a vault export",
-          error_type: "not_a_vault_export",
-          message: err.message,
-        },
-        { status: 400 },
-      );
-    }
-    if (err instanceof CloneFailedError) {
-      return Response.json(
-        {
-          error: "Clone failed",
-          error_type: "clone_failed",
-          message: err.message,
-        },
-        { status: 502 },
-      );
-    }
-    return Response.json(
-      {
-        error: "Import failed",
-        error_type: "internal",
-        message: (err as Error).message ?? String(err),
-      },
-      { status: 500 },
-    );
+    throw err;
   }
 
-  // ---- vault#416: auto-enable sync to the imported repo (default-on) -------
-  //
-  // The import SUCCEEDED above. From here on, every failure is non-fatal —
-  // we never lose a successful import to a sync-setup error. `result` already
-  // carries `sync_enabled: false` (set by importResultFromStats); we flip it
-  // true only when sync is actually wired (or already wired to this remote).
-  if (enableSync) {
-    try {
-      const manager =
-        managerOverride ?? getMirrorManager(vaultName) ?? undefined;
-      const outcome = await enableSyncToImportedRepo({
-        vaultName,
-        remoteUrl: remote_url,
-        auth,
-        manager,
-        override,
-      });
-      result.sync_enabled = outcome.sync_enabled;
-      if (outcome.warning) result.sync_warning = outcome.warning;
-    } catch (err) {
-      // Defense-in-depth: enableSyncToImportedRepo is written to not throw
-      // (it catches its own write/credential/reload errors), but a future
-      // edit or an unexpected throw must NOT take down a successful import.
-      const msg = redactToken((err as Error).message ?? String(err));
-      console.warn(
-        `[mirror-import] sync-enable threw after a successful import (non-fatal): ${msg}`,
-      );
-      result.sync_enabled = false;
-      result.sync_warning =
-        "Import succeeded, but enabling Sync failed. Set up Sync separately from the Git remote section.";
-    }
-  }
-
-  return Response.json(result, {
+  return Response.json(job, {
+    status: 202,
     headers: { "Access-Control-Allow-Origin": "*" },
   });
+}
+
+/**
+ * `GET /vault/<name>/.parachute/mirror/import/<job_id>` — poll an import.
+ *
+ * Returns the job record (status / stage / detail, plus `result` or `error`
+ * once terminal). 404 when the id is unknown for this vault — which is also
+ * what a caller sees after a vault restart, since jobs are in-memory by design
+ * (see `mirror-import-jobs.ts`).
+ *
+ * Admin-gated upstream in routing.ts, same as the POST.
+ */
+export function handleMirrorImportStatus(
+  vaultName: string,
+  jobId: string,
+): Response {
+  const job = getImportJob(vaultName, jobId);
+  if (!job) {
+    return Response.json(
+      {
+        error: "No such import job",
+        error_type: "job_not_found",
+        message:
+          "That import job isn't known to this vault. It may have finished more than an hour ago, or the vault restarted while it was running.",
+      },
+      { status: 404, headers: { "Access-Control-Allow-Origin": "*" } },
+    );
+  }
+  return Response.json(job, {
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      // Polled endpoint — never let an intermediary serve a stale stage.
+      "cache-control": "no-store",
+    },
+  });
+}
+
+/** Map a thrown import error onto the wire's `error_type` vocabulary. */
+function classifyImportError(err: unknown): ImportJobError {
+  if (err instanceof GitNotInstalledError) {
+    return { error_type: "git_not_installed", message: err.message };
+  }
+  if (err instanceof ImportConflictError) {
+    return { error_type: "concurrent_import", message: err.message };
+  }
+  if (err instanceof NotAVaultExportError) {
+    return { error_type: "not_a_vault_export", message: err.message };
+  }
+  if (err instanceof CloneFailedError) {
+    return { error_type: "clone_failed", message: err.message };
+  }
+  return {
+    error_type: "internal",
+    message: redactToken((err as Error)?.message ?? String(err)),
+  };
+}
+
+/** HTTP status for an `error_type` — used by the `wait: true` path. */
+function importErrorStatus(errorType: ImportJobError["error_type"]): number {
+  switch (errorType) {
+    case "git_not_installed":
+      return 503;
+    case "concurrent_import":
+      return 409;
+    case "not_a_vault_export":
+      return 400;
+    case "clone_failed":
+      return 502;
+    default:
+      return 500;
+  }
+}
+
+/** Human title for an `error_type` — used by the `wait: true` path. */
+function importErrorTitle(errorType: ImportJobError["error_type"]): string {
+  switch (errorType) {
+    case "git_not_installed":
+      return "git not installed";
+    case "concurrent_import":
+      return "Import already running";
+    case "not_a_vault_export":
+      return "Not a vault export";
+    case "clone_failed":
+      return "Clone failed";
+    default:
+      return "Import failed";
+  }
 }
 
 // ---------------------------------------------------------------------------

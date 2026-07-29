@@ -24,6 +24,7 @@ import { SqliteStore } from "../core/src/store.ts";
 import { exportVaultToDir } from "../core/src/portable-md.ts";
 import {
   CloneFailedError,
+  DEFAULT_CLONE_STALL_TIMEOUT_MS,
   ImportConflictError,
   NotAVaultExportError,
   _isImportInFlight,
@@ -437,7 +438,7 @@ describe("cloneAndImport — failures", () => {
     }
   });
 
-  test("clone timeout → CloneFailedError mentioning timeout", async () => {
+  test("absolute clone timeout → CloneFailedError naming the limit", async () => {
     await expect(
       cloneAndImport({
         vaultName: "default",
@@ -449,7 +450,106 @@ describe("cloneAndImport — failures", () => {
         spawn: spawnCloneTimeout,
         cloneTimeoutMs: 100,
       }),
-    ).rejects.toThrow(/timed out/);
+    ).rejects.toThrow(/exceeded its .*limit/);
+  });
+
+  // vault#640 — a stalled clone and a slow one are different failures and get
+  // different copy. The old code could only say "timed out after 60s", which
+  // was actively misleading on a big vault: nothing was wrong except that the
+  // vault was large.
+  test("stalled clone → CloneFailedError says STALLED, not 'too slow'", async () => {
+    const spawnStalled: GitSpawn = async () => ({
+      exitCode: 143,
+      stderr: "",
+      timedOut: true,
+      stalled: true,
+    });
+    await expect(
+      cloneAndImport({
+        vaultName: "default",
+        remoteUrl: "https://github.com/owner/repo.git",
+        auth: { kind: "none" },
+        mode: "merge",
+        store,
+        assetsDir,
+        spawn: spawnStalled,
+        cloneStallTimeoutMs: 600_000,
+      }),
+    ).rejects.toThrow(/stalled — no progress for 10 minutes/);
+  });
+
+  // The regression that made this whole change necessary: a clone that takes
+  // longer than a minute must NOT be killed. Previously `cloneTimeoutMs`
+  // defaulted to 60s, so any vault big enough to matter failed here.
+  test("no absolute timeout by default — a long clone is allowed to finish", async () => {
+    const localFixture = await buildExportFixture();
+    let observedTimeout: number | undefined;
+    let observedStall: number | undefined;
+    const spawnSlowButFine: GitSpawn = async (argv, options) => {
+      observedTimeout = options.timeoutMs;
+      observedStall = options.stallTimeoutMs;
+      const dest = argv[argv.length - 1]!;
+      cpSync(localFixture, dest, { recursive: true });
+      return { exitCode: 0, stderr: "", timedOut: false };
+    };
+    const result = await cloneAndImport({
+      vaultName: "default",
+      remoteUrl: "https://github.com/owner/repo.git",
+      auth: { kind: "none" },
+      mode: "merge",
+      store,
+      assetsDir,
+      spawn: spawnSlowButFine,
+    });
+    expect(result.notes_imported).toBeGreaterThan(0);
+    // 0 == disabled. The stall bound is what guards a wedged clone.
+    expect(observedTimeout).toBe(0);
+    expect(observedStall).toBe(DEFAULT_CLONE_STALL_TIMEOUT_MS);
+  });
+
+  test("clone runs with --progress so the stall timer has something to watch", async () => {
+    const localFixture = await buildExportFixture();
+    let argvSeen: string[] = [];
+    const spawnCapture: GitSpawn = async (argv) => {
+      argvSeen = argv;
+      const dest = argv[argv.length - 1]!;
+      cpSync(localFixture, dest, { recursive: true });
+      return { exitCode: 0, stderr: "", timedOut: false };
+    };
+    await cloneAndImport({
+      vaultName: "default",
+      remoteUrl: "https://github.com/owner/repo.git",
+      auth: { kind: "none" },
+      mode: "merge",
+      store,
+      assetsDir,
+      spawn: spawnCapture,
+    });
+    expect(argvSeen).toContain("--progress");
+  });
+
+  test("onProgress reports stage transitions and clone detail", async () => {
+    const localFixture = await buildExportFixture();
+    const seen: string[] = [];
+    const spawnWithProgress: GitSpawn = async (argv, options) => {
+      options.onProgress?.("Receiving objects:  47% (470/1000)");
+      const dest = argv[argv.length - 1]!;
+      cpSync(localFixture, dest, { recursive: true });
+      return { exitCode: 0, stderr: "", timedOut: false };
+    };
+    await cloneAndImport({
+      vaultName: "default",
+      remoteUrl: "https://github.com/owner/repo.git",
+      auth: { kind: "none" },
+      mode: "merge",
+      store,
+      assetsDir,
+      spawn: spawnWithProgress,
+      onProgress: (u) => seen.push(`${u.stage}:${u.detail ?? ""}`),
+    });
+    expect(seen).toContain("cloning:");
+    expect(seen).toContain("cloning:Receiving objects:  47% (470/1000)");
+    expect(seen).toContain("importing:");
   });
 
   test("clone target lacks .parachute/vault.yaml → NotAVaultExportError", async () => {

@@ -643,11 +643,58 @@ export interface MirrorImportRequest {
   mode: "merge" | "replace";
   credentials: MirrorImportCredentials;
   /**
-   * vault#416 — also enable sync (mirror push-back) to the imported repo,
-   * reusing the import credentials. DEFAULT TRUE on the server when omitted;
-   * the UI sends the checkbox state explicitly.
+   * Also enable sync (mirror push-back) to the imported repo, reusing the
+   * import credentials. **Defaults to FALSE on the server** since vault#641 —
+   * an import is a read and must not arm a write on its own. The UI sends the
+   * checkbox state explicitly either way.
    */
   enable_sync?: boolean;
+}
+
+/** Stage the running import is in. Mirrors `src/mirror-import.ts:ImportStage`. */
+export type MirrorImportStage = "cloning" | "importing" | "syncing";
+
+/** Terminal + non-terminal job states. */
+export type MirrorImportStatus = "running" | "succeeded" | "failed";
+
+/** Why an import failed. Mirrors `src/mirror-import-jobs.ts:ImportJobError`. */
+export interface MirrorImportError {
+  error_type:
+    | "git_not_installed"
+    | "concurrent_import"
+    | "not_a_vault_export"
+    | "clone_failed"
+    | "internal";
+  message: string;
+}
+
+/**
+ * An import job record (vault#640). POST returns one of these with
+ * `status: "running"`; poll `getMirrorImportJob` until it goes terminal.
+ */
+export interface MirrorImportJob {
+  job_id: string;
+  vault_name: string;
+  status: MirrorImportStatus;
+  stage: MirrorImportStage;
+  /** Live progress line — e.g. "Receiving objects:  47% (470/1000)". */
+  detail?: string;
+  started_at: string;
+  updated_at: string;
+  finished_at?: string;
+  result?: MirrorImportResult;
+  error?: MirrorImportError;
+}
+
+/**
+ * Outcome of starting an import.
+ *
+ * `attached: true` means we didn't start a new import — one was already
+ * running for this vault and we're now watching that one instead.
+ */
+export interface MirrorImportStart {
+  attached: boolean;
+  job: MirrorImportJob;
 }
 
 export interface MirrorImportResult {
@@ -673,14 +720,22 @@ export interface MirrorImportResult {
 }
 
 /**
- * POST a clone-and-import request. Returns the import stats on success.
- * Throws `HttpError` on validation/clone/conflict failures — caller can
- * surface the status code-specific message to the user.
+ * START a clone-and-import. Resolves with the `running` job record as soon as
+ * the server accepts it (202) — the import itself continues server-side. Poll
+ * `getMirrorImportJob` for stage, progress, and the terminal outcome.
+ *
+ * Throws `HttpError` for the synchronous refusals: validation (400) and git
+ * missing (503).
+ *
+ * The import OUTCOME does not arrive here (vault#640). It can't: a big vault
+ * takes far longer than the ~4 minutes hub's proxy allows a single request to
+ * live, so the old "await the whole import in the POST" shape capped what was
+ * importable rather than what was correct.
  */
 export async function postMirrorImport(
   vaultName: string,
   args: MirrorImportRequest,
-): Promise<MirrorImportResult> {
+): Promise<MirrorImportStart> {
   const res = await authedFetch(
     vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/import`,
@@ -690,8 +745,49 @@ export async function postMirrorImport(
       body: JSON.stringify(args),
     },
   );
+  if (res.ok) {
+    return { attached: false, job: (await res.json()) as MirrorImportJob };
+  }
+  // 409 — this vault already has an import running. The server hands back the
+  // in-flight `job_id` precisely so we can ATTACH to it: a reload mid-import,
+  // or a second tab, should show the running import rather than an error about
+  // an import the operator can't see.
+  if (res.status === 409) {
+    const text = await res.text();
+    let jobId: string | undefined;
+    let message = text;
+    try {
+      const parsed = JSON.parse(text) as { job_id?: string; message?: string };
+      if (typeof parsed.job_id === "string" && parsed.job_id.length > 0) {
+        jobId = parsed.job_id;
+      }
+      if (parsed.message) message = parsed.message;
+    } catch {
+      // not JSON — fall through with the raw text as the message
+    }
+    if (jobId) {
+      return { attached: true, job: await getMirrorImportJob(vaultName, jobId) };
+    }
+    throw new HttpError(409, message, "concurrent_import");
+  }
+  throw new HttpError(res.status, await readError(res));
+}
+
+/**
+ * Poll one import job. 404 (`HttpError` 404) means the id is unknown to this
+ * vault — most often because the vault restarted mid-import, since jobs are
+ * in-memory by design.
+ */
+export async function getMirrorImportJob(
+  vaultName: string,
+  jobId: string,
+): Promise<MirrorImportJob> {
+  const res = await authedFetch(
+    vaultName,
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/import/${encodeURIComponent(jobId)}`,
+  );
   if (!res.ok) throw new HttpError(res.status, await readError(res));
-  return (await res.json()) as MirrorImportResult;
+  return (await res.json()) as MirrorImportJob;
 }
 
 // ---------------------------------------------------------------------------
