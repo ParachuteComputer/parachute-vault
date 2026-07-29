@@ -108,7 +108,11 @@ export const TRANSCRIPTION_MODELS: readonly TranscriptionModel[] = [
     url: "https://huggingface.co/ggml-org/parakeet-GGUF/resolve/main/ggml-parakeet-tdt-0.6b-v3-q4_0.bin",
     filename: "ggml-parakeet-tdt-0.6b-v3-q4_0.bin",
     sizeMb: 339,
-    minRamMb: 2048,
+    // 1.5 GB rather than 2: the q4 weights are 339 MB and peak usage lands
+    // well under 1 GB, so the common 2 GB VPS should get Parakeet rather than
+    // being stepped down to Whisper Tiny — a large accuracy loss to buy
+    // headroom it didn't need.
+    minRamMb: 1536,
     note: "Parakeet at the smallest quantization. 25 European languages.",
   },
   {

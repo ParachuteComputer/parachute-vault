@@ -4,6 +4,43 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.5-rc.5] - 2026-07-29
+
+**`transcription install` now produces a setup that works — and proves it.**
+
+Builds on rc.4's whisper.cpp provider. With no `--provider`, install now takes
+the whisper.cpp path: pick a model for the box, obtain the CLIs, download the
+model, **verify**, then activate.
+
+The verification step is the point. The provider this replaces was activated by
+an install verb that never checked whether what it configured could run — which
+is exactly how `TRANSCRIPTION_PROVIDER=transcribe-cpp` came to point at a CLI
+that has never shipped, and why local transcription silently did nothing for
+everyone who "installed" it. Install now generates a real 16 kHz mono WAV, runs
+the real CLI against the real model, and flips `TRANSCRIPTION_PROVIDER` **only
+if that succeeds**. An install that can't transcribe is a failed install, and it
+says so at install time rather than silently at the first voice memo.
+
+- **macOS** → Homebrew (`brew install whisper-cpp`, one formula giving both
+  `whisper-cli` and `parakeet-cli`). Upstream ships no macOS CLI tarball, so
+  when brew is absent we refuse and explain, rather than emitting an opaque
+  exit 127.
+- **Linux** → the release tarball extracted into `<root>/transcription/bin`,
+  binaries and their shared objects together, no distro package manager
+  involved.
+- **Already installed** short-circuits both — re-running never drags a package
+  manager through a reinstall.
+- Model downloads land on a `.part` and rename on success, so an interrupted
+  install can't leave a truncated file that passes the readiness probe and then
+  fails mysteriously at the first transcription.
+- A 2 GB VPS now gets Parakeet rather than being stepped down to Whisper Tiny —
+  the q4 weights are 339 MB and fit comfortably; the old floor bought headroom
+  the box didn't need at a large accuracy cost.
+- Non-interactive-safe: without a TTY, install requires `--yes` instead of
+  blocking forever on a prompt nothing will answer.
+- Missing ffmpeg is called out at the end with the exact per-platform command,
+  since transcoding is required and its absence otherwise surfaces much later.
+
 ## [0.7.5-rc.4] - 2026-07-29
 
 **A local transcription provider that actually runs.**

@@ -175,6 +175,21 @@ import {
   type CliBuildResult,
 } from "./transcription/build.ts";
 import { downloadTo } from "./transcription/download.ts";
+import {
+  describeWhisperPlan,
+  planWhisperInstall,
+} from "./transcription/install-whisper-cpp.ts";
+import {
+  ensureBinaries,
+  ensureModel,
+  verifyTranscription,
+} from "./transcription/install-whisper-exec.ts";
+import {
+  binaryNameFor,
+  candidateBinDirs,
+  resolveCliBinary,
+  resolveFfmpeg,
+} from "./transcription/resolve-binary.ts";
 import { selectDefaultProvider, NOMINAL_SLACK_GB, type TierPlan } from "./transcription/tiers.ts";
 import {
   PYTHON_PROVIDERS,
@@ -3605,12 +3620,109 @@ function printTranscriptionPlan(plan: InstallPlan): void {
   console.log(`        ~${m.approxSizeMb}MB download, ~${m.approxRuntimeGb}GB peak RAM while transcribing`);
 }
 
+
+/**
+ * `parachute-vault transcription install` — the whisper.cpp path.
+ *
+ * Plan → binaries → model → VERIFY → activate. The verify step is the
+ * load-bearing one: the provider this replaces was activated by an install
+ * that never checked whether what it configured could run, which is how
+ * `TRANSCRIPTION_PROVIDER` came to point at a CLI that has never existed.
+ * `TRANSCRIPTION_PROVIDER` flips only after a real CLI transcribes a real
+ * file, so an install that reports success is one that works.
+ */
+async function runWhisperCppInstall(opts: {
+  modelId?: string;
+  dryRun: boolean;
+  yes: boolean;
+}): Promise<void> {
+  const plan = planWhisperInstall(opts.modelId, {
+    resolveExisting: (engine) => resolveCliBinary(engine),
+  });
+  for (const line of describeWhisperPlan(plan)) console.log(line);
+
+  if (!plan.supported) {
+    console.error("\nCan't install automatically on this host — see above.");
+    process.exit(1);
+  }
+  if (opts.dryRun) {
+    console.log("\n(dry run — nothing downloaded or changed)");
+    return;
+  }
+  if (!opts.yes) {
+    // Bun's global `confirm()` reads stdin. In a non-TTY — which is exactly
+    // how the unified setup script and any CI invocation call this — it would
+    // block forever, so require an explicit --yes there instead of hanging.
+    if (!process.stdin.isTTY) {
+      console.error(
+        "\nNot a terminal — re-run with --yes to install without confirmation.",
+      );
+      process.exit(1);
+    }
+    if (!confirm("\nProceed?")) {
+      console.log("Cancelled.");
+      return;
+    }
+  }
+
+  const log = (l: string) => console.log(`  ${l}`);
+
+  const bin = await ensureBinaries(plan, { log });
+  console.log(`${bin.ok ? "✓" : "✗"} ${bin.message}`);
+  if (!bin.ok) process.exit(1);
+
+  const model = await ensureModel(plan, { log });
+  console.log(`${model.ok ? "✓" : "✗"} ${model.message}`);
+  if (!model.ok) process.exit(1);
+
+  // Re-resolve AFTER install — a brew install just changed what's on disk.
+  const binPath = resolveCliBinary(plan.model.engine);
+  if (!binPath) {
+    console.error(
+      `✗ ${binaryNameFor(plan.model.engine)} still isn't resolvable after install. ` +
+        `Searched: ${candidateBinDirs().slice(0, 5).join(", ")}`,
+    );
+    process.exit(1);
+  }
+
+  const verified = await verifyTranscription(plan, binPath, { log });
+  console.log(`${verified.ok ? "✓" : "✗"} ${verified.message}`);
+  if (!verified.ok) {
+    console.error("\nNot activating — an install that can't transcribe isn't installed.");
+    process.exit(1);
+  }
+
+  setEnvVar("TRANSCRIPTION_PROVIDER", "whisper-cpp");
+  setEnvVar("TRANSCRIPTION_MODEL", plan.model.id);
+  console.log(`\n✓ Activated: whisper-cpp with ${plan.model.label}.`);
+
+  if (!resolveFfmpeg()) {
+    console.log(
+      "\n! ffmpeg isn't installed. Audio has to be transcoded to 16 kHz mono WAV before\n" +
+        "  transcription, so voice memos will fail until you install it:\n" +
+        "    macOS:  brew install ffmpeg\n" +
+        "    Debian: sudo apt install ffmpeg",
+    );
+  }
+  console.log("\nRestart the vault to apply (`parachute restart vault`).");
+}
+
 async function cmdTranscriptionInstall(args: string[]) {
   const dryRun = args.includes("--dry-run") || args.includes("--plan");
   const force = args.includes("--force");
   const yes = args.includes("--yes") || args.includes("-y");
   const overrideModel = takeArgValue(args, "--model").value;
   const providerArg = takeArgValue(args, "--provider").value;
+
+  // whisper-cpp is the local path now, and the DEFAULT when no --provider is
+  // given. The legacy tier table below still serves an explicit
+  // `--provider transcribe-cpp|parakeet-mlx|onnx-asr`, but nothing routes
+  // there by default any more: transcribe-cpp's CLI has never shipped, and
+  // the Python providers need a venv plus a multi-GB model.
+  if (!providerArg || providerArg === "whisper-cpp") {
+    await runWhisperCppInstall({ modelId: overrideModel, dryRun, yes });
+    return;
+  }
 
   if (providerArg === "scribe-http") {
     // Just flip config back to the remote provider — no download.
@@ -3628,7 +3740,7 @@ async function cmdTranscriptionInstall(args: string[]) {
   if (providerArg) {
     if (!["transcribe-cpp", "parakeet-mlx", "onnx-asr"].includes(providerArg)) {
       console.error(
-        `Unknown --provider "${providerArg}". Valid: transcribe-cpp, parakeet-mlx, onnx-asr, scribe-http.`,
+        `Unknown --provider "${providerArg}". Valid: whisper-cpp (default), transcribe-cpp, parakeet-mlx, onnx-asr, scribe-http.`,
       );
       process.exit(1);
     }
