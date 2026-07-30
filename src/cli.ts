@@ -168,6 +168,7 @@ import {
   type PythonInstallManifest,
 } from "./transcription/select.ts";
 import { buildTranscriptionSnapshot } from "./transcription-routes.ts";
+import { TRANSCRIPTION_MODELS } from "./transcription/models.ts";
 import {
   buildTranscribeCli,
   cliSourceUrl,
@@ -4189,132 +4190,87 @@ function noRunnableCliGuidance(
   return lines.join("\n");
 }
 
-/** `parachute-vault transcription status` — provider + per-provider install state. */
+/**
+ * `parachute-vault transcription status` — is transcription working, and if
+ * not, what do I run.
+ *
+ * Rewritten to answer that in the first line. It used to open with a "tier
+ * default for this host" recommending `parakeet-mlx`, then list three
+ * superseded providers, and only then (after vault#641 taught it the word)
+ * mention whisper-cpp — which is the actual default and the only one
+ * `transcription install` sets up. An operator read a recommendation for
+ * something we no longer ship, above a wall of "not installed" for things they
+ * should never install.
+ *
+ * The legacy providers still WORK if an operator configured one, so they are
+ * not removed — they are demoted. They print only when actually active or
+ * actually installed, which on a normal box means they never print at all.
+ */
 async function cmdTranscriptionStatus(): Promise<void> {
   const active = resolveTranscriptionProviderName();
-  console.log(`Configured provider: ${active}`);
-
-  // What the ratified tier table would pick for this host (install default).
-  const tier = selectDefaultProvider({
-    platform: process.platform,
-    arch: process.arch,
-    totalRamBytes: detectTotalRamBytes(),
-  });
-  console.log(
-    `Tier default for this host (${tier.platform}/${tier.arch}, ${tier.totalRamGb}GB): ${tier.provider}${tier.model ? ` (${tier.model})` : ""}`,
-  );
-
-  // transcribe-cpp — prebuilt libs + GGUF model + built CLI. "runnable" is an
-  // EXECUTED verdict, not a stat: `--help` must actually exit 0 (vault#534 —
-  // an existsSync-only check said "yes" on Linux while the CLI exited 1 on
-  // every real transcription because its dlopen'd CPU backends never loaded).
-  const paths = resolveTranscribeCppPaths();
-  const manifest = readManifest(paths.manifestPath);
-  const cliPresent = existsSync(paths.binPath);
-  const filesPresent = transcribeCppInstalled(paths); // CLI + model both on disk
-  let installed = false;
-  let notRunnableReason: string | undefined;
-  if (!filesPresent) {
-    notRunnableReason = !cliPresent ? "no transcribe-cli binary" : "no GGUF model on disk";
-  } else {
-    const probe = await probeTranscribeCliRunnable(paths.binPath);
-    installed = probe.ok;
-    notRunnableReason = probe.reason;
-  }
-  console.log(`\ntranscribe-cpp runnable: ${installed ? "yes" : `no (${notRunnableReason})`}`);
-  if (manifest) {
-    console.log(`  model:   ${manifest.model} (${manifest.modelFile})`);
-    console.log(
-      `  libs:    ${paths.libsDir}${manifest.libFiles?.length ? ` (${manifest.libFiles.length} file(s))` : ""}`,
-    );
-    console.log(
-      cliPresent
-        ? `  cli:     ${paths.binPath}${manifest.binBuiltFrom ? ` (built from source @ ${manifest.binBuiltFrom.slice(0, 12)})` : ""}`
-        : `  cli:     NOT FOUND — re-run \`transcription install\` to build one (needs a C++ compiler), or set TRANSCRIBE_CPP_BIN`,
-    );
-    console.log(`  ram:     ${manifest.ram_gb}GB at install (${manifest.os}/${manifest.arch})`);
-  } else {
-    console.log(`  (not installed — run: parachute-vault transcription install --provider transcribe-cpp)`);
-  }
-
-  // parakeet-mlx / onnx-asr — Python venv providers (scribe-fold Phase 2b).
-  const pyManifest = readPythonManifest(pythonManifestPath());
-  const pkBin = resolveParakeetMlxBin();
-  const pkRunnable = parakeetMlxInstalled();
-  console.log(`\nparakeet-mlx runnable: ${pkRunnable ? "yes" : "no"}`);
-  if (pkRunnable) {
-    console.log(`  bin:     ${pkBin}`);
-    console.log(`  model:   ${resolveParakeetMlxModel()} (HF cache; downloads on first use)`);
-  } else {
-    console.log(
-      process.platform === "darwin" && process.arch === "arm64"
-        ? `  (not installed — run: parachute-vault transcription install${tier.provider === "parakeet-mlx" ? "" : " --provider parakeet-mlx"})`
-        : "  (macOS Apple Silicon only)",
-    );
-  }
-
-  const oxBin = resolveOnnxAsrBin();
-  const oxRunnable = onnxAsrInstalled();
-  console.log(`onnx-asr runnable: ${oxRunnable ? "yes" : "no"}`);
-  if (oxRunnable) {
-    console.log(`  bin:     ${oxBin}`);
-    console.log(`  model:   ${resolveOnnxAsrModel()} (HF cache)`);
-  } else {
-    console.log(
-      `  (not installed — run: parachute-vault transcription install${tier.provider === "onnx-asr" ? "" : " --provider onnx-asr"})`,
-    );
-  }
-  if (pyManifest) {
-    console.log(
-      `  python install: ${pyManifest.provider} (${pyManifest.pipTarget}) @ ${pyManifest.installedAt}${pyManifest.venv ? ` — venv ${pyManifest.venv}` : ""}`,
-    );
-  }
-
-  // whisper-cpp — the current local provider (vault#635/#636), and since
-  // vault#640 the DEFAULT on a box with no scribe. It was missing from this
-  // command entirely: `status` was written before it existed and never grew a
-  // branch for it, so a box with a working whisper-cpp install was told
-  // "no runnable whisper-cpp install was found — transcription is offline"
-  // while it transcribed perfectly. Found live.
-  //
-  // Reuses `buildTranscriptionSnapshot` — the exact function behind the admin
-  // SPA's Transcription page — rather than re-deriving readiness here. Two
-  // implementations of "is transcription working" is how this drifted in the
-  // first place, and a status command that disagrees with the UI is worse than
-  // no status command.
   const snap = buildTranscriptionSnapshot();
-  const wcRunnable = snap.provider === "whisper-cpp" ? snap.ready : false;
-  console.log(`\nwhisper-cpp runnable: ${snap.provider === "whisper-cpp" ? (snap.ready ? "yes" : `no (${snap.reason ?? "not ready"})`) : "not the active provider"}`);
-  console.log(`  ${snap.binary.name}: ${snap.binary.path ?? "NOT FOUND"}`);
-  console.log(`  ffmpeg:  ${snap.ffmpeg.path ?? "NOT FOUND — required to transcode webm to 16kHz mono WAV"}`);
-  if (snap.model) {
-    console.log(
-      `  model:   ${snap.model.label} (${snap.model.size_mb} MB, ${snap.model.installed ? "downloaded" : "NOT downloaded"})`,
-    );
+
+  // The headline: one line, answering the question that brought them here.
+  //
+  // Deliberately reports READINESS only, never `snap.active`. `active` reads
+  // the in-process transcription worker registry, which a one-shot CLI process
+  // never has — so keying on it would print "ready, but the worker isn't
+  // running yet" on every healthy box. Liveness is a question only the running
+  // daemon can answer, which is why the admin UI (served from that process)
+  // shows it and this command doesn't pretend to.
+  if (snap.ready) {
+    console.log(`Transcription: ready (${active})`);
   } else {
-    console.log(`  model:   ${snap.model_id} is not in the catalog`);
-  }
-  if (!snap.binary.path) {
-    // The macOS launchd trap: the binary can be installed and still invisible
-    // to a supervised vault, so "NOT FOUND" alone misleads.
-    console.log(`  searched: ${snap.binary.searched.join(", ")}`);
-    console.log(`  (installed elsewhere? set WHISPER_CPP_BIN_DIR to that directory)`);
+    console.log(`Transcription: NOT running (${active})`);
+    if (snap.reason) console.log(`  ${snap.reason}`);
+    if (snap.fix_command) console.log(`  fix:  ${snap.fix_command}`);
   }
 
-  // Offline warning when the ACTIVE provider isn't runnable.
-  const activeRunnable =
-    active === "scribe-http" ||
-    (active === "whisper-cpp" && wcRunnable) ||
-    (active === "transcribe-cpp" && installed) ||
-    (active === "parakeet-mlx" && pkRunnable) ||
-    (active === "onnx-asr" && oxRunnable);
-  if (!activeRunnable) {
-    console.log(
-      `\n⚠  provider is ${active} but no runnable ${active} install was found — transcription is offline until one is available (\`parachute-vault transcription install\`).`,
-    );
+  // What's actually on this machine, for the active local provider.
+  if (snap.provider === "whisper-cpp") {
+    console.log("");
+    console.log(`  ${snap.binary.name.padEnd(14)} ${snap.binary.path ?? "not found"}`);
+    console.log(`  ${"ffmpeg".padEnd(14)} ${snap.ffmpeg.path ?? "not found"}`);
+    if (snap.model) {
+      console.log(
+        `  ${"model".padEnd(14)} ${snap.model.label} (${snap.model.size_mb} MB, ${snap.model.installed ? "downloaded" : "not downloaded"})`,
+      );
+    } else {
+      console.log(`  ${"model".padEnd(14)} ${snap.model_id} — not in the catalog`);
+    }
+    if (!snap.binary.path) {
+      // The macOS launchd trap: installed but invisible to a supervised vault.
+      console.log(`  searched:      ${snap.binary.searched.join(", ")}`);
+      console.log("  (installed elsewhere? set WHISPER_CPP_BIN_DIR to that directory)");
+    }
   }
+
+  // Legacy providers — demoted, and silent unless one is genuinely in play.
+  // Printing "not installed" for three superseded providers on every run
+  // trained operators to skim past the part that mattered.
+  const legacy: string[] = [];
+  const cppPaths = resolveTranscribeCppPaths();
+  if (active === "transcribe-cpp" || transcribeCppInstalled(cppPaths)) {
+    const probe = transcribeCppInstalled(cppPaths)
+      ? await probeTranscribeCliRunnable(cppPaths.binPath)
+      : { ok: false, reason: "not installed" };
+    legacy.push(`  transcribe-cpp   ${probe.ok ? "runnable" : `not runnable (${probe.reason})`}`);
+  }
+  if (active === "parakeet-mlx" || parakeetMlxInstalled()) {
+    legacy.push(`  parakeet-mlx     ${parakeetMlxInstalled() ? `runnable (${resolveParakeetMlxBin()})` : "not installed"}`);
+  }
+  if (active === "onnx-asr" || onnxAsrInstalled()) {
+    legacy.push(`  onnx-asr         ${onnxAsrInstalled() ? `runnable (${resolveOnnxAsrBin()})` : "not installed"}`);
+  }
+  if (legacy.length > 0) {
+    console.log("\nLegacy providers (superseded by whisper-cpp):");
+    for (const line of legacy) console.log(line);
+  }
+
+  // The model catalog is what `--model` accepts, so it belongs with the
+  // provider that actually uses it.
   console.log(
-    `\nAvailable transcribe-cpp models (override with --model): ${Object.values(MODELS).map((m: ModelChoice) => m.name).join(", ")}`,
+    `\nModels for whisper-cpp (--model): ${TRANSCRIPTION_MODELS.map((m) => m.id).join(", ")}`,
   );
 }
 
