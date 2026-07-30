@@ -93,3 +93,31 @@ describe("the snapshot is the single source of truth", () => {
     expect(snap.binary.searched.length).toBeGreaterThan(0);
   });
 });
+
+describe("what `transcription status` must not claim", () => {
+  test("readiness never depends on the in-process worker registry", () => {
+    // A one-shot CLI process has no transcription worker — `active` is
+    // structurally false there. Keying the headline off it would print
+    // "ready, but the worker isn't running yet" on every healthy box, which is
+    // the same class of lie the command was just fixed for.
+    const installed = {
+      resolveBinaryImpl: () => "/opt/homebrew/bin/parakeet-cli",
+      resolveFfmpegImpl: () => "/opt/homebrew/bin/ffmpeg",
+      existsImpl: () => true,
+    };
+    const prev = process.env.TRANSCRIPTION_PROVIDER;
+    process.env.TRANSCRIPTION_PROVIDER = "whisper-cpp";
+    try {
+      // `ready` is identical whether or not a worker happens to be live; only
+      // `active` differs. The CLI reports the former.
+      const withWorker = buildTranscriptionSnapshot({ ...installed, active: true });
+      const without = buildTranscriptionSnapshot({ ...installed, active: false });
+      expect(withWorker.ready).toBe(true);
+      expect(without.ready).toBe(true);
+      expect(without.active).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.TRANSCRIPTION_PROVIDER;
+      else process.env.TRANSCRIPTION_PROVIDER = prev;
+    }
+  });
+});
