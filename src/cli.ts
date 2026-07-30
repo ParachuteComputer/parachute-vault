@@ -167,6 +167,7 @@ import {
   type TranscribeCppManifest,
   type PythonInstallManifest,
 } from "./transcription/select.ts";
+import { buildTranscriptionSnapshot } from "./transcription-routes.ts";
 import {
   buildTranscribeCli,
   cliSourceUrl,
@@ -4269,9 +4270,41 @@ async function cmdTranscriptionStatus(): Promise<void> {
     );
   }
 
+  // whisper-cpp — the current local provider (vault#635/#636), and since
+  // vault#640 the DEFAULT on a box with no scribe. It was missing from this
+  // command entirely: `status` was written before it existed and never grew a
+  // branch for it, so a box with a working whisper-cpp install was told
+  // "no runnable whisper-cpp install was found — transcription is offline"
+  // while it transcribed perfectly. Found live.
+  //
+  // Reuses `buildTranscriptionSnapshot` — the exact function behind the admin
+  // SPA's Transcription page — rather than re-deriving readiness here. Two
+  // implementations of "is transcription working" is how this drifted in the
+  // first place, and a status command that disagrees with the UI is worse than
+  // no status command.
+  const snap = buildTranscriptionSnapshot();
+  const wcRunnable = snap.provider === "whisper-cpp" ? snap.ready : false;
+  console.log(`\nwhisper-cpp runnable: ${snap.provider === "whisper-cpp" ? (snap.ready ? "yes" : `no (${snap.reason ?? "not ready"})`) : "not the active provider"}`);
+  console.log(`  ${snap.binary.name}: ${snap.binary.path ?? "NOT FOUND"}`);
+  console.log(`  ffmpeg:  ${snap.ffmpeg.path ?? "NOT FOUND — required to transcode webm to 16kHz mono WAV"}`);
+  if (snap.model) {
+    console.log(
+      `  model:   ${snap.model.label} (${snap.model.size_mb} MB, ${snap.model.installed ? "downloaded" : "NOT downloaded"})`,
+    );
+  } else {
+    console.log(`  model:   ${snap.model_id} is not in the catalog`);
+  }
+  if (!snap.binary.path) {
+    // The macOS launchd trap: the binary can be installed and still invisible
+    // to a supervised vault, so "NOT FOUND" alone misleads.
+    console.log(`  searched: ${snap.binary.searched.join(", ")}`);
+    console.log(`  (installed elsewhere? set WHISPER_CPP_BIN_DIR to that directory)`);
+  }
+
   // Offline warning when the ACTIVE provider isn't runnable.
   const activeRunnable =
     active === "scribe-http" ||
+    (active === "whisper-cpp" && wcRunnable) ||
     (active === "transcribe-cpp" && installed) ||
     (active === "parakeet-mlx" && pkRunnable) ||
     (active === "onnx-asr" && oxRunnable);
