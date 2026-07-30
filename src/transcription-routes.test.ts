@@ -44,12 +44,13 @@ beforeEach(() => {
   process.env.PATH = "";
   delete process.env.WHISPER_CPP_BIN_DIR;
   delete process.env.TRANSCRIPTION_PROVIDER;
+  delete process.env.SCRIBE_URL;
   delete process.env.TRANSCRIPTION_MODEL;
 });
 
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
-  for (const k of ["PARACHUTE_HOME", "PATH", "WHISPER_CPP_BIN_DIR", "TRANSCRIPTION_PROVIDER", "TRANSCRIPTION_MODEL"]) {
+  for (const k of ["PARACHUTE_HOME", "PATH", "WHISPER_CPP_BIN_DIR", "TRANSCRIPTION_PROVIDER", "TRANSCRIPTION_MODEL", "SCRIBE_URL"]) {
     if (ORIG[k] === undefined) delete process.env[k];
     else process.env[k] = ORIG[k];
   }
@@ -68,11 +69,33 @@ function installFfmpeg() {
   present.add(join(home, "ff", "ffmpeg"));
 }
 
-describe("snapshot — the default (stale) provider", () => {
-  test("scribe-http with no backend reports NOT ready and says why", () => {
-    // The fresh-install state: nothing configured, so the provider resolves to
-    // scribe-http and there is no scribe. This is the case that used to be
-    // invisible.
+describe("snapshot — the default provider on a fresh box", () => {
+  test("nothing configured → whisper-cpp, and it reports what's missing", () => {
+    // The fresh-install state. This used to resolve to `scribe-http` with no
+    // scribe anywhere — a provider that could never run, which is how audio was
+    // accepted and silently never transcribed. The default is now the local
+    // provider, so "not ready" is a list of things `transcription install`
+    // fixes rather than a dead end.
+    const s = buildTranscriptionSnapshot(deps(false));
+    expect(s.provider).toBe("whisper-cpp");
+    expect(s.ready).toBe(false);
+    expect(s.reason).toMatch(/parakeet-cli|model file|ffmpeg/);
+    expect(s.fix_command).toBe("parachute-vault transcription install");
+  });
+
+  test("a box with a reachable scribe still resolves to scribe-http", () => {
+    // The flip's safety property, asserted at the snapshot level: an operator
+    // running scribe today configured it by NOT setting TRANSCRIPTION_PROVIDER,
+    // so the flip must not move them off it.
+    process.env.SCRIBE_URL = "http://127.0.0.1:1943";
+    const s = buildTranscriptionSnapshot(deps(true));
+    expect(s.provider).toBe("scribe-http");
+    // ...and with a worker live, it reports as working rather than as broken.
+    expect(s.ready).toBe(true);
+  });
+
+  test("an explicitly-pinned scribe-http with nothing behind it still says why", () => {
+    process.env.TRANSCRIPTION_PROVIDER = "scribe-http";
     const s = buildTranscriptionSnapshot(deps(false));
     expect(s.provider).toBe("scribe-http");
     expect(s.ready).toBe(false);

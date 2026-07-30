@@ -30,38 +30,101 @@ import {
 const silent = { warn: () => {} };
 
 describe("resolveTranscriptionProviderName", () => {
-  test("unset → scribe-http (behavior-preserving default)", () => {
-    expect(resolveTranscriptionProviderName({}, silent)).toBe("scribe-http");
+  // Scribe presence is injected in every case. Left to production resolution it
+  // would read the developer's real ~/.parachute/services.json, so "unset" would
+  // resolve differently on a box that happens to have scribe installed — the
+  // test would pass for the wrong reason on one machine and fail on another.
+  const noScribe = { scribeConfiguredImpl: () => false };
+  const withScribe = { scribeConfiguredImpl: () => true };
+
+  test("unset + no scribe → whisper-cpp (the local default)", () => {
+    // The default a fresh box gets. `scribe-http` used to win here and was
+    // unreachable, so audio was accepted and never transcribed.
+    expect(resolveTranscriptionProviderName({}, silent, noScribe)).toBe("whisper-cpp");
   });
-  test("blank → scribe-http", () => {
-    expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "  " }, silent)).toBe("scribe-http");
+
+  test("unset + a reachable scribe → scribe-http (a working box keeps working)", () => {
+    // The safety property of the flip. These operators configured scribe by
+    // NOT configuring anything, so "unset" can't be read as "wants local" —
+    // flipping unconditionally would take transcription away from them.
+    expect(resolveTranscriptionProviderName({}, silent, withScribe)).toBe("scribe-http");
   });
-  test("explicit transcribe-cpp", () => {
-    expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "transcribe-cpp" }, silent)).toBe(
-      "transcribe-cpp",
+
+  test("blank → same default resolution as unset", () => {
+    expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "  " }, silent, noScribe)).toBe(
+      "whisper-cpp",
     );
-  });
-  test("explicit parakeet-mlx / onnx-asr (scribe-fold Phase 2b)", () => {
-    expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "parakeet-mlx" }, silent)).toBe(
-      "parakeet-mlx",
-    );
-    expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "onnx-asr" }, silent)).toBe(
-      "onnx-asr",
-    );
-  });
-  test("explicit scribe-http", () => {
-    expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "scribe-http" }, silent)).toBe(
+    expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "  " }, silent, withScribe)).toBe(
       "scribe-http",
     );
   });
-  test("unknown value → warns + falls back to scribe-http", () => {
-    let warned = false;
+
+  test("an EXPLICIT scribe-http is honored even with no scribe reachable", () => {
+    // Explicit config always wins over the probe: the operator may be about to
+    // start scribe, or point SCRIBE_URL somewhere that's briefly down. Silently
+    // overriding a stated choice is its own bug.
+    expect(
+      resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "scribe-http" }, silent, noScribe),
+    ).toBe("scribe-http");
+  });
+
+  test("an EXPLICIT whisper-cpp is honored even when scribe IS reachable", () => {
+    expect(
+      resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "whisper-cpp" }, silent, withScribe),
+    ).toBe("whisper-cpp");
+  });
+
+  test("explicit transcribe-cpp", () => {
+    expect(
+      resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "transcribe-cpp" }, silent, noScribe),
+    ).toBe("transcribe-cpp");
+  });
+
+  test("explicit parakeet-mlx / onnx-asr (scribe-fold Phase 2b)", () => {
+    expect(
+      resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "parakeet-mlx" }, silent, noScribe),
+    ).toBe("parakeet-mlx");
+    expect(
+      resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "onnx-asr" }, silent, noScribe),
+    ).toBe("onnx-asr");
+  });
+
+  test("unknown value → warns + falls back to the DEFAULT, not to scribe-http", () => {
+    // The fallback follows the same rule as unset, so a typo on a box with no
+    // scribe lands on the provider that can actually run rather than a dead one.
+    let warned = "";
     const name = resolveTranscriptionProviderName(
       { TRANSCRIPTION_PROVIDER: "whisper-magic" },
-      { warn: () => (warned = true) },
+      { warn: (...a: unknown[]) => (warned = a.join(" ")) },
+      noScribe,
+    );
+    expect(name).toBe("whisper-cpp");
+    // The warning must name what it fell back TO, or the operator can't tell
+    // which provider is actually running.
+    expect(warned).toContain("whisper-magic");
+    expect(warned).toContain("whisper-cpp");
+  });
+
+  test("unknown value on a scribe box falls back to scribe-http", () => {
+    let warned = "";
+    const name = resolveTranscriptionProviderName(
+      { TRANSCRIPTION_PROVIDER: "whisper-magic" },
+      { warn: (...a: unknown[]) => (warned = a.join(" ")) },
+      withScribe,
     );
     expect(name).toBe("scribe-http");
-    expect(warned).toBe(true);
+    expect(warned).toContain("scribe-http");
+  });
+
+  test("the scribe probe is consulted ONLY when there's no explicit provider", () => {
+    // Cheap guard against a regression that makes every capability check stat
+    // services.json — this runs on the per-upload path.
+    let probes = 0;
+    const counting = { scribeConfiguredImpl: () => (probes++, false) };
+    resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "whisper-cpp" }, silent, counting);
+    expect(probes).toBe(0);
+    resolveTranscriptionProviderName({}, silent, counting);
+    expect(probes).toBe(1);
   });
 });
 
