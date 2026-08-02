@@ -18,7 +18,10 @@
  * the UI answer "is transcription working" from ONE implementation.
  */
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterEach } from "bun:test";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from "fs";
+import { tmpdir } from "os";
+import { join, resolve } from "path";
 import { buildTranscriptionSnapshot } from "./transcription-routes.ts";
 import { TRANSCRIPTION_PROVIDERS } from "./transcription/select.ts";
 
@@ -119,5 +122,100 @@ describe("what `transcription status` must not claim", () => {
       if (prev === undefined) delete process.env.TRANSCRIPTION_PROVIDER;
       else process.env.TRANSCRIPTION_PROVIDER = prev;
     }
+  });
+});
+
+/**
+ * The command must report the CONFIG FILE, not its own process environment.
+ *
+ * Found live (UniOps, 2026-08-02): a box whose `.env` said `whisper-cpp` was
+ * told `scribe-http` — the retired service — while `status` was the very tool
+ * being used to diagnose why transcription was dead. Same class as the bug at
+ * the top of this file: the daemon loads `~/.parachute/vault/.env` at boot
+ * (`server.ts` → `loadEnvFile()`), a one-shot CLI process never did, and every
+ * resolver underneath reads `process.env`.
+ *
+ * These spawn the real CLI because that is where the defect lived — the
+ * resolvers were always correct when handed the right env; nothing but a
+ * process boundary reproduces it. No in-test `Bun.serve` is involved, so
+ * `Bun.spawnSync` is fine here (CLAUDE.md, "Subprocess tests + Bun.serve").
+ *
+ * Each case sets a value that DIFFERS from the fallback. A test using a value
+ * the fallback happens to produce would pass without the fix — which is
+ * precisely how this shipped: on an unconfigured box the default agrees with
+ * the file, so the command looked right until someone changed something.
+ */
+describe("`transcription status` reads ~/.parachute/vault/.env", () => {
+  const CLI = resolve(import.meta.dir, "cli.ts");
+  const homes: string[] = [];
+
+  afterEach(() => {
+    for (const h of homes.splice(0)) rmSync(h, { recursive: true, force: true });
+  });
+
+  /** A temp PARACHUTE_HOME whose `vault/.env` holds exactly these lines. */
+  function homeWithEnv(lines: string[]): string {
+    const home = mkdtempSync(join(tmpdir(), "pv-transcription-env-"));
+    homes.push(home);
+    mkdirSync(join(home, "vault"), { recursive: true });
+    writeFileSync(join(home, "vault", ".env"), `${lines.join("\n")}\n`);
+    return home;
+  }
+
+  /** Run `transcription status` with the file's values ONLY on disk. */
+  function status(home: string): string {
+    // Strip the inherited values so the child cannot pass by reading the
+    // parent's environment — the file is the only source in play.
+    const env: Record<string, string | undefined> = { ...process.env, PARACHUTE_HOME: home };
+    for (const k of [
+      "TRANSCRIPTION_PROVIDER",
+      "TRANSCRIPTION_MODEL",
+      "WHISPER_CPP_BIN_DIR",
+      "SCRIBE_URL",
+      "PARACHUTE_HUB_ORIGIN",
+    ]) {
+      delete env[k];
+    }
+    const proc = Bun.spawnSync({
+      cmd: ["bun", CLI, "transcription", "status"],
+      stdout: "pipe",
+      stderr: "pipe",
+      env,
+    });
+    return new TextDecoder().decode(proc.stdout);
+  }
+
+  test("the provider comes from the file, not the fallback default", () => {
+    // `scribe-http` is never the fallback on a box with no scribe in
+    // services.json — the default there is whisper-cpp. So this asserts the
+    // file was read rather than that two paths coincided.
+    const out = status(homeWithEnv(["TRANSCRIPTION_PROVIDER=scribe-http", "SCRIBE_URL=http://127.0.0.1:1943"]));
+    expect(out).toContain("scribe-http");
+    expect(out).not.toContain("(whisper-cpp)");
+  });
+
+  test("the model comes from the file", () => {
+    const out = status(homeWithEnv(["TRANSCRIPTION_PROVIDER=whisper-cpp", "TRANSCRIPTION_MODEL=whisper-tiny.en"]));
+    expect(out).toContain("Whisper Tiny (English)");
+    expect(out).not.toContain("Parakeet TDT 0.6b v3");
+  });
+
+  test("a binary-dir override in the file is honored — the false 'not found'", () => {
+    // The sharpest symptom: an installed, working binary reported missing
+    // because the `.env` override naming its directory never reached the
+    // resolver. This is the `runnable: no` line UniOps flagged as suspect.
+    const home = homeWithEnv([]);
+    const bin = join(home, "fakebin");
+    mkdirSync(bin, { recursive: true });
+    const exe = join(bin, "parakeet-cli");
+    writeFileSync(exe, "#!/bin/sh\nexit 0\n");
+    chmodSync(exe, 0o755);
+    writeFileSync(
+      join(home, "vault", ".env"),
+      `TRANSCRIPTION_PROVIDER=whisper-cpp\nWHISPER_CPP_BIN_DIR=${bin}\n`,
+    );
+    const out = status(home);
+    expect(out).toContain(exe);
+    expect(out).not.toContain("parakeet-cli   not found");
   });
 });
