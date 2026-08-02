@@ -9,6 +9,8 @@ import { describe, test, expect } from "bun:test";
 import {
   _resetNoProviderWarnForTest,
   classifyAutoTranscribe,
+  NO_PROVIDER_ERROR,
+  noProviderErrorFor,
   shouldAutoTranscribe,
   warnNoTranscriptionProvider,
 } from "./auto-transcribe.ts";
@@ -279,5 +281,108 @@ describe("warnNoTranscriptionProvider throttle (vault#643)", () => {
       console.warn = orig;
       _resetNoProviderWarnForTest();
     }
+  });
+});
+
+/**
+ * The `unavailable` error must be TRUE, not merely actionable.
+ *
+ * Found live: a box with `TRANSCRIPTION_PROVIDER=whisper-cpp`, `parakeet-cli`
+ * on PATH, the model downloaded, and `[transcribe] worker started →
+ * whisper-cpp` in the same boot log was writing "no transcription provider
+ * configured — set TRANSCRIPTION_PROVIDER to a local provider" onto its
+ * attachments. Every clause of that is false there, and the fix it prescribes
+ * is a 400 MB re-download that changes nothing.
+ *
+ * The decision is deliberately unchanged — `unavailable` stays `unavailable`,
+ * because this path resolves a scribe URL and nothing else. Only the sentence
+ * moves.
+ */
+describe("the unavailable message tells the truth about the local install", () => {
+  const audio = "audio/webm";
+  const noScribe = () => undefined;
+
+  test("nothing runnable locally → the original message, unchanged", () => {
+    // The fresh-install case the old string was written for, and it is still
+    // exactly right there. Byte-identical so a fresh install sees no churn.
+    const d = classifyAutoTranscribe(audio, {
+      perVaultEnabled: true,
+      getCachedScribeUrlImpl: noScribe,
+      localProviderImpl: () => null,
+    });
+    expect(d.kind).toBe("unavailable");
+    expect(noProviderErrorFor(d.kind === "unavailable" ? d.localProvider : null)).toBe(
+      NO_PROVIDER_ERROR,
+    );
+  });
+
+  test("a runnable local provider → a message that does not contradict the box", () => {
+    const d = classifyAutoTranscribe(audio, {
+      perVaultEnabled: true,
+      getCachedScribeUrlImpl: noScribe,
+      localProviderImpl: () => "whisper-cpp",
+    });
+    expect(d.kind).toBe("unavailable");
+    const msg = noProviderErrorFor(d.kind === "unavailable" ? d.localProvider : null);
+
+    // The three false claims the old string made on such a box.
+    expect(msg).not.toContain("no transcription provider configured");
+    expect(msg).not.toContain("set TRANSCRIPTION_PROVIDER to a local provider");
+    expect(msg).not.toContain("transcription install");
+    // And what it must say instead: the local install is fine, this path just
+    // doesn't read it, and don't go reinstalling anything.
+    expect(msg).toContain("whisper-cpp");
+    expect(msg).toContain("SCRIBE_URL");
+    expect(msg).toMatch(/does not consult it/);
+    expect(msg).toMatch(/Reinstalling whisper-cpp will not change this/);
+  });
+
+  test("the decision itself is untouched — this diff moves no behaviour", () => {
+    // Same inputs, both local-provider states: still `unavailable` either way.
+    // If this ever diverges, the change stopped being diagnostic-only and
+    // started deciding what gets transcribed.
+    for (const local of [null, "whisper-cpp"]) {
+      expect(
+        classifyAutoTranscribe(audio, {
+          perVaultEnabled: true,
+          getCachedScribeUrlImpl: noScribe,
+          localProviderImpl: () => local,
+        }).kind,
+      ).toBe("unavailable");
+    }
+    // And a reachable scribe still wins outright, local install or not.
+    expect(
+      classifyAutoTranscribe(audio, {
+        perVaultEnabled: true,
+        getCachedScribeUrlImpl: () => "http://127.0.0.1:1943",
+        localProviderImpl: () => "whisper-cpp",
+      }).kind,
+    ).toBe("transcribe");
+  });
+
+  test("an installed provider with ffmpeg missing STILL gets the honest message", () => {
+    // The trap that cost a rewrite: `snap.ready` also demands ffmpeg, so it
+    // varies box to box. A machine with the provider installed and ffmpeg
+    // missing is still one where "no transcription provider configured" is
+    // false, so the discriminator is INSTALLED, not READY — it answers the
+    // question the sentence asks, identically everywhere.
+    const msg = noProviderErrorFor("whisper-cpp");
+    expect(msg).not.toBe(NO_PROVIDER_ERROR);
+    // And it must not over-claim in the other direction: with ffmpeg missing
+    // the install is present but not necessarily working, so the message says
+    // requests are ROUTED to it and points at status for the real state.
+    expect(msg).toMatch(/routed to it/);
+    expect(msg).toContain("transcription status");
+    expect(msg).not.toMatch(/is fine/);
+  });
+
+  test("the provider NAME is not the discriminator — the fresh-install trap", () => {
+    // `resolveTranscriptionProviderName` returns "whisper-cpp" on a box where
+    // nothing is set up at all, because that is the default when no scribe URL
+    // resolves. Keying off the name would tell a fresh-install operator their
+    // whisper-cpp install is fine when they have never installed one. The
+    // discriminator is RUNNABILITY, and null must produce the old message.
+    expect(noProviderErrorFor(null)).toBe(NO_PROVIDER_ERROR);
+    expect(noProviderErrorFor("whisper-cpp")).not.toBe(NO_PROVIDER_ERROR);
   });
 });

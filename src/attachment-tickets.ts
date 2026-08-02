@@ -24,6 +24,7 @@ import { sanitizeAttachmentExtension } from "../core/src/attachment/policy.ts";
 import { assetsDir, readVaultConfig } from "./config.ts";
 import {
   NO_PROVIDER_ERROR,
+  noProviderErrorFor,
   classifyAutoTranscribe,
   warnNoTranscriptionProvider,
 } from "./auto-transcribe.ts";
@@ -303,7 +304,11 @@ async function handleUploadSpend(
     }
   } else if (transcribeUnavailable) {
     attMeta.transcribe_status = "failed";
-    attMeta.transcribe_error = NO_PROVIDER_ERROR;
+    // Name the real situation. On a box with a local provider configured,
+    // the flat NO_PROVIDER_ERROR told the operator to do what they'd done.
+    attMeta.transcribe_error = noProviderErrorFor(
+      autoDecision.kind === "unavailable" ? autoDecision.localProvider : null,
+    );
     attMeta.transcribe_requested_at = new Date().toISOString();
     attMeta.transcribe_origin = "auto";
     if (ticket.segmentIndex !== undefined) {

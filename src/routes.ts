@@ -147,6 +147,7 @@ import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { assetsDir, readGlobalConfig, readVaultConfig } from "./config.ts";
 import {
   NO_PROVIDER_ERROR,
+  noProviderErrorFor,
   classifyAutoTranscribe,
   shouldAutoTranscribe,
   warnNoTranscriptionProvider,
@@ -2429,7 +2430,12 @@ async function handleNotesInner(
         : transcribeUnavailable
           ? {
               transcribe_status: "failed" as const,
-              transcribe_error: NO_PROVIDER_ERROR,
+              // Name the real situation — see noProviderErrorFor. On a box
+              // with a local provider configured, the flat NO_PROVIDER_ERROR
+              // told the operator to do what they had already done.
+              transcribe_error: noProviderErrorFor(
+                autoDecision.kind === "unavailable" ? autoDecision.localProvider : null,
+              ),
               transcribe_requested_at: new Date().toISOString(),
               transcribe_origin: "auto" as const,
               ...(validSegment ? { segment_index: segIdx } : {}),
