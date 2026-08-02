@@ -2367,6 +2367,22 @@ async function handleNotesInner(
       // Explicit `transcribe: true` wins — if the caller asked, we honor that
       // regardless of the auto-transcribe toggle (back-compat).
       const explicitOptIn = body.transcribe === true;
+      // Explicit opt-OUT. `transcribe: false` is a caller saying no, and it is
+      // NOT the same as saying nothing — which is the only reading this route
+      // had until now (`body.transcribe` was read once, as `=== true`, so
+      // `false` and absent were indistinguishable).
+      //
+      // That collapse is what put the auto path in front of a decision the user
+      // had already made: the app's `voice-capture-plan.ts` sets this from the
+      // capture's transcribe toggle, its docstring states the invariant
+      // ("every link sends `transcribe: false`"), and the sync queue dropped
+      // the `false` in transit. With both halves in place a "no" arrives as a
+      // "no" and auto-transcribe is never consulted — it exists to guess when
+      // nobody expressed a preference, which is no longer this case.
+      //
+      // Absent still means absent, so old app builds and any caller with
+      // genuinely no opinion are byte-unchanged; this is additive.
+      const explicitOptOut = body.transcribe === false;
       // Per-vault auto-transcribe: read THIS vault's `auto_transcribe.enabled`
       // (vault.yaml) and pass it as the precedence-winning toggle. A vault that
       // set its own value uses it; one that left it unset falls through to the
@@ -2378,9 +2394,18 @@ async function handleNotesInner(
       // turned it off" and "nothing is configured to do it" both used to read
       // as `false`, so a misconfigured box silently accepted audio and
       // transcribed nothing — no marker, no status, no log.
+      // An explicit opt-out resolves to `disabled`, which already carries
+      // exactly the right meaning here — "silence is correct: they asked for
+      // nothing to happen" (see `AutoTranscribeDecision`). Reusing it rather
+      // than adding a kind means the downstream branches need no changes: not
+      // `transcribe`, so nothing is enqueued; not `unavailable`, so no `failed`
+      // marker and no missing-provider warning. The attachment links as a plain
+      // audio file, which is what the caller asked for.
       const autoDecision = explicitOptIn
         ? ({ kind: "transcribe" } as const)
-        : classifyAutoTranscribe(body.mimeType, { perVaultEnabled });
+        : explicitOptOut
+          ? ({ kind: "disabled" } as const)
+          : classifyAutoTranscribe(body.mimeType, { perVaultEnabled });
       const autoOptIn = !explicitOptIn && autoDecision.kind === "transcribe";
       // Enabled, audio, but no reachable provider. Record it on the attachment
       // so the state is visible in the API and the admin SPA instead of the
