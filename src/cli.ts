@@ -3591,6 +3591,32 @@ function printHistoryUsage(): void {
  * per-provider install state.
  */
 async function cmdTranscription(args: string[]) {
+  // Read the config this command REPORTS ON. Every transcription setting lives
+  // in `~/.parachute/vault/.env` (CLAUDE.md, "Conventions"), and the resolvers
+  // underneath — `resolveTranscriptionProviderName`, `resolveScribeUrl`,
+  // `resolveTranscribeCppPaths`, the model lookup — all read `process.env`.
+  // The daemon gets that env because `server.ts` calls `loadEnvFile()` at boot;
+  // a one-shot CLI process does not, so before this line `transcription status`
+  // answered from an EMPTY env and printed the fallback default as though it
+  // were the operator's configuration.
+  //
+  // Three ways that lied on a box whose `.env` set the values (all reproduced
+  // at 7652af4):
+  //   - `TRANSCRIPTION_PROVIDER=scribe-http` in the file → reported whisper-cpp
+  //   - `TRANSCRIPTION_MODEL=whisper-tiny.en` in the file → reported Parakeet
+  //   - `WHISPER_CPP_BIN_DIR=<dir>` in the file → "parakeet-cli not found"
+  //     while the binary sat in that very directory
+  //
+  // The failure mode is the nasty one: with nothing configured the fallback
+  // HAPPENS to equal the file, so the command looks correct right up until an
+  // operator changes something — i.e. it lies precisely during the task it
+  // exists for. Loading here (not just in `status`) covers `install` too, whose
+  // binary probing reads the same overrides.
+  //
+  // `loadEnvFile` only fills keys that are `undefined`, so a var passed
+  // explicitly on the command line still wins — same precedence the daemon has.
+  loadEnvFile();
+
   const sub = args[0];
   if (sub === "install") {
     await cmdTranscriptionInstall(args.slice(1));
