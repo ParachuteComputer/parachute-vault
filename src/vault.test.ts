@@ -2901,6 +2901,63 @@ describe("HTTP /notes", async () => {
       expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
     });
 
+    // The explicit opt-out. `transcribe: false` is a caller saying no, and it
+    // used to be indistinguishable from saying nothing — `body.transcribe` was
+    // read once, as `=== true`. So a user who turned the capture's transcribe
+    // toggle OFF had their decision answered by the auto-transcribe guess,
+    // which exists for callers who expressed no preference.
+    //
+    // Contrast with the test directly above: same request, same suite, same
+    // absent provider — absent gets `failed`, `false` gets nothing at all.
+    test("transcribe: false is honoured — no transcription, and NO failure marker", async () => {
+      await store.createNote("note body", { id: "v2c" });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/v2c/attachments", {
+          path: "memos/memo-optout.webm",
+          mimeType: "audio/webm",
+          transcribe: false,
+        }),
+        store,
+        "/v2c/attachments",
+      );
+      expect(res.status).toBe(201);
+      const att = await res.json() as any;
+      // Not enqueued...
+      expect(att.metadata?.transcribe_status).toBeUndefined();
+      // ...and NOT recorded as a misconfiguration either. Nothing failed; the
+      // caller asked for nothing to happen and nothing happened.
+      expect(att.metadata?.transcribe_error).toBeUndefined();
+      expect(att.metadata?.transcribe_origin).toBeUndefined();
+      // The note is untouched — no stub to fill, because no transcript is coming.
+      const note = await store.getNote("v2c");
+      expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+    });
+
+    test("false and absent are no longer the same request", async () => {
+      // The regression this pair exists to prevent, stated as one assertion:
+      // if these two ever produce equal metadata again, the opt-out has been
+      // collapsed back into "no opinion".
+      await store.createNote("body", { id: "v2d" });
+      await store.createNote("body", { id: "v2e" });
+      const mk = async (id: string, extra: Record<string, unknown>) => {
+        const r = await handleNotes(
+          mkReq("POST", `/notes/${id}/attachments`, {
+            path: `memos/${id}.webm`,
+            mimeType: "audio/webm",
+            ...extra,
+          }),
+          store,
+          `/${id}/attachments`,
+        );
+        return ((await r.json()) as any).metadata ?? {};
+      };
+      const absent = await mk("v2d", {});
+      const optedOut = await mk("v2e", { transcribe: false });
+      expect(absent.transcribe_status).toBe("failed");
+      expect(optedOut.transcribe_status).toBeUndefined();
+      expect(absent).not.toEqual(optedOut);
+    });
+
     test("NON-audio with no flag still leaves metadata completely empty", async () => {
       await store.createNote("note body", { id: "v2b" });
       const res = await handleNotes(

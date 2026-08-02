@@ -268,6 +268,17 @@ async function handleUploadSpend(
   // mint) wins; otherwise infer from mime-type + the owning vault's
   // auto-transcribe toggle.
   const explicitOptIn = ticket.transcribe === true;
+  // NO explicit-opt-out branch here, deliberately — unlike the REST attach
+  // route this path CANNOT express one today. `generateMcpTools` mints the
+  // ticket with `transcribe: params.transcribe === true` (core/src/mcp.ts),
+  // so a caller who says nothing and a caller who says `false` both arrive
+  // as `false`. Reading `false` as an opt-out here would therefore disable
+  // auto-transcribe for every ticket that didn't explicitly opt in — the
+  // collapse this work exists to undo, in the opposite direction.
+  //
+  // Making the ticket path symmetric means preserving the tri-state at mint
+  // first, which is a change to the MCP tool contract and belongs with that
+  // argument rather than smuggled in here.
   const perVaultEnabled = readVaultConfig(vaultName)?.auto_transcribe?.enabled;
   const autoDecision = explicitOptIn
     ? ({ kind: "transcribe" } as const)
