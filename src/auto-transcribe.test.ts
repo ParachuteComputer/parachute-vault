@@ -361,11 +361,11 @@ describe("the unavailable message tells the truth about the local install", () =
   });
 
   test("an installed provider with ffmpeg missing STILL gets the honest message", () => {
-    // The trap that cost a rewrite: `snap.ready` also demands ffmpeg, so
-    // gating on readiness would have left the very box that reported this bug
-    // on the old, wrong string — it has the provider installed and no ffmpeg.
-    // "no transcription provider configured" is false there regardless of
-    // ffmpeg, so the discriminator is INSTALLED, not READY.
+    // The trap that cost a rewrite: `snap.ready` also demands ffmpeg, so it
+    // varies box to box. A machine with the provider installed and ffmpeg
+    // missing is still one where "no transcription provider configured" is
+    // false, so the discriminator is INSTALLED, not READY — it answers the
+    // question the sentence asks, identically everywhere.
     const msg = noProviderErrorFor("whisper-cpp");
     expect(msg).not.toBe(NO_PROVIDER_ERROR);
     // And it must not over-claim in the other direction: with ffmpeg missing

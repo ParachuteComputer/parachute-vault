@@ -19,12 +19,13 @@ import { buildTranscriptionSnapshot } from "./transcription-routes.ts";
  * answer from, so these surfaces share one implementation and cannot drift.
  *
  * Keyed on `binary.path`, deliberately, NOT on `snap.ready`. Readiness also
- * demands ffmpeg, and a box with the provider installed but ffmpeg missing is
- * still a box where "no transcription provider configured — set
- * TRANSCRIPTION_PROVIDER to a local provider" is false. Gating on `ready` would
- * have left exactly the reporting box on the old, wrong message, because it has
- * no ffmpeg. (Caught by running the real probe rather than the injected one —
- * the unit tests inject `localProviderImpl` and would never have shown it.)
+ * demands ffmpeg, so it varies box to box in a way this message shouldn't: a
+ * machine with the provider installed but ffmpeg missing is still a machine
+ * where "no transcription provider configured — set TRANSCRIPTION_PROVIDER to
+ * a local provider" is false. `installed` answers the question the sentence
+ * actually asks, and answers it the same way everywhere.
+ * (Caught by running the real probe rather than the injected one — the unit
+ * tests inject `localProviderImpl` and would never have shown the difference.)
  *
  * Errors swallow to null: a broken probe must degrade to the old, flat message,
  * never take down an attachment upload.
