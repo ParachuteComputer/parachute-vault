@@ -271,3 +271,127 @@ export function remoteConflictMessage(conflict: RemoteConflict): string {
     `If you're sure (e.g. you just moved the repo between vaults), pass override=true to proceed anyway.`
   );
 }
+
+// ---------------------------------------------------------------------------
+// Unrelated-history guard (vault#823).
+//
+// Field report: a vault imported from a git repo, then armed Sync against that
+// same repo, and every push for five days was refused as non-fast-forward.
+// `mirror-import.ts` clones to a TEMP dir, imports notes into the store, and
+// deletes the temp dir — it never touches the mirror dir. The mirror is then
+// stood up fresh by `bootstrapInternalMirror` (`git init` + seed commit), so
+// its root commit has no relationship to anything on the remote. Two histories,
+// no common ancestor, and no push can ever land. It is deterministic, not a
+// race: ANY import onto a non-empty remote produces a mirror that can never
+// push.
+//
+// The cross-vault guard above answers "is someone else using this repo?". This
+// one answers a different question about the SAME bind: "can my history reach
+// theirs at all?" — and it is the one the import path needs, because on that
+// path the remote is not a stranger's repo, it is the repo we just cloned FROM.
+//
+// Detection, without a fetch: ask the remote for its head shas (`ls-remote`,
+// already run at the PAT bind point), then ask the mirror whether it HOLDS any
+// of those objects (`git cat-file -e`). A mirror that was cloned from — or has
+// ever pushed to — the remote holds them. A freshly-`git init`ed one does not.
+// ---------------------------------------------------------------------------
+
+/** A detected unrelated-history bind — the mirror can never push to this remote. */
+export interface UnrelatedHistory {
+  /** Normalized repo identity, or the raw URL when it can't be parsed. */
+  remoteIdentity: string;
+  /** True when the mirror dir doesn't exist / holds no commits yet. */
+  mirrorIsFresh: boolean;
+}
+
+/**
+ * Does `mirrorPath` hold at least one of `remoteHeads`?
+ *
+ * `git cat-file -e <sha>^{commit}` is a local object-database lookup — no
+ * network, no fetch, no working-tree touch. Fails closed to `false` (we do not
+ * hold it) on any spawn error, which routes into "unrelated" and therefore into
+ * a warning rather than a silent arm. That is the safe direction: the cost of a
+ * false warning is one confused operator; the cost of a false all-clear is five
+ * days with no backup.
+ */
+async function mirrorHoldsAnyRemoteHead(
+  mirrorPath: string,
+  remoteHeads: string[],
+  spawnImpl: typeof Bun.spawn = Bun.spawn,
+): Promise<boolean> {
+  for (const sha of remoteHeads) {
+    if (!/^[0-9a-f]{7,64}$/.test(sha)) continue;
+    try {
+      const proc = spawnImpl(["git", "cat-file", "-e", `${sha}^{commit}`], {
+        cwd: mirrorPath,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      if ((await proc.exited) === 0) return true;
+    } catch {
+      // git missing / path unreadable — treat as "not held" and keep going.
+    }
+  }
+  return false;
+}
+
+/**
+ * Detect a bind whose pushes can never land: a non-empty remote whose history
+ * the local mirror cannot reach.
+ *
+ * Returns null (bind is fine) when:
+ *   - the remote is EMPTY — nothing to conflict with; the first push defines
+ *     the history. This is the ordinary "fresh repo" setup and must not warn.
+ *   - the mirror already holds one of the remote's heads — it was cloned from
+ *     there, or has pushed there before. Re-binding after a token rotation
+ *     lands here and must not warn.
+ *
+ * Returns a struct (bind will never push) when the remote has refs and the
+ * mirror holds none of them — including the case where the mirror does not
+ * exist yet, because what gets created will be a fresh `git init`.
+ */
+export async function findUnrelatedRemoteHistory(opts: {
+  mirrorPath: string | null;
+  remoteUrl: string;
+  /** Head shas from `git ls-remote` — empty array means an empty remote. */
+  remoteHeads: string[];
+  /** Test seam. */
+  spawnImpl?: typeof Bun.spawn;
+}): Promise<UnrelatedHistory | null> {
+  const { mirrorPath, remoteUrl, remoteHeads, spawnImpl } = opts;
+  // An empty remote can't conflict — the first push establishes the history.
+  if (remoteHeads.length === 0) return null;
+
+  const remoteIdentity = normalizeRemoteIdentity(remoteUrl) ?? redactUrlForMessage(remoteUrl);
+
+  // No mirror on disk yet → whatever gets bootstrapped will be a fresh root.
+  if (mirrorPath === null || !existsSync(join(mirrorPath, ".git"))) {
+    return { remoteIdentity, mirrorIsFresh: true };
+  }
+  if (await mirrorHoldsAnyRemoteHead(mirrorPath, remoteHeads, spawnImpl)) return null;
+  return { remoteIdentity, mirrorIsFresh: false };
+}
+
+/**
+ * Strip any userinfo from a remote URL so an unparseable one can still be
+ * named in an operator-facing message without leaking a token.
+ */
+function redactUrlForMessage(remote: string): string {
+  return remote.replace(/\/\/[^@/]*@/, "//");
+}
+
+/**
+ * Operator-facing message for a refused arm. Says what is wrong, why it can
+ * never self-correct, and what the three real options are — deliberately
+ * concrete, because "non-fast-forward" is exactly the error an operator cannot
+ * act on without knowing the histories are unrelated.
+ */
+export function unrelatedHistoryMessage(found: UnrelatedHistory): string {
+  return (
+    `${found.remoteIdentity} already has commits that this vault's backup history doesn't share, ` +
+    `so every push would be rejected (non-fast-forward) and it would never recover on its own. ` +
+    `Importing brings your notes across but not the old backup history, which is why they don't line up. ` +
+    `Either back up to a new empty repo, or replace the repo's contents with this vault's history on purpose. ` +
+    `If you know they should be joined, pass override=true to arm Sync anyway.`
+  );
+}

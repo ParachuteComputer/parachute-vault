@@ -22,6 +22,7 @@ import {
   type MirrorDeps,
 } from "./mirror-manager.ts";
 import {
+  enableSyncToImportedRepo,
   _resetDeviceFlowSessionsForTest,
   handleAuthDelete,
   handleAuthGet,
@@ -2310,6 +2311,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2355,6 +2358,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2391,6 +2396,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2435,6 +2442,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2470,6 +2479,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { sync_enabled: boolean };
@@ -2516,6 +2527,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2569,6 +2582,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2626,6 +2641,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { sync_enabled: boolean };
@@ -2673,6 +2690,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2722,6 +2741,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2766,6 +2787,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -3165,3 +3188,127 @@ describe("cross-vault remote-clobber guard (vault#482)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// vault#823 — enableSyncToImportedRepo must consult the unrelated-history
+// guard, not just contain a call to it.
+//
+// The lesson from hub#820, applied before shipping rather than after: proving
+// `findUnrelatedRemoteHistory` returns a struct proves nothing about whether
+// the arm path reads it. Mutating `if (unrelated)` to `if (false && unrelated)`
+// left the whole vault suite green, which is how this test came to exist.
+// ---------------------------------------------------------------------------
+
+describe("enableSyncToImportedRepo — unrelated-history guard (vault#823)", () => {
+  /** Minimal manager stand-in: the guard branch only reads `mirror_path`. */
+  function stubManager(mirrorPath: string | null): MirrorManager {
+    return {
+      getStatus: () => ({ mirror_path: mirrorPath }),
+    } as unknown as MirrorManager;
+  }
+
+  test("non-empty remote + fresh mirror → sync NOT armed, and the reason is stated", async () => {
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/my-vault.git",
+      auth: { kind: "none" },
+      manager: stubManager(null), // nothing bootstrapped yet — the import case
+      probeOverride: async () => ({ ok: true, heads: ["a".repeat(40)] }),
+    });
+    expect(res.sync_enabled).toBe(false);
+    expect(res.warning).toContain("github.com/aaron/my-vault");
+    expect(res.warning).toContain("non-fast-forward");
+    // It must not be mistaken for the "no credential" refusal further down —
+    // that one fires for auth.kind === "none" and would also return false.
+    expect(res.warning).not.toContain("write credentials");
+  });
+
+  test("empty remote → guard stays out of the way (falls through to the credential check)", async () => {
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/fresh.git",
+      auth: { kind: "none" },
+      manager: stubManager(null),
+      probeOverride: async () => ({ ok: true, heads: [] }),
+    });
+    expect(res.sync_enabled).toBe(false);
+    // Reached the NEXT refusal, which proves the history guard declined to fire.
+    expect(res.warning).toContain("write credentials");
+  });
+
+  test("override=true skips the guard entirely", async () => {
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/my-vault.git",
+      auth: { kind: "none" },
+      manager: stubManager(null),
+      override: true,
+      probeOverride: async () => ({ ok: true, heads: ["a".repeat(40)] }),
+    });
+    expect(res.warning).toContain("write credentials");
+    expect(res.warning).not.toContain("non-fast-forward");
+  });
+
+  test("unreachable remote fails OPEN — a network blip must not block setup", async () => {
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/my-vault.git",
+      auth: { kind: "none" },
+      manager: stubManager(null),
+      probeOverride: async () => ({ ok: false, error: "could not resolve host" }),
+    });
+    expect(res.warning).toContain("write credentials");
+    expect(res.warning).not.toContain("non-fast-forward");
+  });
+
+  test("a skipped check is SAID, not silent — the advisory rides on a successful arm", async () => {
+    // Uni's catch on #646: this guard runs at BIND time and there may be no
+    // next bind. An operator arms Sync once and walks away, so a probe blip
+    // that silently skips the check reproduces the exact five-day silence the
+    // guard exists to prevent. Failing open is still right; failing open
+    // WITHOUT saying so is not.
+    let armed = false;
+    const manager = {
+      getStatus: () => (armed ? { mirror_path: "/tmp/m", enabled: true } : { mirror_path: null }),
+      getEffectiveConfig: () => ({ enabled: false, auto_push: false, location: "internal" }),
+      reload: async () => {
+        armed = true;
+      },
+    } as unknown as MirrorManager;
+
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/my-vault.git",
+      auth: { kind: "pat", token: "ghp_x" },
+      manager,
+      probeOverride: async () => ({ ok: false, error: "could not resolve host" }),
+    });
+    expect(res.sync_enabled).toBe(true);
+    expect(res.warning).toContain("couldn't reach the repo");
+    // Points at a surface that works TODAY — the vault's own Git remote
+    // section, which renders status.last_push_error. Naming the hub account
+    // tile instead would make hub#820 a precondition for text a user reads.
+    expect(res.warning).toContain("Git remote section");
+    expect(res.warning).not.toContain("account page");
+  });
+
+  test("a probe that succeeded adds no advisory", async () => {
+    let armed = false;
+    const manager = {
+      getStatus: () => (armed ? { mirror_path: "/tmp/m", enabled: true } : { mirror_path: null }),
+      getEffectiveConfig: () => ({ enabled: false, auto_push: false, location: "internal" }),
+      reload: async () => {
+        armed = true;
+      },
+    } as unknown as MirrorManager;
+
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/fresh.git",
+      auth: { kind: "pat", token: "ghp_x" },
+      manager,
+      probeOverride: async () => ({ ok: true, heads: [] }),
+    });
+    expect(res.sync_enabled).toBe(true);
+    expect(res.warning ?? "").not.toContain("couldn't reach");
+  });
+});
