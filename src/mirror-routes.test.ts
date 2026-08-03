@@ -2311,6 +2311,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2356,6 +2358,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2392,6 +2396,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2436,6 +2442,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2471,6 +2479,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { sync_enabled: boolean };
@@ -2517,6 +2527,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2570,6 +2582,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2627,6 +2641,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { sync_enabled: boolean };
@@ -2674,6 +2690,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2723,6 +2741,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2767,6 +2787,8 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
       spawnCloneSuccess(fixture),
       undefined,
       manager,
+      // vault#823: hermetic probe — reachable, empty remote (no guard fire).
+      async () => ({ ok: true, heads: [] }),
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -3236,5 +3258,54 @@ describe("enableSyncToImportedRepo — unrelated-history guard (vault#823)", () 
     });
     expect(res.warning).toContain("write credentials");
     expect(res.warning).not.toContain("non-fast-forward");
+  });
+
+  test("a skipped check is SAID, not silent — the advisory rides on a successful arm", async () => {
+    // Uni's catch on #646: this guard runs at BIND time and there may be no
+    // next bind. An operator arms Sync once and walks away, so a probe blip
+    // that silently skips the check reproduces the exact five-day silence the
+    // guard exists to prevent. Failing open is still right; failing open
+    // WITHOUT saying so is not.
+    let armed = false;
+    const manager = {
+      getStatus: () => (armed ? { mirror_path: "/tmp/m", enabled: true } : { mirror_path: null }),
+      getEffectiveConfig: () => ({ enabled: false, auto_push: false, location: "internal" }),
+      reload: async () => {
+        armed = true;
+      },
+    } as unknown as MirrorManager;
+
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/my-vault.git",
+      auth: { kind: "pat", token: "ghp_x" },
+      manager,
+      probeOverride: async () => ({ ok: false, error: "could not resolve host" }),
+    });
+    expect(res.sync_enabled).toBe(true);
+    expect(res.warning).toContain("couldn't reach the repo");
+    // Points at the surface that WILL catch it after the fact (hub#820).
+    expect(res.warning).toContain("backup status");
+  });
+
+  test("a probe that succeeded adds no advisory", async () => {
+    let armed = false;
+    const manager = {
+      getStatus: () => (armed ? { mirror_path: "/tmp/m", enabled: true } : { mirror_path: null }),
+      getEffectiveConfig: () => ({ enabled: false, auto_push: false, location: "internal" }),
+      reload: async () => {
+        armed = true;
+      },
+    } as unknown as MirrorManager;
+
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/fresh.git",
+      auth: { kind: "pat", token: "ghp_x" },
+      manager,
+      probeOverride: async () => ({ ok: true, heads: [] }),
+    });
+    expect(res.sync_enabled).toBe(true);
+    expect(res.warning ?? "").not.toContain("couldn't reach");
   });
 });

@@ -1749,6 +1749,13 @@ export async function handleMirrorImport(
   spawnOverride?: GitSpawn,
   whichOverride?: (cmd: string) => string | null,
   managerOverride?: MirrorManager,
+  // vault#823 test seam — the unrelated-history probe reaches the network
+  // (`git ls-remote`) on the sync-arm path. Inject one to keep import tests
+  // hermetic; production passes nothing and the real probe runs.
+  probeOverride?: (
+    url: string,
+    timeoutMs: number,
+  ) => Promise<{ ok: boolean; error?: string; heads?: string[] }>,
 ): Promise<Response> {
   let body: {
     remote_url?: unknown;
@@ -1952,6 +1959,7 @@ export async function handleMirrorImport(
           auth,
           manager,
           override,
+          probeOverride,
         });
         result.sync_enabled = outcome.sync_enabled;
         if (outcome.warning) result.sync_warning = outcome.warning;
@@ -2159,16 +2167,19 @@ async function headShasOfRemote(
     url: string,
     timeoutMs: number,
   ) => Promise<{ ok: boolean; error?: string; heads?: string[] }>,
-): Promise<string[]> {
+): Promise<{ heads: string[]; probed: boolean }> {
   let url = remoteUrl;
   if (auth.kind === "pat") {
     url = embedTokenInRemoteUrl(remoteUrl, auth.token) ?? remoteUrl;
   }
   try {
     const probe = await (probeOverride ?? probeGitLsRemote)(url, 10_000);
-    return probe.ok ? (probe.heads ?? []) : [];
+    // `ok` with no `heads` key means an older probe shape, not an empty remote —
+    // treat it as "didn't ask" so the caller can say so.
+    if (probe.ok && probe.heads !== undefined) return { heads: probe.heads, probed: true };
+    return { heads: [], probed: false };
   } catch {
-    return [];
+    return { heads: [], probed: false };
   }
 }
 
@@ -2200,6 +2211,21 @@ export async function enableSyncToImportedRepo(opts: {
   ) => Promise<{ ok: boolean; error?: string; heads?: string[] }>;
 }): Promise<{ sync_enabled: boolean; warning?: string }> {
   const { vaultName, remoteUrl, auth, manager, override = false, probeOverride } = opts;
+  // Set when the unrelated-history probe couldn't reach the remote. Rides along
+  // on a SUCCESSFUL arm — the operator gets Sync and the caveat, not neither.
+  let historyUnverified = false;
+  const withUnverifiedNote = (
+    result: { sync_enabled: boolean; warning?: string },
+  ): { sync_enabled: boolean; warning?: string } => {
+    if (!historyUnverified || !result.sync_enabled) return result;
+    const note =
+      "Sync is on, but we couldn't reach the repo to check its history lines up with this vault's backup. " +
+      "If pushes start failing, the backup status on your account page will say so.";
+    return {
+      ...result,
+      warning: result.warning ? `${result.warning} ${note}` : note,
+    };
+  };
 
   if (!manager) {
     return {
@@ -2232,16 +2258,27 @@ export async function enableSyncToImportedRepo(opts: {
     // Decline the optional sync-arm and say why. The import itself already
     // succeeded and is not touched: the thing that would be wrong is quietly
     // pointing a backup at a repo it can never write to.
-    const unrelated = await findUnrelatedRemoteHistory({
-      mirrorPath: manager.getStatus().mirror_path,
-      remoteUrl,
-      remoteHeads: await headShasOfRemote(remoteUrl, auth, probeOverride),
-    });
-    if (unrelated) {
-      return {
-        sync_enabled: false,
-        warning: `Import succeeded, but Sync was not enabled — ${unrelatedHistoryMessage(unrelated)}`,
-      };
+    const probe = await headShasOfRemote(remoteUrl, auth, probeOverride);
+    if (probe.probed) {
+      const unrelated = await findUnrelatedRemoteHistory({
+        mirrorPath: manager.getStatus().mirror_path,
+        remoteUrl,
+        remoteHeads: probe.heads,
+      });
+      if (unrelated) {
+        return {
+          sync_enabled: false,
+          warning: `Import succeeded, but Sync was not enabled — ${unrelatedHistoryMessage(unrelated)}`,
+        };
+      }
+    } else {
+      // Fail OPEN — a network blip must not block a legitimate setup. But say
+      // so: this guard runs at BIND time and there may be no next bind, so a
+      // silently-skipped check is the same five-day silence it exists to
+      // prevent, reached by a different route. Arming with an unverified
+      // remote is the right trade; arming without saying it was unverified is
+      // not.
+      historyUnverified = true;
     }
   }
 
@@ -2313,7 +2350,7 @@ export async function enableSyncToImportedRepo(opts: {
           };
         }
       }
-      return await applyEnabledAutoPush(manager);
+      return withUnverifiedNote(await applyEnabledAutoPush(manager));
     }
     // Different remote — don't clobber the operator's existing backup target.
     return {
@@ -2401,7 +2438,7 @@ export async function enableSyncToImportedRepo(opts: {
     }
   }
 
-  return await applyEnabledAutoPush(manager);
+  return withUnverifiedNote(await applyEnabledAutoPush(manager));
 }
 
 /**
