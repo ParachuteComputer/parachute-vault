@@ -3284,8 +3284,11 @@ describe("enableSyncToImportedRepo — unrelated-history guard (vault#823)", () 
     });
     expect(res.sync_enabled).toBe(true);
     expect(res.warning).toContain("couldn't reach the repo");
-    // Points at the surface that WILL catch it after the fact (hub#820).
-    expect(res.warning).toContain("backup status");
+    // Points at a surface that works TODAY — the vault's own Git remote
+    // section, which renders status.last_push_error. Naming the hub account
+    // tile instead would make hub#820 a precondition for text a user reads.
+    expect(res.warning).toContain("Git remote section");
+    expect(res.warning).not.toContain("account page");
   });
 
   test("a probe that succeeded adds no advisory", async () => {

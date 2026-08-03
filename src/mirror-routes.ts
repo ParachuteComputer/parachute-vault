@@ -2218,9 +2218,16 @@ export async function enableSyncToImportedRepo(opts: {
     result: { sync_enabled: boolean; warning?: string },
   ): { sync_enabled: boolean; warning?: string } => {
     if (!historyUnverified || !result.sync_enabled) return result;
+    // Points at the vault's OWN Git remote section, which renders
+    // `status.last_push_error` today (mirror-manager.ts:121-140, "Cut 5: push
+    // observability"). Deliberately NOT the hub account page: that tile only
+    // reports push outcome once hub#820 lands, and an advisory naming a
+    // diagnostic that doesn't work yet is the same defect this whole set has
+    // been clearing — a claim asserting something that isn't true. Uni caught
+    // that this sentence had made #820 a precondition for user-facing text.
     const note =
       "Sync is on, but we couldn't reach the repo to check its history lines up with this vault's backup. " +
-      "If pushes start failing, the backup status on your account page will say so.";
+      "If pushes start failing, the Git remote section will show the error.";
     return {
       ...result,
       warning: result.warning ? `${result.warning} ${note}` : note,
