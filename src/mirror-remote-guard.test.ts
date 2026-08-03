@@ -18,6 +18,8 @@ import {
   sameRemoteIdentity,
   claimedRemoteOf,
   findConflictingVault,
+  findUnrelatedRemoteHistory,
+  unrelatedHistoryMessage,
 } from "./mirror-remote-guard.ts";
 import { writeMirrorConfigForVault, defaultMirrorConfig } from "./mirror-config.ts";
 import { writeCredentials } from "./mirror-credentials.ts";
@@ -265,5 +267,162 @@ describe("findConflictingVault", () => {
     seedVault("a", { origin: "https://github.com/aaron/shared.git" });
     expect(findConflictingVault("b", "")).toBeNull();
     expect(findConflictingVault("b", "   ")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// vault#823 — unrelated-history guard, against REAL git repos.
+//
+// The failure being guarded is deterministic and reproduces in plain git:
+// give a remote some history, `git init` a fresh mirror beside it, bind, push
+// → `! [rejected] (non-fast-forward)`, forever. These tests build exactly that
+// on disk rather than mocking the object database, because the whole claim is
+// about what git does with two roots.
+// ---------------------------------------------------------------------------
+
+function git(cwd: string, ...args: string[]): void {
+  const proc = Bun.spawnSync(["git", ...args], {
+    cwd,
+    stdout: "ignore",
+    stderr: "ignore",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t",
+      GIT_AUTHOR_EMAIL: "t@example.com",
+      GIT_COMMITTER_NAME: "t",
+      GIT_COMMITTER_EMAIL: "t@example.com",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    },
+  });
+  if (!proc.success) throw new Error(`git ${args.join(" ")} failed in ${cwd}`);
+}
+
+function headShasOf(repo: string): string[] {
+  const proc = Bun.spawnSync(["git", "ls-remote", repo], { stdout: "pipe", stderr: "ignore" });
+  return new TextDecoder()
+    .decode(proc.stdout)
+    .split("\n")
+    .map((l) => l.split("\t")[0])
+    .filter((s) => /^[0-9a-f]{40}$/.test(s));
+}
+
+describe("findUnrelatedRemoteHistory (vault#823)", () => {
+  test("fresh mirror + non-empty remote → flagged, and the real push really is rejected", async () => {
+    const root = tmp("pv-unrelated-");
+    const remote = path.join(root, "remote.git");
+    fs.mkdirSync(remote, { recursive: true });
+    git(remote, "init", "-q", "--bare");
+
+    // Seed the remote with history, the way a prior machine's mirror would.
+    const seed = path.join(root, "seed");
+    fs.mkdirSync(seed);
+    git(seed, "init", "-q", "-b", "main");
+    fs.writeFileSync(path.join(seed, "n1.md"), "note one");
+    git(seed, "add", "-A");
+    git(seed, "commit", "-qm", "vault export 1");
+    git(seed, "push", "-q", remote, "HEAD:main");
+
+    // The imported box: notes came across, the mirror is a fresh `git init`.
+    const mirror = path.join(root, "mirror");
+    fs.mkdirSync(mirror);
+    git(mirror, "init", "-q", "-b", "main");
+    fs.writeFileSync(path.join(mirror, "n1.md"), "note one");
+    git(mirror, "add", "-A");
+    git(mirror, "commit", "-qm", "vault mirror seed");
+
+    const heads = headShasOf(remote);
+    expect(heads.length).toBeGreaterThan(0);
+
+    const found = await findUnrelatedRemoteHistory({
+      mirrorPath: mirror,
+      remoteUrl: `https://github.com/a/b.git`,
+      remoteHeads: heads,
+    });
+    expect(found).not.toBeNull();
+    expect(found?.mirrorIsFresh).toBe(false); // the dir exists, it's just unrelated
+
+    // And the thing the guard is predicting actually happens.
+    const push = Bun.spawnSync(["git", "push", remote, "HEAD:main"], {
+      cwd: mirror,
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    expect(push.success).toBe(false);
+    expect(new TextDecoder().decode(push.stderr)).toContain("rejected");
+  });
+
+  test("mirror cloned FROM the remote → not flagged (re-bind after token rotation)", async () => {
+    const root = tmp("pv-related-");
+    const remote = path.join(root, "remote.git");
+    fs.mkdirSync(remote, { recursive: true });
+    git(remote, "init", "-q", "--bare");
+    const seed = path.join(root, "seed");
+    fs.mkdirSync(seed);
+    git(seed, "init", "-q", "-b", "main");
+    fs.writeFileSync(path.join(seed, "n1.md"), "note one");
+    git(seed, "add", "-A");
+    git(seed, "commit", "-qm", "vault export 1");
+    git(seed, "push", "-q", remote, "HEAD:main");
+
+    const mirror = path.join(root, "mirror");
+    git(root, "clone", "-q", remote, mirror);
+
+    const found = await findUnrelatedRemoteHistory({
+      mirrorPath: mirror,
+      remoteUrl: "https://github.com/a/b.git",
+      remoteHeads: headShasOf(remote),
+    });
+    expect(found).toBeNull();
+  });
+
+  test("empty remote → not flagged (the ordinary fresh-repo setup)", async () => {
+    const root = tmp("pv-emptyremote-");
+    const mirror = path.join(root, "mirror");
+    fs.mkdirSync(mirror, { recursive: true });
+    git(mirror, "init", "-q", "-b", "main");
+    const found = await findUnrelatedRemoteHistory({
+      mirrorPath: mirror,
+      remoteUrl: "https://github.com/a/b.git",
+      remoteHeads: [],
+    });
+    expect(found).toBeNull();
+  });
+
+  test("no mirror on disk yet + non-empty remote → flagged as fresh", async () => {
+    const root = tmp("pv-nomirror-");
+    const found = await findUnrelatedRemoteHistory({
+      mirrorPath: path.join(root, "does-not-exist"),
+      remoteUrl: "https://github.com/a/b.git",
+      remoteHeads: ["a".repeat(40)],
+    });
+    expect(found).not.toBeNull();
+    expect(found?.mirrorIsFresh).toBe(true);
+  });
+
+  test("null mirrorPath + non-empty remote → flagged as fresh", async () => {
+    const found = await findUnrelatedRemoteHistory({
+      mirrorPath: null,
+      remoteUrl: "https://github.com/a/b.git",
+      remoteHeads: ["b".repeat(40)],
+    });
+    expect(found?.mirrorIsFresh).toBe(true);
+  });
+
+  test("message names the repo, the cause, and never leaks a token", () => {
+    const msg = unrelatedHistoryMessage({
+      remoteIdentity: "github.com/aaron/my-vault",
+      mirrorIsFresh: true,
+    });
+    expect(msg).toContain("github.com/aaron/my-vault");
+    expect(msg).toContain("non-fast-forward");
+    expect(msg).toContain("override=true");
+
+    // Unparseable URL falls back to a userinfo-stripped form, not the raw one.
+    const leaky = unrelatedHistoryMessage({
+      remoteIdentity: "not a url",
+      mirrorIsFresh: false,
+    });
+    expect(leaky).not.toContain("@");
   });
 });

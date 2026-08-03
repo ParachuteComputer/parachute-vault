@@ -91,6 +91,8 @@ import { redactToken } from "./export-watch.ts";
 import {
   findConflictingVault,
   remoteConflictMessage,
+  findUnrelatedRemoteHistory,
+  unrelatedHistoryMessage,
 } from "./mirror-remote-guard.ts";
 import { GitNotInstalledError, ensureGitAvailable } from "./git-preflight.ts";
 import { getVaultStore } from "./vault-store.ts";
@@ -1000,7 +1002,7 @@ export async function handleAuthPat(
 async function probeGitLsRemote(
   url: string,
   timeoutMs: number,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; heads?: string[] }> {
   // GIT_TERMINAL_PROMPT=0 ensures bad credentials FAIL FAST instead of
   // sitting at "Username:" indefinitely (which the timeout would then
   // catch, but failing fast on the auth wall is the better UX).
@@ -1025,7 +1027,18 @@ async function probeGitLsRemote(
   }, timeoutMs);
   const exitCode = await proc.exited;
   clearTimeout(timer);
-  if (exitCode === 0) return { ok: true };
+  if (exitCode === 0) {
+    // vault#823: the ref list answers "is this remote empty?", which is what
+    // the unrelated-history guard needs. We were already piping stdout and
+    // dropping it on the floor — the reachability answer and the emptiness
+    // answer come out of the same spawn.
+    const stdout = new TextDecoder().decode(await new Response(proc.stdout).arrayBuffer());
+    const heads = stdout
+      .split("\n")
+      .map((line) => line.split("\t")[0]?.trim() ?? "")
+      .filter((sha) => /^[0-9a-f]{40}$/.test(sha));
+    return { ok: true, heads };
+  }
   const stderr = new TextDecoder()
     .decode(await new Response(proc.stderr).arrayBuffer())
     .trim();
@@ -2127,6 +2140,38 @@ function importErrorTitle(errorType: ImportJobError["error_type"]): string {
  *     stored credential's remote host/path against the import remote.
  *   - **A mirror already targets the SAME remote** — no-op success.
  */
+/**
+ * Head shas on `remoteUrl`, for the unrelated-history guard (vault#823).
+ *
+ * Reuses `probeGitLsRemote` — same spawn, same 10s bound, same no-prompt
+ * posture — and resolves the same authed URL shape the import clone used, so
+ * a private repo answers here too.
+ *
+ * Fails OPEN: any unreachable/ambiguous result returns `[]`, which the guard
+ * reads as "empty remote" and lets the bind proceed. A network blip must not
+ * block a legitimate setup; the failure it exists to catch is deterministic
+ * and will be caught on the next attempt.
+ */
+async function headShasOfRemote(
+  remoteUrl: string,
+  auth: ImportAuth,
+  probeOverride?: (
+    url: string,
+    timeoutMs: number,
+  ) => Promise<{ ok: boolean; error?: string; heads?: string[] }>,
+): Promise<string[]> {
+  let url = remoteUrl;
+  if (auth.kind === "pat") {
+    url = embedTokenInRemoteUrl(remoteUrl, auth.token) ?? remoteUrl;
+  }
+  try {
+    const probe = await (probeOverride ?? probeGitLsRemote)(url, 10_000);
+    return probe.ok ? (probe.heads ?? []) : [];
+  } catch {
+    return [];
+  }
+}
+
 export async function enableSyncToImportedRepo(opts: {
   vaultName: string;
   remoteUrl: string;
@@ -2143,8 +2188,18 @@ export async function enableSyncToImportedRepo(opts: {
    * backs up to this repo.
    */
   override?: boolean;
+  /**
+   * Test seam for the vault#823 unrelated-history probe (default
+   * `probeGitLsRemote`, which spawns real git at the supplied remote). Inject
+   * one returning `{ ok: true, heads: [] }` to exercise the arm path without
+   * touching the network — matching `handleAuthPat`'s `probeOverride`.
+   */
+  probeOverride?: (
+    url: string,
+    timeoutMs: number,
+  ) => Promise<{ ok: boolean; error?: string; heads?: string[] }>;
 }): Promise<{ sync_enabled: boolean; warning?: string }> {
-  const { vaultName, remoteUrl, auth, manager, override = false } = opts;
+  const { vaultName, remoteUrl, auth, manager, override = false, probeOverride } = opts;
 
   if (!manager) {
     return {
@@ -2165,6 +2220,27 @@ export async function enableSyncToImportedRepo(opts: {
       return {
         sync_enabled: false,
         warning: `Import succeeded, but Sync was not enabled — ${remoteConflictMessage(conflict)}`,
+      };
+    }
+
+    // vault#823: arming Sync against a remote whose history this vault's
+    // mirror can't reach produces a backup that is refused on EVERY push and
+    // never self-corrects. Import is the path that creates it — it brings the
+    // notes across but not the mirror's git history, so the mirror is a fresh
+    // `git init` and the remote we just cloned from is, to it, unrelated.
+    //
+    // Decline the optional sync-arm and say why. The import itself already
+    // succeeded and is not touched: the thing that would be wrong is quietly
+    // pointing a backup at a repo it can never write to.
+    const unrelated = await findUnrelatedRemoteHistory({
+      mirrorPath: manager.getStatus().mirror_path,
+      remoteUrl,
+      remoteHeads: await headShasOfRemote(remoteUrl, auth, probeOverride),
+    });
+    if (unrelated) {
+      return {
+        sync_enabled: false,
+        warning: `Import succeeded, but Sync was not enabled — ${unrelatedHistoryMessage(unrelated)}`,
       };
     }
   }

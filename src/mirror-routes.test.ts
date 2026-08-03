@@ -22,6 +22,7 @@ import {
   type MirrorDeps,
 } from "./mirror-manager.ts";
 import {
+  enableSyncToImportedRepo,
   _resetDeviceFlowSessionsForTest,
   handleAuthDelete,
   handleAuthGet,
@@ -3165,3 +3166,75 @@ describe("cross-vault remote-clobber guard (vault#482)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// vault#823 — enableSyncToImportedRepo must consult the unrelated-history
+// guard, not just contain a call to it.
+//
+// The lesson from hub#820, applied before shipping rather than after: proving
+// `findUnrelatedRemoteHistory` returns a struct proves nothing about whether
+// the arm path reads it. Mutating `if (unrelated)` to `if (false && unrelated)`
+// left the whole vault suite green, which is how this test came to exist.
+// ---------------------------------------------------------------------------
+
+describe("enableSyncToImportedRepo — unrelated-history guard (vault#823)", () => {
+  /** Minimal manager stand-in: the guard branch only reads `mirror_path`. */
+  function stubManager(mirrorPath: string | null): MirrorManager {
+    return {
+      getStatus: () => ({ mirror_path: mirrorPath }),
+    } as unknown as MirrorManager;
+  }
+
+  test("non-empty remote + fresh mirror → sync NOT armed, and the reason is stated", async () => {
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/my-vault.git",
+      auth: { kind: "none" },
+      manager: stubManager(null), // nothing bootstrapped yet — the import case
+      probeOverride: async () => ({ ok: true, heads: ["a".repeat(40)] }),
+    });
+    expect(res.sync_enabled).toBe(false);
+    expect(res.warning).toContain("github.com/aaron/my-vault");
+    expect(res.warning).toContain("non-fast-forward");
+    // It must not be mistaken for the "no credential" refusal further down —
+    // that one fires for auth.kind === "none" and would also return false.
+    expect(res.warning).not.toContain("write credentials");
+  });
+
+  test("empty remote → guard stays out of the way (falls through to the credential check)", async () => {
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/fresh.git",
+      auth: { kind: "none" },
+      manager: stubManager(null),
+      probeOverride: async () => ({ ok: true, heads: [] }),
+    });
+    expect(res.sync_enabled).toBe(false);
+    // Reached the NEXT refusal, which proves the history guard declined to fire.
+    expect(res.warning).toContain("write credentials");
+  });
+
+  test("override=true skips the guard entirely", async () => {
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/my-vault.git",
+      auth: { kind: "none" },
+      manager: stubManager(null),
+      override: true,
+      probeOverride: async () => ({ ok: true, heads: ["a".repeat(40)] }),
+    });
+    expect(res.warning).toContain("write credentials");
+    expect(res.warning).not.toContain("non-fast-forward");
+  });
+
+  test("unreachable remote fails OPEN — a network blip must not block setup", async () => {
+    const res = await enableSyncToImportedRepo({
+      vaultName: "solo",
+      remoteUrl: "https://github.com/aaron/my-vault.git",
+      auth: { kind: "none" },
+      manager: stubManager(null),
+      probeOverride: async () => ({ ok: false, error: "could not resolve host" }),
+    });
+    expect(res.warning).toContain("write credentials");
+    expect(res.warning).not.toContain("non-fast-forward");
+  });
+});
