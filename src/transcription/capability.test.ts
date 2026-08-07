@@ -1,4 +1,7 @@
 import { describe, test, expect, afterEach } from "bun:test";
+import { randomUUID } from "crypto";
+import { tmpdir } from "os";
+import { join } from "path";
 import { resolveTranscriptionCapability, defaultTranscriptionProvider } from "./capability.ts";
 import { ScribeHttpProvider } from "./providers/scribe-http.ts";
 import { TranscribeCppProvider } from "./providers/transcribe-cpp.ts";
@@ -81,9 +84,53 @@ describe("defaultTranscriptionProvider — provider selection", () => {
     else process.env.TRANSCRIPTION_PROVIDER = saved;
   });
 
-  test("default (unset) → the scribe-http provider", () => {
+  const savedScribe = process.env.SCRIBE_URL;
+  const savedHome = process.env.PARACHUTE_HOME;
+  afterEach(() => {
+    if (savedScribe === undefined) delete process.env.SCRIBE_URL;
+    else process.env.SCRIBE_URL = savedScribe;
+    if (savedHome === undefined) delete process.env.PARACHUTE_HOME;
+    else process.env.PARACHUTE_HOME = savedHome;
+  });
+
+  test("default (unset) with a reachable scribe → the scribe-http provider", () => {
     delete process.env.TRANSCRIPTION_PROVIDER;
+    process.env.SCRIBE_URL = "http://scribe.test";
     expect(defaultTranscriptionProvider().name).toBe("scribe-http");
+  });
+
+  // REGRESSION (Aaron's box, 2026-08-07): `select.ts` defaults an un-scribed
+  // box to `whisper-cpp`, but this factory had no `whisper-cpp` branch and fell
+  // through to ScribeHttpProvider — which reports unavailable, so the landing
+  // said `transcription: {enabled:false}` and the app hid the mic while the
+  // WORKER (server.ts) was happily running whisper-cpp. The capability flag and
+  // the thing that actually transcribes must name the same provider.
+  test("default (unset) with no scribe → the whisper-cpp provider, not scribe-http", () => {
+    delete process.env.TRANSCRIPTION_PROVIDER;
+    delete process.env.SCRIBE_URL;
+    // Unsetting SCRIBE_URL is not enough to mean "no scribe": resolution falls
+    // back to the real `~/.parachute/services.json`, so on a box that still has
+    // a `parachute-scribe` entry this would resolve scribe-http and fail on
+    // correct code. Point PARACHUTE_HOME at an empty dir so "no scribe" is
+    // actually true here.
+    process.env.PARACHUTE_HOME = join(tmpdir(), `pv-cap-${randomUUID()}`);
+    expect(defaultTranscriptionProvider().name).toBe("whisper-cpp");
+  });
+
+  test("TRANSCRIPTION_PROVIDER=whisper-cpp → the whisper-cpp provider", () => {
+    process.env.TRANSCRIPTION_PROVIDER = "whisper-cpp";
+    expect(defaultTranscriptionProvider().name).toBe("whisper-cpp");
+  });
+
+  test("whisper-cpp with no installed model resolves to disabled (no throw)", async () => {
+    // Point PARACHUTE_HOME at a dir with no managed model. `available()` gates
+    // on the model file existing, so this stays hermetic even on a dev box
+    // that has `brew install whisper-cpp` on PATH.
+    process.env.TRANSCRIPTION_PROVIDER = "whisper-cpp";
+    process.env.PARACHUTE_HOME = join(tmpdir(), `pv-cap-${randomUUID()}`);
+    const cap = await resolveTranscriptionCapability(defaultTranscriptionProvider());
+    expect(cap.enabled).toBe(false);
+    expect(cap.provider).toBeUndefined();
   });
 
   test("TRANSCRIPTION_PROVIDER=transcribe-cpp → the transcribe-cpp provider", () => {
