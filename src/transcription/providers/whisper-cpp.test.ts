@@ -26,7 +26,14 @@ import type { SpawnRunner } from "./transcribe-cpp.ts";
 
 const AUDIO = new Uint8Array([1, 2, 3, 4]);
 
-/** A provider wired to a scripted spawn; both paths "exist" by default. */
+/**
+ * A provider wired to a scripted spawn; both paths "exist" by default.
+ *
+ * `whichImpl` is stubbed because `available()` now also requires ffmpeg, and
+ * the default `ffmpegPath` is the bare name `"ffmpeg"` resolved on PATH. Left
+ * un-stubbed these tests would pass on a dev box with ffmpeg installed and fail
+ * in a CI container without it — the exact green-locally/red-in-CI trap.
+ */
 function makeProvider(
   spawn: SpawnRunner,
   over: Partial<WhisperCppProviderOpts> = {},
@@ -37,6 +44,7 @@ function makeProvider(
     modelPath: "/models/m.bin",
     spawn,
     existsImpl: () => true,
+    whichImpl: () => "/usr/bin/ffmpeg",
     tmpDir: tmpdir(),
     ...over,
   });
@@ -106,6 +114,41 @@ describe("availability", () => {
 
   test("both present → ok", async () => {
     expect((await makeProvider(scripted({}, {})).available()).ok).toBe(true);
+  });
+
+  // ffmpeg is a hard requirement — `transcribe()` always transcodes to 16 kHz
+  // mono WAV first, so a box without it can never transcribe anything. Leaving
+  // it out of `available()` made the vault landing advertise a working mic that
+  // failed on every recording.
+  test("missing ffmpeg is reported as its own problem, distinct from binary/model", async () => {
+    const p = makeProvider(scripted({}, {}), { whichImpl: () => null });
+    const a = await p.available();
+    expect(a.ok).toBe(false);
+    expect(a.reason).toMatch(/ffmpeg/);
+    expect(a.reason).not.toMatch(/parakeet-cli binary/);
+    expect(a.reason).not.toMatch(/model file/);
+  });
+
+  test("an ABSOLUTE ffmpegPath is stat'd, not resolved on PATH", async () => {
+    const p = makeProvider(scripted({}, {}), {
+      ffmpegPath: "/opt/custom/ffmpeg",
+      existsImpl: (x) => x !== "/opt/custom/ffmpeg",
+      whichImpl: () => "/usr/bin/ffmpeg", // PATH has one; the configured path does not exist
+    });
+    const a = await p.available();
+    expect(a.ok).toBe(false);
+    expect(a.reason).toMatch(/ffmpeg/);
+  });
+
+  // The regression this probe could easily have introduced: the constructor
+  // defaults ffmpegPath to the BARE name "ffmpeg". Stat'ing that would always
+  // miss and report every default-constructed provider unavailable.
+  test("the bare-name default resolves on PATH rather than being stat'd", async () => {
+    const p = makeProvider(scripted({}, {}), {
+      existsImpl: (x) => x === "/bin/parakeet-cli" || x === "/models/m.bin",
+      whichImpl: (cmd) => (cmd === "ffmpeg" ? "/usr/bin/ffmpeg" : null),
+    });
+    expect((await p.available()).ok).toBe(true);
   });
 });
 

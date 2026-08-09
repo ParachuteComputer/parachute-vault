@@ -77,6 +77,8 @@ export interface WhisperCppProviderOpts {
   spawn?: SpawnRunner;
   /** Existence probe (tests inject). */
   existsImpl?: (p: string) => boolean;
+  /** PATH lookup for a bare command name, e.g. the default `"ffmpeg"` (tests inject). */
+  whichImpl?: (cmd: string) => string | null;
   /** Scratch dir for temp audio. Default `os.tmpdir()`. */
   tmpDir?: string;
 }
@@ -131,6 +133,7 @@ export class WhisperCppProvider implements TranscriptionProvider {
   private readonly timeoutMs: number;
   private readonly spawn: SpawnRunner;
   private readonly existsImpl: (p: string) => boolean;
+  private readonly whichImpl: (cmd: string) => string | null;
   private readonly tmpDir: string;
   /** Once available, stays available for this process — avoids re-statting. */
   private cachedAvailable = false;
@@ -143,13 +146,38 @@ export class WhisperCppProvider implements TranscriptionProvider {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.spawn = opts.spawn ?? defaultSpawnRunner;
     this.existsImpl = opts.existsImpl ?? existsSync;
+    this.whichImpl = opts.whichImpl ?? ((cmd) => Bun.which(cmd));
     this.tmpDir = opts.tmpDir ?? tmpdir();
   }
 
   /**
-   * Ready iff both the CLI and the model are on disk. Reports WHICH is missing
-   * — "not installed" is not an actionable message when there are two things
-   * it could mean and different fixes for each.
+   * Is ffmpeg actually invokable?
+   *
+   * `ffmpegPath` arrives in two shapes and they need different probes. A
+   * resolved absolute path (what `resolveFfmpeg()` returns) can be stat'd. The
+   * constructor's `"ffmpeg"` default is a BARE COMMAND NAME to be resolved on
+   * PATH — stat'ing that would always miss, and reporting every default-
+   * constructed provider unavailable would be a far worse bug than the one this
+   * check exists to catch.
+   */
+  private ffmpegReady(): boolean {
+    const p = this.ffmpegPath;
+    if (p.includes("/")) return this.existsImpl(p);
+    return this.whichImpl(p) != null;
+  }
+
+  /**
+   * Ready iff the CLI, the model AND ffmpeg are all present. Reports WHICH is
+   * missing — "not installed" is not an actionable message when there are
+   * several things it could mean and different fixes for each.
+   *
+   * ffmpeg is a hard requirement, not a nicety: `transcribe()` ALWAYS transcodes
+   * to 16 kHz mono WAV before invoking the CLI (browser capture is webm/opus,
+   * which neither CLI reads), so without ffmpeg every transcription fails with
+   * `ffmpeg_missing`. Omitting it here made the vault landing advertise
+   * `transcription: {enabled:true}` on a box that could never transcribe a
+   * single file — a mic that appears and then fails is worse than one that
+   * honestly isn't offered.
    */
   async available(): Promise<ProviderAvailability> {
     if (this.cachedAvailable) return { ok: true };
@@ -162,6 +190,9 @@ export class WhisperCppProvider implements TranscriptionProvider {
     }
     if (!this.modelPath || !this.existsImpl(this.modelPath)) {
       missing.push("the model file (`parachute-vault transcription install` downloads it)");
+    }
+    if (!this.ffmpegReady()) {
+      missing.push("ffmpeg (`brew install ffmpeg` on macOS, `apt install ffmpeg` on Linux)");
     }
     if (missing.length > 0) {
       return { ok: false, reason: `whisper-cpp is not ready — missing ${missing.join(" and ")}` };
