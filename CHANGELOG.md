@@ -4,6 +4,33 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.6-rc.1] - 2026-08-09
+
+**Voice transcription was reported unavailable on boxes where it worked.** Both
+items below are the same failure seen twice: the capability flag the app reads
+did not agree with the engine that actually runs.
+
+- **The capability flag never knew about `whisper-cpp` (#648).**
+  `resolveTranscriptionProviderName()` returns `whisper-cpp` -- it is the default
+  on a box with no reachable scribe, and it is what `transcription install`
+  persists. The worker honoured that and started correctly. But
+  `defaultTranscriptionProvider()` branched only on `transcribe-cpp`,
+  `parakeet-mlx` and `onnx-asr`, falling through to the retired `scribe-http`
+  for everything else -- which reports unavailable, so `GET /api/vault` returned
+  `transcription: {enabled: false}` and the app hid the microphone in front of a
+  working engine. **Every box that has run `transcription install` since
+  `whisper-cpp` became the default was affected.**
+- **`available()` now also requires ffmpeg (#648).** `transcribe()` always
+  transcodes to 16 kHz mono WAV first, because browser capture is webm/opus which
+  neither CLI reads. Readiness checked the binary and the model but not ffmpeg,
+  so a box without it advertised a microphone that failed on every recording. The
+  probe stats absolute paths and PATH-resolves the bare `ffmpeg` default -- naively
+  stat'ing the bare name would have reported every default-constructed provider
+  unavailable.
+
+Verified with a paired end-to-end run in a container: the same browser test
+passes here and fails on `main` at the missing-microphone assertion.
+
 ## [0.7.5] - 2026-07-29
 
 **Stable promotion of the 0.7.5 line (7 commits over 0.7.4).** Promotes rc.1-rc.7
