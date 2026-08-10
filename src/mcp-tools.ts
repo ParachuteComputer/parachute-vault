@@ -883,9 +883,13 @@ function overrideVaultInfo(
  * model error), the cap is the backstop. Operators wanting long-lived
  * tokens mint a hub-issued JWT via the hub mint-token flow (the REST
  * /vault/<name>/tokens endpoint was removed with the pvt_* drop, vault#282).
+ * The `long_lived: true` opt-in deliberately relaxes this to a 90-day
+ * ceiling for standing credentials; the caller's admin JWT could already
+ * mint longer directly from the hub, so the flag adds no new authority.
  */
 const MANAGE_TOKEN_DEFAULT_TTL_SECONDS = 900; // 15 minutes
 const MANAGE_TOKEN_MAX_TTL_SECONDS = 3600; // 1 hour
+const MANAGE_TOKEN_LONG_TTL_MAX_SECONDS = 7776000; // 90 days; opt-in ceiling for `long_lived: true`, matching hub's API_MINT_TOKEN_DEFAULT_TTL_SECONDS
 
 /**
  * Resolve the bare hub origin for the mint/revoke proxy calls. Reuses
@@ -952,8 +956,10 @@ function buildManageTokenTool(
       "escalate. Minting requires a hub-JWT session holding 'vault:" + vaultName +
       ":admin'. List + revoke are scoped to tokens this session minted; " +
       "CLI/REST-minted tokens are not surfaced here.\n\n" +
+      "`long_lived: true` raises the mint TTL cap to 90 days; a 90-day token is a " +
+      "standing credential and meaningfully increases blast radius if leaked/misused.\n\n" +
       "Actions (discriminator: `action`):\n" +
-      "- `mint` — { scope: string|string[], ttl_seconds?: number, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
+      "- `mint` — { scope: string|string[], ttl_seconds?: number, long_lived?: boolean, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
       "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean, already_revoked?: boolean } — idempotent; a jti not in this session's ledger, or already revoked, still returns ok:true. A genuine failure additionally carries error/message (and, for a hub-side rejection, hub_status).\n" +
       "- `list` — (no inputs) → { action: \"list\", tokens: [...] }",
     inputSchema: {
@@ -974,7 +980,11 @@ function buildManageTokenTool(
         },
         ttl_seconds: {
           type: "number",
-          description: `(action=mint) Token lifetime in seconds. Default ${MANAGE_TOKEN_DEFAULT_TTL_SECONDS} (15 min), max ${MANAGE_TOKEN_MAX_TTL_SECONDS} (1 hour). Values outside (0, ${MANAGE_TOKEN_MAX_TTL_SECONDS}] are rejected.`,
+          description: `(action=mint) Token lifetime in seconds. Default ${MANAGE_TOKEN_DEFAULT_TTL_SECONDS} (15 min), max ${MANAGE_TOKEN_MAX_TTL_SECONDS} (1 hour); with long_lived=true, max ${MANAGE_TOKEN_LONG_TTL_MAX_SECONDS} (90 days). Values outside the applicable (0, max] range are rejected.`,
+        },
+        long_lived: {
+          type: "boolean",
+          description: "(action=mint, optional) Set true to raise the TTL cap from 1 hour to 90 days. A 90-day token is a standing credential: long-lived and meaningfully increases blast radius if leaked/misused.",
         },
         description: {
           type: "string",
@@ -1107,9 +1117,20 @@ async function mintAction(
   }
 
   // TTL bounds. Default 900 (15 min); explicit values must satisfy
-  // `0 < ttl <= MANAGE_TOKEN_MAX_TTL_SECONDS`. Zero, negative, NaN, and
-  // beyond-max all reject — the cap is the safety backstop if revoke fails,
-  // so it must be strict.
+  // `0 < ttl <= MANAGE_TOKEN_MAX_TTL_SECONDS`, or
+  // `0 < ttl <= MANAGE_TOKEN_LONG_TTL_MAX_SECONDS` with `long_lived: true`.
+  // Zero, negative, NaN, and beyond-max all reject — the cap is the safety
+  // backstop if revoke fails, so it must be strict.
+  if (params.long_lived !== undefined && typeof params.long_lived !== "boolean") {
+    return {
+      action: "mint",
+      error: "invalid_request",
+      message: "manage-token mint: long_lived must be a boolean.",
+    };
+  }
+  const maxTtl = params.long_lived === true
+    ? MANAGE_TOKEN_LONG_TTL_MAX_SECONDS
+    : MANAGE_TOKEN_MAX_TTL_SECONDS;
   let ttl = MANAGE_TOKEN_DEFAULT_TTL_SECONDS;
   if (params.ttl_seconds !== undefined && params.ttl_seconds !== null) {
     if (typeof params.ttl_seconds !== "number" || !Number.isFinite(params.ttl_seconds)) {
@@ -1119,11 +1140,11 @@ async function mintAction(
         message: "manage-token mint: ttl_seconds must be a finite number.",
       };
     }
-    if (params.ttl_seconds <= 0 || params.ttl_seconds > MANAGE_TOKEN_MAX_TTL_SECONDS) {
+    if (params.ttl_seconds <= 0 || params.ttl_seconds > maxTtl) {
       return {
         action: "mint",
         error: "invalid_request",
-        message: `manage-token mint: ttl_seconds must be in (0, ${MANAGE_TOKEN_MAX_TTL_SECONDS}]; got ${params.ttl_seconds}.`,
+        message: `manage-token mint: ttl_seconds must be in (0, ${maxTtl}]; got ${params.ttl_seconds}.`,
       };
     }
     ttl = params.ttl_seconds;
