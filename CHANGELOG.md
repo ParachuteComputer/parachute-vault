@@ -4,6 +4,17 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.6-rc.2] - 2026-08-10
+
+**`manage-token` mint can opt into a standing credential (#650).** The mint
+action capped `ttl_seconds` at 1 hour while the hub itself mints up to 365
+days -- so agents needing a standing credential had to leave the MCP surface
+entirely. An explicit `long_lived: true` now raises the cap to 90 days; the
+default path is byte-identical to before, over-cap requests still reject
+(never clamp), and the schema states the standing-credential tradeoff. The
+flag adds no new authority: the caller's admin JWT could already mint longer
+directly from the hub.
+
 ## [0.7.6-rc.1] - 2026-08-09
 
 **Voice transcription was reported unavailable on boxes where it worked.** Both
