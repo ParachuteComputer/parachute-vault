@@ -7598,6 +7598,23 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
     closeAllStores();
   });
 
+  test("long_lived=true permits a 30-day TTL", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("mint-long-lived");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+      ttl_seconds: 2592000,
+      long_lived: true,
+    });
+    expect(parsed.action).toBe("mint");
+    expect(parsed.error).toBeUndefined();
+    const mint = hubCalls.find((c) => c.url.endsWith("/api/auth/mint-token"));
+    expect(mint!.body.expires_in).toBe(2592000);
+    closeAllStores();
+  });
+
   test("tag-scoped caller's mint includes permissions.scoped_tags", async () => {
     installHubStub();
     const { vaultName, auth } = await setupAdminSession("mint-scoped", ["task", "project"]);
@@ -7624,6 +7641,52 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
     const { vaultName, auth } = await setupAdminSession("mint-over");
     const { closeAllStores } = await import("./vault-store.ts");
     const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", ttl_seconds: 3601 });
+    expect(parsed.error).toBe("invalid_request");
+    expect(parsed.message).toBe("manage-token mint: ttl_seconds must be in (0, 3600]; got 3601.");
+    expect(hubCalls.length).toBe(0);
+    closeAllStores();
+  });
+
+  test("long_lived=true rejects TTL above the 90-day cap locally", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("mint-long-over");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+      ttl_seconds: 7776001,
+      long_lived: true,
+    });
+    expect(parsed.error).toBe("invalid_request");
+    expect(parsed.message).toContain("7776000");
+    expect(hubCalls.length).toBe(0);
+    closeAllStores();
+  });
+
+  test("long_lived=false keeps the 1-hour cap", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("mint-long-false");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+      ttl_seconds: 7200,
+      long_lived: false,
+    });
+    expect(parsed.error).toBe("invalid_request");
+    expect(hubCalls.length).toBe(0);
+    closeAllStores();
+  });
+
+  test("omitted long_lived keeps the 1-hour cap", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("mint-long-omitted");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+      ttl_seconds: 7200,
+    });
     expect(parsed.error).toBe("invalid_request");
     expect(hubCalls.length).toBe(0);
     closeAllStores();
