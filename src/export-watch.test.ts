@@ -828,11 +828,13 @@ describe("export CLI: --watch", () => {
       const watch = spawnWatchCli(["export", exportDir, "--watch", "--interval", "1"], tmp);
       try {
         // Initial export prints the "Exported N notes" line.
-        await watch.awaitLine((l) => l.includes("Exported 1 note"), 10_000);
+        await watch.awaitLine((l) => l.includes("Exported 1 note"), 15_000);
         // Watch loop prints the polling banner.
-        await watch.awaitLine((l) => l.includes("[watch] polling every 1s"), 5_000);
-        // At least one idle tick.
-        await watch.awaitLine((l) => l.includes("[watch] no changes"), 5_000);
+        await watch.awaitLine((l) => l.includes("[watch] polling every 1s"), 15_000);
+        // At least one idle tick. 15s not 5s: under full-suite spawn
+        // contention the child can take >5s to print its first idle tick
+        // even with --interval 1 (vault#609).
+        await watch.awaitLine((l) => l.includes("[watch] no changes"), 15_000);
       } finally {
         watch.proc.kill("SIGINT");
       }
@@ -841,7 +843,7 @@ describe("export CLI: --watch", () => {
       // Stopping line printed on shutdown.
       expect(watch.seenLines.some((l) => l.includes("[watch] stopping watch"))).toBe(true);
     },
-    30_000,
+    60_000,
   );
 
   test(
@@ -849,7 +851,7 @@ describe("export CLI: --watch", () => {
     async () => {
       const watch = spawnWatchCli(["export", exportDir, "--watch", "--interval", "1"], tmp);
       try {
-        await watch.awaitLine((l) => l.includes("[watch] polling every 1s"), 10_000);
+        await watch.awaitLine((l) => l.includes("[watch] polling every 1s"), 15_000);
 
         // Open the vault DB out-of-band and add a note. The watch loop
         // should pick it up within ~2 intervals.
@@ -866,7 +868,7 @@ describe("export CLI: --watch", () => {
         // Expect the watch-mode incremental-export line.
         const line = await watch.awaitLine(
           (l) => l.startsWith("[watch] exported"),
-          10_000,
+          15_000,
         );
         expect(line).toMatch(/\[watch\] exported \d+ note/);
         // And the on-disk file landed.
@@ -878,7 +880,7 @@ describe("export CLI: --watch", () => {
       await watch.proc.exited;
       expect(fs.existsSync(path.join(exportDir, "Inbox", "triggered.md"))).toBe(true);
     },
-    30_000,
+    60_000,
   );
 
   test(
@@ -925,8 +927,8 @@ describe("export CLI: --watch", () => {
       );
       try {
         // Initial export must succeed (seed has no collision).
-        await watch.awaitLine((l) => l.includes("Exported 1 note"), 10_000);
-        await watch.awaitLine((l) => l.includes("[watch] polling every 1s"), 5_000);
+        await watch.awaitLine((l) => l.includes("Exported 1 note"), 15_000);
+        await watch.awaitLine((l) => l.includes("[watch] polling every 1s"), 15_000);
 
         // Inject a collision: existing seed is `Inbox/seed`; write
         // `Inbox/SEED` so the lowercased (path, ext) key collides.
@@ -977,7 +979,7 @@ describe("export CLI: --watch", () => {
       expect(stderr).toContain("Resolve the collision in the vault");
       expect(stderr).toContain("--strict-case-collision");
     },
-    30_000,
+    60_000,
   );
 
   test(
@@ -993,9 +995,9 @@ describe("export CLI: --watch", () => {
         tmp,
       );
       try {
-        await watch.awaitLine((l) => l.includes("[watch] polling every 1s"), 10_000);
+        await watch.awaitLine((l) => l.includes("[watch] polling every 1s"), 15_000);
         // Initial export should have produced a commit.
-        await watch.awaitLine((l) => l.startsWith("[git-commit] export:"), 10_000);
+        await watch.awaitLine((l) => l.startsWith("[git-commit] export:"), 15_000);
         const afterInitial = gitLogOneline(exportDir).length;
 
         // Add a note → expect another commit on the next cycle.
@@ -1023,6 +1025,6 @@ describe("export CLI: --watch", () => {
       }
       await watch.proc.exited;
     },
-    30_000,
+    60_000,
   );
 });
