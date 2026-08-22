@@ -165,6 +165,19 @@ describe("contract: search composes with structured filters (vault#647)", () => 
     expect(contents).toContain("unique-647-date recent");
     expect(contents).not.toContain("unique-647-date old");
   });
+
+  it("REST ?search= + exclude_path_prefix drops matching paths (vault#628)", async () => {
+    await store.createNote("unique-628-search-term keep", { path: "Projects/a" });
+    await store.createNote("unique-628-search-term drop", { path: ".parachute/notes/settings" });
+    const res = await search(
+      "search=unique-628-search-term&exclude_path_prefix=.parachute/&include_content=true",
+    );
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    const contents = body.map((n: any) => n.content);
+    expect(contents).toContain("unique-628-search-term keep");
+    expect(contents).not.toContain("unique-628-search-term drop");
+  });
 });
 
 describe('contract: search — literal-by-default (#551, flipped from todo)', () => {

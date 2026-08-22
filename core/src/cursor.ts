@@ -176,6 +176,7 @@ export interface QueryHashInputs {
   hasBrokenLinks?: boolean;
   path?: string;
   pathPrefix?: string;
+  excludePathPrefix?: string[];
   extension?: string | string[];
   ids?: string[];
   metadata?: Record<string, unknown>;
@@ -249,6 +250,7 @@ function canonicalize(value: unknown): unknown {
   const ORDER_IRRELEVANT_STRING_ARRAYS = new Set([
     "tags",
     "excludeTags",
+    "excludePathPrefix",
     "ids",
     "extension",
   ]);

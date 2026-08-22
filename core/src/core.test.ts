@@ -4361,6 +4361,36 @@ describe("MCP tools", async () => {
     expect(pageResult.warnings?.some((w: any) => w.code === "truncated" && w.limit === 2)).toBe(true);
   });
 
+  it("query-notes exclude_path_prefix drops matching paths and keeps pathless notes (vault#628)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("bare"); // no path
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const r = await query.execute({ exclude_path_prefix: ".parachute/", include_content: true }) as any[];
+    const contents = r.map((n: any) => n.content).sort();
+    expect(contents).toEqual(["bare", "user"]);
+  });
+
+  it("query-notes search composes with exclude_path_prefix (vault#628)", async () => {
+    // The MCP search branch enumerates QueryOpts fields rather than
+    // spreading them. After #656, REST search picks up exclude_path_prefix
+    // via ...parsed.queryOpts; omitting the field here is the silent-drop
+    // class this lane kills.
+    await store.createNote("unique-628-search-term keep", { path: "Projects/a" });
+    await store.createNote("unique-628-search-term drop", { path: ".parachute/notes/settings" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const r = await query.execute({
+      search: "unique-628-search-term",
+      exclude_path_prefix: ".parachute/",
+      include_content: true,
+    }) as any[];
+    const contents = r.map((n: any) => n.content);
+    expect(contents).toContain("unique-628-search-term keep");
+    expect(contents).not.toContain("unique-628-search-term drop");
+  });
+
   it("query-notes full-text search works", async () => {
     await store.createNote("Flagstaff trail");
     const tools = generateMcpTools(store);

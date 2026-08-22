@@ -1102,6 +1102,18 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
     params.push(opts.pathPrefix + "%");
   }
 
+  // Path-prefix exclusion (vault#628). Mirrors `pathPrefix` matching
+  // (`LIKE prefix || '%'`, SQLite LIKE is ASCII-case-insensitive). NULL
+  // paths are kept — they are not under the prefix. Repeatable: a note
+  // matching ANY listed prefix is dropped.
+  if (opts.excludePathPrefix && opts.excludePathPrefix.length > 0) {
+    for (const prefix of opts.excludePathPrefix) {
+      if (typeof prefix !== "string" || prefix.length === 0) continue;
+      conditions.push("(n.path IS NULL OR n.path NOT LIKE ?)");
+      params.push(prefix + "%");
+    }
+  }
+
   // Extension filter (vault#328). Single string → exact match; array → IN
   // clause. Compared lower-case so a caller passing "CSV" still hits rows
   // stored as "csv". An empty array is a no-op (no filter applied) rather
@@ -1656,6 +1668,7 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
     hasBrokenLinks: opts.hasBrokenLinks,
     path: opts.path,
     pathPrefix: opts.pathPrefix,
+    excludePathPrefix: opts.excludePathPrefix,
     extension: opts.extension,
     ids: opts.ids,
     metadata: opts.metadata,

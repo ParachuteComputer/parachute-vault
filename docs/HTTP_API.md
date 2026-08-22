@@ -868,6 +868,11 @@ Query params:
     no-op — rather than erroring on a table that was never created.
   - `path=foo/bar` — exact path match.
   - `path_prefix=foo/` — startswith.
+  - `exclude_path_prefix=.parachute/` — drop notes whose path matches any
+    of these prefixes (vault#628). Same LIKE matching as `path_prefix`. A
+    note with no path is not excluded. Comma-list form
+    (`exclude_path_prefix=a/,b/`); repeated params take the first
+    occurrence only.
   - `extension=md&extension=csv` — filter by file extension (vault#328).
 
 - **Date filters**

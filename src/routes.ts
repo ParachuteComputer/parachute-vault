@@ -943,6 +943,7 @@ export function parseNotesQueryOpts(url: URL): {
     hasBrokenLinks: parseBoolOrUndef(parseQuery(url, "has_broken_links")),
     path: parseQuery(url, "path") ?? undefined,
     pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
+    excludePathPrefix: parseQueryList(url, "exclude_path_prefix"),
     extension: parseExtensionFilter(url),
     metadata: bracket.metadata ?? metadataAlias.metadata,
     // Write-attribution filters (vault#298) — symmetric with the MCP
