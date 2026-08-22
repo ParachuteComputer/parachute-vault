@@ -388,6 +388,9 @@ CREATE INDEX IF NOT EXISTS idx_mcp_mint_ledger_session ON mcp_mint_ledger(parent
  * on every open. Migrations occasionally disable it transiently (see
  * migrateToV14's BEGIN IMMEDIATE block); the boot path re-enables.
  *
+ * `busy_timeout` is likewise per-connection. See {@link BUSY_TIMEOUT_MS} for
+ * why a zero default is wrong for a daemon-plus-CLI deployment.
+ *
  * WAL requires a filesystem that supports memory-mapped shared-memory
  * (the `-shm` sidecar). NFS, some FUSE mounts, and a few Docker volume
  * drivers don't qualify and silently fall back to the prior journal mode
@@ -396,6 +399,30 @@ CREATE INDEX IF NOT EXISTS idx_mcp_mint_ledger_session ON mcp_mint_ledger(parent
  * filesystems should know they've lost multi-process concurrency.
  */
 const APPLY_PRAGMAS_LOGGED = new WeakSet<Database>();
+
+/**
+ * How long SQLite parks on a locked database before giving up with
+ * SQLITE_BUSY (vault#527).
+ *
+ * The default is 0 — a contended write fails INSTANTLY. That's the wrong
+ * default for this product's actual deployment shape: the daemon holds a live
+ * WAL connection on :1940 while the operator runs a CLI command (`add-pack`,
+ * `schema migrate-field`, an import) against the same file from another
+ * process. Under WAL, readers never block, but two WRITERS still serialize —
+ * and with no timeout the CLI's write loses the instant it overlaps the
+ * daemon's, surfacing as an error whose only remedy is "please re-run".
+ *
+ * Five seconds is far longer than any single vault write (these are
+ * millisecond-scale row inserts) so it costs nothing on an uncontended box,
+ * while comfortably covering an overlapping daemon transaction. It is not a
+ * substitute for retry logic on a genuinely long-held lock — it's the
+ * difference between "wait your turn" and "fail immediately", which is the
+ * behaviour a single-file embedded database should have had from the start.
+ *
+ * Per-connection (not persistent), so it must be re-applied on every open —
+ * which is why it lives here rather than in a migration.
+ */
+export const BUSY_TIMEOUT_MS = 5000;
 
 export interface ConnectionPragmaResult {
   /** True when the connection ended up in WAL mode. False means the FS doesn't support WAL. */
@@ -456,6 +483,11 @@ export function applyConnectionPragmas(db: Database): ConnectionPragmaResult {
   }
 
   try { db.exec("PRAGMA foreign_keys = ON"); } catch {}
+
+  // Deliberately NOT gated on the WAL branch: SQLITE_BUSY is not WAL-specific,
+  // and a rollback-journal DB (the NFS/FUSE fallback above) serializes harder,
+  // so it needs the grace more, not less.
+  try { db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`); } catch {}
 
   return { wal, journalMode };
 }
