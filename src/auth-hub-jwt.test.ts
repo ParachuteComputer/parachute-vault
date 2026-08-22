@@ -21,7 +21,7 @@
  * wiring and the response-shape contract.
  */
 
-import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, test, expect, beforeAll, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdirSync, rmSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -147,6 +147,15 @@ let prevJwksOrigin: string | undefined;
 let fixture: HubFixture;
 let kp: Keypair;
 
+beforeAll(async () => {
+  // RSA keygen is the expensive part of this file (~tens of ms locally,
+  // hundreds under a loaded full-suite worker). Doing it per-test is what
+  // clustered failures under parallel contention (vault#609): 30 tests ×
+  // generateKeyPair competing with the rest of `bun test ./src/` blew the
+  // 5s default. One keypair is enough — kid, n, e are stable for the file.
+  kp = await makeKeypair("k1");
+});
+
 beforeEach(async () => {
   tmpHome = join(
     tmpdir(),
@@ -157,7 +166,6 @@ beforeEach(async () => {
   process.env.PARACHUTE_HOME = tmpHome;
   clearVaultStoreCache();
 
-  kp = await makeKeypair("k1");
   fixture = startHubFixture([kp]);
   prevHubOrigin = process.env.PARACHUTE_HUB_ORIGIN;
   prevJwksOrigin = process.env.PARACHUTE_HUB_JWKS_ORIGIN;

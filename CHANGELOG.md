@@ -4,6 +4,19 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.6] - 2026-08-22
+
+**Promotion of the 0.7.6 rc chain to stable, after a week serving the live
+box (2026-08-14 → 2026-08-22, zero incidents).** Sums the chain: transcription
+capability honesty — the availability flag learns `whisper-cpp` and requires
+ffmpeg, so voice transcription stops being reported unavailable on boxes where
+it worked (#648, rc.1); `manage-token` mint can opt into a standing credential
+(#650, rc.2). New since rc.2: the auth-hub-jwt tests generate one RSA keypair
+per file and the export-watch condition-waits get real deadline headroom —
+kills the two chronic full-suite flakes (#652, fixes #609; the distinct-key
+security cases in hub-jwt.test.ts are untouched and were sabotage-verified in
+review).
+
 ## [0.7.6-rc.2] - 2026-08-10
 
 **`manage-token` mint can opt into a standing credential (#650).** The mint
