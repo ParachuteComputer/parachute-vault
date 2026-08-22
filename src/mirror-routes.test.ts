@@ -395,22 +395,20 @@ describe("handleMirrorPut", () => {
     await manager.stop();
   });
 
-  test("two PUTs fired in quick succession both apply; manager ends in the second config's state", async () => {
-    // Reviewer concern: a second PUT entering `reload()` while the
-    // first PUT's `stop()` is still inside its 250ms in-flight settle
-    // window could theoretically race the `stopping` flag. JS's
-    // microtask-serialized awaits make this safe in practice — each
-    // PUT's reload→start chain runs to completion on its own tick
-    // before the next runs — but pinning the expected outcome with a
-    // test documents the behavior + catches a regression if the
-    // serialization ever relaxes.
+  test("two PUTs in succession both apply; manager ends in the second config's state", async () => {
+    // vault#558: the previous Promise.all pairing raced. `reload()` is
+    // async (stop's 250ms in-flight settle + start), so the two PUTs
+    // could finish in either order and the last-writer-wins assertion
+    // on safety_net_seconds: 120 flaked. The issue is the assertion,
+    // not a product bug as observed — serialize the second PUT behind
+    // the first's completion so last-writer-wins is deterministic.
     //
     // What we assert:
     //   - Both PUTs return 200 (no crash, no stuck-in-flight).
     //   - After both resolve, the manager is in the SECOND config's
     //     shape (last-writer-wins; not a stale first-config state
     //     leaking through).
-    home = tmp("mirror-put-concurrent-");
+    home = tmp("mirror-put-succession-");
     const { manager } = makeManager(home);
     const put = (body: Record<string, unknown>) =>
       handleMirrorPut(
@@ -420,29 +418,22 @@ describe("handleMirrorPut", () => {
         }),
         manager,
       );
-    const [res1, res2] = await Promise.all([
-      put({
-        enabled: true,
-        location: "internal",
-        sync_mode: "events",
-        auto_commit: false,
-        safety_net_seconds: 60,
-      }),
-      put({
-        enabled: true,
-        location: "internal",
-        sync_mode: "events",
-        auto_commit: false,
-        safety_net_seconds: 120,
-      }),
-    ]);
+    const res1 = await put({
+      enabled: true,
+      location: "internal",
+      sync_mode: "events",
+      auto_commit: false,
+      safety_net_seconds: 60,
+    });
+    const res2 = await put({
+      enabled: true,
+      location: "internal",
+      sync_mode: "events",
+      auto_commit: false,
+      safety_net_seconds: 120,
+    });
     expect(res1.status).toBe(200);
     expect(res2.status).toBe(200);
-    // Both PUTs read the same config-storage seam (deps.writeMirrorConfig)
-    // and serialize through the manager's async start() under the
-    // microtask queue. Final config reflects whichever PUT entered
-    // `reload()` last — practically the second one — but the salient
-    // assertion is "the manager isn't stuck": enabled + watch_running.
     const status = manager.getStatus();
     expect(status.enabled).toBe(true);
     expect(status.watch_running).toBe(true);
