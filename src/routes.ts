@@ -68,6 +68,8 @@ import {
   filterNotesByTagScope,
   noteWithinTagScope,
   scrubIndexedFieldConflictError,
+  scrubNotesTagsByScope,
+  scrubNoteTagsByScope,
   scrubParentCycleError,
   scrubReferencingTagsByScope,
   scrubTagFieldViolationsByScope,
@@ -1193,6 +1195,10 @@ async function handleNotesInner(
         const contentRange = parseContentRangeQuery(url, includeContent);
         if (contentRange.error) return contentRange.error;
         let result: any = includeContent ? { ...note } : toNoteIndex(note);
+        // Tag-scope (vault#568): the note is visible via at least one
+        // in-scope tag, but its `.tags` array would otherwise name every
+        // out-of-scope co-tag it carries. No-op unscoped.
+        result = scrubNoteTagsByScope(result, tagScope.allowed, tagScope.raw);
         const expand = parseExpandParams(url, db, tagScope);
         if (expand && includeContent && typeof result.content === "string") {
           expand.ctx.expanded.add(note.id);
@@ -1293,6 +1299,10 @@ async function handleNotesInner(
           if (contentRange.error) return contentRange.error;
           const inclMeta = parseIncludeMetadata(url);
           let output: any[] = includeContent ? filtered.map((n) => ({ ...n })) : filtered.map(toNoteIndex);
+          // Tag-scope (vault#568): filter each surviving note's own `.tags`
+          // to the in-scope subset — being visible via one tag must not
+          // disclose the NAMES of its out-of-scope co-tags. No-op unscoped.
+          output = scrubNotesTagsByScope(output, tagScope.allowed, tagScope.raw);
           const expand = parseExpandParams(url, db, tagScope);
           if (expand && includeContent) {
             for (const n of output) expand.ctx.expanded.add(n.id);
@@ -1465,6 +1475,9 @@ async function handleNotesInner(
         if (contentRange.error) return contentRange.error;
         const inclMeta = parseIncludeMetadata(url);
         let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
+        // Tag-scope (vault#568): filter each surviving note's own `.tags` to
+        // the in-scope subset — see the structured-query branch below.
+        output = scrubNotesTagsByScope(output, tagScope.allowed, tagScope.raw);
         const expand = parseExpandParams(url, db, tagScope);
         if (expand && includeContent) {
           for (const n of output) expand.ctx.expanded.add(n.id);
@@ -1762,6 +1775,15 @@ async function handleNotesInner(
       const includeLinkCount = parseBool(parseQuery(url, "include_link_count"), false);
       const inclMeta = parseIncludeMetadata(url);
       let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
+      // Tag-scope (vault#568): filter each surviving note's own `.tags` to
+      // the in-scope subset. Deliberately applied to `output`, NOT `results`:
+      // `results` still feeds `store.validateNoteAgainstSchemas` below (which
+      // needs the FULL tag set to compute the status that then gets its own
+      // scope scrub) and the graph-edge walk. Because `nodes` (graph format),
+      // `enrichedOut`, and the cursor/plain envelopes are all derived from
+      // `output`, this one call covers every shape this branch can return.
+      // No-op unscoped.
+      output = scrubNotesTagsByScope(output, tagScope.allowed, tagScope.raw);
       const expand = parseExpandParams(url, db, tagScope);
       if (expand && includeContent) {
         for (const n of output) expand.ctx.expanded.add(n.id);
@@ -2298,6 +2320,19 @@ async function handleNotesInner(
         let out: any = validated;
         if (warnings && warnings.length > 0) out = { ...out, warnings };
         if (existed !== undefined) out = { ...out, existed };
+        // Tag-scope (vault#568): a create response echoes the STORED note,
+        // and under `if_exists: ignore|update|replace` that's a note that
+        // already existed with tags this token never supplied. Without the
+        // scrub a scoped caller could recover any co-tagged note's full tag
+        // set through the write door. Same treatment on the validation_status
+        // this response carries — the #555 scrub was only wired to the read
+        // paths, so the write door still named out-of-scope schemas.
+        out = scrubNoteTagsByScope(out, tagScope.allowed, tagScope.raw);
+        if (out.validation_status) {
+          const vs = scrubValidationStatusByScope(out.validation_status, tagScope.allowed, tagScope.raw);
+          if (vs === undefined) { const { validation_status: _d, ...rest } = out; out = rest; }
+          else out = { ...out, validation_status: vs };
+        }
         return out;
       });
 
@@ -2538,6 +2573,11 @@ async function handleNotesInner(
     const contentRange = parseContentRangeQuery(url, includeContent);
     if (contentRange.error) return contentRange.error;
     let result: any = includeContent ? { ...note } : toNoteIndex(note);
+    // Tag-scope (vault#568): filter `.tags` to the in-scope subset. Placed
+    // before the validation_status block on purpose — that block reads
+    // `note.tags` (the full set) to COMPUTE the status and then scrubs the
+    // status itself, so the two scrubs are independent.
+    result = scrubNoteTagsByScope(result, tagScope.allowed, tagScope.raw);
     // vault#555 fix 3 — mirror the MCP query-notes fix: attach
     // validation_status on reads too, not just on the one-time create/update
     // write response. See core/src/mcp.ts's query-notes handler for the
@@ -2692,8 +2732,20 @@ async function handleNotesInner(
           }
           const final = await store.getNote(created.id);
           if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
-          const validated: any = attachValidationStatus(store, db, final);
+          let validated: any = attachValidationStatus(store, db, final);
           if (createWarnings.length > 0) validated.warnings = createWarnings;
+          // Tag-scope (vault#568): scrub the echoed note so create-then-read
+          // returns the SAME shape. A scoped token may legitimately attach an
+          // out-of-scope co-tag on write (`tagsWithinScope` only requires ONE
+          // in-scope tag), so this isn't a leak of anything it didn't send —
+          // but leaving it unscrubbed would make the write door the one place
+          // the full tag set is observable. Same for validation_status.
+          validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
+          if (validated.validation_status) {
+            const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
+            if (vs === undefined) { const { validation_status: _d, ...rest } = validated; validated = rest; }
+            else validated = { ...validated, validation_status: vs };
+          }
           const includeContentResp = body.include_content !== false;
           if (includeContentResp) return json({ ...validated, created: true });
           const lean: any = toNoteIndex(validated);
@@ -3013,7 +3065,18 @@ async function handleNotesInner(
       if (contentChanged) {
         linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
       }
-      const validated: any = attachValidationStatus(store, db, updatedNote);
+      let validated: any = attachValidationStatus(store, db, updatedNote);
+      // Tag-scope (vault#568): the update response echoes the STORED note, so
+      // without this a scoped caller could recover a co-tagged note's full tag
+      // set with a no-op PATCH — the read-path scrub would be trivially
+      // bypassable. The validation_status scrub rides along for the same
+      // reason (#555 only wired it to the read paths).
+      validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
+      if (validated.validation_status) {
+        const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
+        if (vs === undefined) { const { validation_status: _d, ...rest } = validated; validated = rest; }
+        else validated = { ...validated, validation_status: vs };
+      }
       // Echo hydrated links when a link mutation was part of this request,
       // OR the caller explicitly asked for them via `?include_links=true`
       // (vault feedback #8). Previously the update response omitted links

@@ -1885,11 +1885,16 @@ describe("scoped MCP wrapper", async () => {
     // note, so it's not a schema-shape indicator.)
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain("fizzbuzz");
-    // The tag NAME must be gone from validation_status specifically. NOTE:
-    // it still appears in the note's `.tags` array — that's PRE-EXISTING
-    // scoped-read behavior (noteWithinTagScope has never scrubbed a returned
-    // note's tag set), independent of fix 3, and out of scope for this fix.
+    // The tag NAME must be gone from validation_status specifically.
+    // (Historical note: this assertion used to be narrowed to
+    // `validation_status` because the name STILL appeared in the note's
+    // `.tags` array — pre-existing scoped-read behavior, filed as vault#568
+    // and out of scope for fix 3. #568 has since scrubbed `.tags` too, so
+    // the name is now absent from the whole response; the narrow assertion
+    // is kept as-is because it pins THIS fix's field specifically.
+    // `tag-scope-note-tags.test.ts` owns the `.tags` coverage.)
     expect(JSON.stringify(result.validation_status)).not.toContain("project-manhattan");
+    expect(result.tags).toEqual(["work"]);
 
     // The in-scope tag's own warning DOES survive.
     const vs = result.validation_status;
