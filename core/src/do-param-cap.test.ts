@@ -207,6 +207,99 @@ describe("id-list query paths stay under the DO 100-bound-param cap", () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // Cross-type affinity: `in`/`not_in` route the value-set through a
+  // `json_each` subquery, which — unlike a placeholder `IN (?, …)` list — does
+  // NOT apply the left column's type affinity to each candidate. The fix CASTs
+  // the set to the column's declared storage type so numeric-vs-TEXT (and the
+  // reverse) matches stay identical to the pre-#536 placeholder-list path
+  // (vault#676). These probes send the exact shapes the reviewer flagged and
+  // pin the row-sets that a naive json_each would silently narrow.
+  // -------------------------------------------------------------------------
+  describe("in / not_in preserve cross-type affinity (vault#676)", () => {
+    it("string-typed indexed column matches BARE NUMERIC in/not_in values", async () => {
+      // `version` is a TEXT-affinity column; the stored values are strings.
+      await store.upsertTagRecord("release", {
+        fields: { version: { type: "string", indexed: true } },
+      });
+      await store.updateNote("n00000", { tags: ["release"], metadata: { version: "5" } });
+      await store.updateNote("n00001", { tags: ["release"], metadata: { version: "6" } });
+      await store.updateNote("n00002", { tags: ["release"], metadata: { version: "7" } });
+
+      // The reviewer's probe: bare JSON numbers against a string column.
+      const inHit = await store.queryNotes({
+        metadata: { version: { in: [5, 6] } },
+        limit: 100,
+        sort: "asc",
+      });
+      expect(inHit.map((n) => n.id)).toEqual(["n00000", "n00001"]);
+
+      // Same set as JSON strings must return the SAME rows (the control the
+      // placeholder-list path always satisfied).
+      const inHitStr = await store.queryNotes({
+        metadata: { version: { in: ["5", "6"] } },
+        limit: 100,
+        sort: "asc",
+      });
+      expect(inHitStr.map((n) => n.id)).toEqual(inHit.map((n) => n.id));
+
+      // not_in with bare numbers must exclude the string rows `"5"`/`"6"` and
+      // keep `"7"` — the affinity-reconciled mirror of the `in` probe. (Rows
+      // with no `version` at all have a NULL column and legitimately match
+      // not_in, so assert membership rather than an exact set.)
+      const notInHit = await store.queryNotes({
+        metadata: { version: { not_in: [5, 6] } },
+        limit: 1000,
+        sort: "asc",
+      });
+      const notInIds = new Set(notInHit.map((n) => n.id));
+      expect(notInIds.has("n00000")).toBe(false); // version "5" — excluded
+      expect(notInIds.has("n00001")).toBe(false); // version "6" — excluded
+      expect(notInIds.has("n00002")).toBe(true); // version "7" — kept
+
+      // The bare-number not_in must exclude exactly the same rows a
+      // string-valued not_in does (the placeholder-list contract).
+      const notInHitStr = await store.queryNotes({
+        metadata: { version: { not_in: ["5", "6"] } },
+        limit: 1000,
+        sort: "asc",
+      });
+      expect(notInHitStr.map((n) => n.id)).toEqual(notInHit.map((n) => n.id));
+    });
+
+    it("integer-typed indexed column matches STRING in/not_in values (reverse direction)", async () => {
+      // `rank` is an INTEGER-affinity column populated 0..249; string-form
+      // membership (e.g. `"5"`) must still match under both shapes.
+      await store.upsertTagRecord("doc", {
+        fields: { rank: { type: "integer", indexed: true } },
+      });
+      for (let i = 0; i < 250; i++) {
+        await store.updateNote(`n${pad(i)}`, { tags: ["doc"], metadata: { rank: i } });
+      }
+      const inHit = await store.queryNotes({
+        metadata: { rank: { in: ["5", "6"] } },
+        limit: 100,
+        sort: "asc",
+      });
+      const inHitNum = await store.queryNotes({
+        metadata: { rank: { in: [5, 6] } },
+        limit: 100,
+        sort: "asc",
+      });
+      expect(inHit.map((n) => n.id)).toEqual(["n00005", "n00006"]);
+      expect(inHit.map((n) => n.id)).toEqual(inHitNum.map((n) => n.id));
+
+      const notInHit = await store.queryNotes({
+        metadata: { rank: { not_in: ["5"] } },
+        limit: 1000,
+        sort: "asc",
+      });
+      // 250 rows, only rank 5 excluded.
+      expect(notInHit.length).toBe(249);
+      expect(notInHit.some((n) => n.id === "n00005")).toBe(false);
+    });
+  });
+
   describe("export a >100-note vault", () => {
     let outDir: string;
     beforeEach(() => { outDir = mkdtempSync(join(tmpdir(), "do-cap-export-")); });

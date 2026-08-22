@@ -36,6 +36,8 @@
  * and is the conservative floor everywhere.
  */
 
+import type { SqliteType } from "./indexed-fields.js";
+
 /**
  * Chunk size for standalone `IN (?, ?, …)` id-lists. 90 leaves headroom
  * under the DO 100-param cap for statements whose only bound params are the
@@ -69,6 +71,25 @@ export function chunkForInClause<T>(items: readonly T[], size = IN_PARAM_CHUNK):
  * usually short-circuited to a `0 = 1` no-match upstream to skip the query).
  */
 export const IN_VIA_JSON_EACH = "(SELECT value FROM json_each(?))";
+
+/**
+ * Like {@link IN_VIA_JSON_EACH}, but CASTs each `json_each` value to the
+ * target column's declared SQLite storage type before the `IN` comparison.
+ *
+ * A placeholder list `IN (?, ?, …)` applied the LEFT column's type affinity
+ * to each bound value for free — a bound `5` compared against a TEXT-affinity
+ * column matched the stored `'5'`. Values arriving out of a `json_each`
+ * subquery do NOT get that conversion, so a numeric `5` from `{ in: [5] }`
+ * silently stopped matching a TEXT-affinity indexed column (vault#676). The
+ * explicit CAST restores the old cross-type match in BOTH directions
+ * (TEXT column / numeric value AND INTEGER column / string value), mirroring
+ * exactly what the placeholder list got implicitly. `sqliteType` is a fixed
+ * enum ("TEXT" | "INTEGER") from `indexed_fields`, never user input, so
+ * interpolating it into the SQL is safe.
+ */
+export function inViaJsonEachCast(sqliteType: SqliteType): string {
+  return `(SELECT CAST(value AS ${sqliteType}) FROM json_each(?))`;
+}
 
 /**
  * Serialize a value-set for the single {@link IN_VIA_JSON_EACH} bound param.

@@ -1177,10 +1177,11 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   if (opts.metadata) {
     for (const [key, value] of Object.entries(opts.metadata)) {
       if (isOperatorObject(value)) {
-        requireIndexedField(db, key);
+        const indexedField = requireIndexedField(db, key);
         const { sql, params: opParams } = buildOperatorClause(
           key,
           value as Record<string, unknown>,
+          indexedField.sqliteType,
         );
         conditions.push(sql);
         params.push(...opParams);

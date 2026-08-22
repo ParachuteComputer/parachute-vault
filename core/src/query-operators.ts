@@ -16,8 +16,8 @@
  */
 
 import { Database, type SQLQueryBindings } from "bun:sqlite";
-import { getIndexedField, type IndexedField } from "./indexed-fields.js";
-import { IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
+import { getIndexedField, type IndexedField, type SqliteType } from "./indexed-fields.js";
+import { inViaJsonEachCast, jsonEachParam } from "./sql-in.js";
 
 export const SUPPORTED_OPS = [
   "eq",
@@ -103,20 +103,6 @@ function toBinding(field: string, op: string, value: unknown): SQLQueryBindings 
 }
 
 /**
- * Best-effort lookup of a metadata field's declared `type` across every tag
- * schema — used ONLY to sharpen the {@link requireIndexedField} error hint
- * below when the field was never indexed. Scans `tags.fields` directly
- * rather than going through `indexed_fields` (which by construction has no
- * row for a type that can never BE indexed, e.g. `"number"`) or a
- * per-note schema resolution (scoped to one note's tags, not "any tag
- * anywhere"). Only reached on the FIELD_NOT_INDEXED error path — a full
- * table scan here is fine since it runs once per rejected call, never on a
- * hot path. Returns the type from the FIRST tag found declaring `field`
- * (a cross-tag type conflict on the same field name is its own separate
- * validation elsewhere, not this function's job); `undefined` when no tag
- * declares this field name, or its `fields` JSON doesn't parse.
- */
-/**
  * Narrow one `in`/`not_in` element to something `JSON.stringify` can carry
  * into {@link jsonEachParam} (vault#536).
  *
@@ -162,6 +148,20 @@ function toJsonEachMember(
   );
 }
 
+/**
+ * Best-effort lookup of a metadata field's declared `type` across every tag
+ * schema — used ONLY to sharpen the {@link requireIndexedField} error hint
+ * below when the field was never indexed. Scans `tags.fields` directly
+ * rather than going through `indexed_fields` (which by construction has no
+ * row for a type that can never BE indexed, e.g. `"number"`) or a
+ * per-note schema resolution (scoped to one note's tags, not "any tag
+ * anywhere"). Only reached on the FIELD_NOT_INDEXED error path — a full
+ * table scan here is fine since it runs once per rejected call, never on a
+ * hot path. Returns the type from the FIRST tag found declaring `field`
+ * (a cross-tag type conflict on the same field name is its own separate
+ * validation elsewhere, not this function's job); `undefined` when no tag
+ * declares this field name, or its `fields` JSON doesn't parse.
+ */
 function findDeclaredFieldType(db: Database, field: string): string | undefined {
   const rows = db.prepare(
     `SELECT fields FROM tags WHERE fields IS NOT NULL`,
@@ -223,10 +223,19 @@ export function requireIndexedField(db: Database, field: string): IndexedField {
  * Build a SQL fragment + bound params for an operator object on an indexed
  * metadata field. Each operator maps to a single AND clause; an object like
  * `{ gt: 5, lt: 10 }` composes as `meta_<field> > 5 AND meta_<field> < 10`.
+ *
+ * `sqliteType` is the field's declared column storage type (from
+ * `requireIndexedField(...).sqliteType`, which every caller already
+ * resolves). It's needed for `in`/`not_in`: those bind the value-set through
+ * a `json_each` subquery, which — unlike a placeholder `IN (?, …)` list —
+ * does NOT apply the left column's type affinity to each candidate value, so
+ * the set must be CAST to the column's type to keep cross-type matches like
+ * numeric `5` against a TEXT-affinity `'5'` (vault#676).
  */
 export function buildOperatorClause(
   field: string,
   opObj: Record<string, unknown>,
+  sqliteType: SqliteType,
 ): { sql: string; params: SQLQueryBindings[] } {
   validateOperatorObject(field, opObj);
   // `field` came from indexed_fields (which validated it via FIELD_NAME_RE
@@ -300,11 +309,19 @@ export function buildOperatorClause(
         // primitive-only validation (and the same error message) applies as
         // before — the values are just serialized into JSON instead of bound
         // one by one.
+        //
+        // The set is CAST to the column's declared storage type inside the
+        // subquery (`inViaJsonEachCast`). A placeholder `IN (?, …)` list got
+        // the left column's affinity applied to each value for free; a
+        // `json_each` subquery does not, so without the CAST a numeric `5`
+        // silently stopped matching a TEXT-affinity `'5'` (vault#676). The
+        // CAST restores that in both directions and covers `in` and `not_in`.
         const members = value.map((v) => toJsonEachMember(field, op, v));
+        const inClause = inViaJsonEachCast(sqliteType);
         if (op === "in") {
-          parts.push(`${col} IN ${IN_VIA_JSON_EACH}`);
+          parts.push(`${col} IN ${inClause}`);
         } else {
-          parts.push(`(${col} IS NULL OR ${col} NOT IN ${IN_VIA_JSON_EACH})`);
+          parts.push(`(${col} IS NULL OR ${col} NOT IN ${inClause})`);
         }
         params.push(jsonEachParam(members));
         break;
