@@ -197,6 +197,56 @@ export function buildExpandVisibility(
 }
 
 /**
+ * Filter a note's OWN `.tags` array to the tags this token can see
+ * (vault#568). A tag-scoped token is admitted to a note when ANY of its tags
+ * is in scope (`noteWithinTagScope`) — but the note that came back carried
+ * its FULL tag set, so a note tagged `["mine","project-manhattan"]` read by a
+ * `mine`-scoped token disclosed the NAME `project-manhattan`. Same
+ * out-of-scope-tag-name disclosure class as #560 and the `validation_status`
+ * scrub above, through a different field.
+ *
+ * Policy: `.tags` becomes exactly the in-scope subset, using the SAME
+ * per-tag rule (`tagVisibleInScope`) that admitted the note — allowlist
+ * membership OR string-form root match. Non-mutating: returns the input
+ * untouched when nothing is filtered (and always when unscoped), otherwise a
+ * shallow copy with a fresh `tags` array. That matters at the live-
+ * subscription seam, where ONE `Note` payload fans out to many subscribers
+ * with different allowlists — mutating it would cross-contaminate.
+ *
+ * **The result is never empty for a note the caller can see.** A note whose
+ * tags are ALL out of scope fails `noteWithinTagScope` and is already
+ * invisible (404 on a single read, silently dropped from lists) — it never
+ * reaches this scrub. So the visible-subset is non-empty by construction,
+ * and this fix introduces no new "note with no tags" shape. The precedent
+ * it follows is the contract's §Semantics "out-of-scope reads return 404,
+ * not 403": the scope boundary is invisible, not redacted-in-place.
+ *
+ * Applies to READ responses on both doors AND to write responses, which
+ * echo the stored note — a scoped caller could otherwise recover the full
+ * tag set with a no-op `update-note`/`PATCH`.
+ */
+export function scrubNoteTagsByScope<T extends { tags?: string[] }>(
+  note: T,
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): T {
+  if (rawRoots === null || !note || !Array.isArray(note.tags)) return note;
+  const visible = note.tags.filter((t) => tagVisibleInScope(t, allowed, rawRoots));
+  if (visible.length === note.tags.length) return note;
+  return { ...note, tags: visible };
+}
+
+/** Array form of `scrubNoteTagsByScope`. No-op when unscoped. */
+export function scrubNotesTagsByScope<T extends { tags?: string[] }>(
+  notes: T[],
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): T[] {
+  if (rawRoots === null) return notes;
+  return notes.map((n) => scrubNoteTagsByScope(n, allowed, rawRoots));
+}
+
+/**
  * Treat a hydrated link's endpoint summary as a scope-checkable note. The
  * summary carries `id` + `tags`, which is all `noteWithinTagScope` needs.
  * A summary with no tags is out of scope under a tag-scoped token (same as
@@ -226,6 +276,13 @@ function summaryWithinTagScope(
  * fully hydrated. Dropping the whole row (vs. just nulling the summary) is
  * required because the raw row still carries the neighbor's note id.
  *
+ * **Also scrubs the SURVIVING summaries' `.tags` (vault#568).** Dropping
+ * wholly-out-of-scope neighbors is not sufficient: an IN-scope neighbor is
+ * itself a co-tagged note, so its `NoteSummary.tags` carries the same
+ * out-of-scope tag NAMES the top-level note's `.tags` does. This is the
+ * second door on the same field, so it gets the same `scrubNoteTagsByScope`
+ * treatment (non-mutating — the hydrated rows may be shared across a page).
+ *
  * No-op when the token is unscoped (`rawRoots === null`) — identical to the
  * pre-fix behavior.
  */
@@ -235,11 +292,22 @@ export function filterHydratedLinksByTagScope(
   rawRoots: string[] | null,
 ): HydratedLink[] {
   if (rawRoots === null) return links;
-  return links.filter(
-    (link) =>
-      summaryWithinTagScope(link.sourceNote, allowed, rawRoots) &&
-      summaryWithinTagScope(link.targetNote, allowed, rawRoots),
-  );
+  return links
+    .filter(
+      (link) =>
+        summaryWithinTagScope(link.sourceNote, allowed, rawRoots) &&
+        summaryWithinTagScope(link.targetNote, allowed, rawRoots),
+    )
+    .map((link) => {
+      const sourceNote = link.sourceNote
+        ? scrubNoteTagsByScope(link.sourceNote, allowed, rawRoots)
+        : link.sourceNote;
+      const targetNote = link.targetNote
+        ? scrubNoteTagsByScope(link.targetNote, allowed, rawRoots)
+        : link.targetNote;
+      if (sourceNote === link.sourceNote && targetNote === link.targetNote) return link;
+      return { ...link, sourceNote, targetNote };
+    });
 }
 
 /**

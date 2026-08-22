@@ -23,6 +23,7 @@ import {
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
   scrubIndexedFieldConflictError,
+  scrubNoteTagsByScope,
   scrubParentCycleError,
   scrubReferencingTagsByScope,
   scrubTagFieldViolationsByScope,
@@ -398,33 +399,57 @@ function applyTagScopeWrappers(
   };
   const rawTags = auth.scoped_tags;
 
-  // Scrub a returned note's hydrated `links` array (present when the caller
-  // set `include_links`) so out-of-scope NEIGHBOR summaries (id/path/tags)
-  // don't leak — symmetric with the REST `include_links` fix. Mutates in
-  // place and returns the note for chaining. No-op when `links` is absent.
+  // Apply every scope scrub a returned note needs, in one place:
+  //
+  //  1. hydrated `links` (present when the caller set `include_links`) — drop
+  //     out-of-scope NEIGHBOR summaries (id/path/tags) and scrub the
+  //     surviving summaries' own `.tags`; symmetric with REST.
+  //  2. `validation_status` (vault#555 auth review) — a note the caller can
+  //     see may ALSO carry an out-of-scope co-tag whose schema would
+  //     otherwise leak (field name / type / enum values, the #560 class).
+  //  3. the note's OWN `.tags` array (vault#568) — being admitted via one
+  //     in-scope tag must not disclose the NAMES of its out-of-scope
+  //     co-tags. This is the same leak class as (2) through a plainer field.
+  //
+  // (1) and (2) mutate in place; (3) is non-mutating and may return a NEW
+  // object, so callers must use the RETURN VALUE, never rely on the mutation.
   //
   // Ordering invariant: reading `allowedHolder.value` here is safe ONLY
-  // because every wrapper that calls scrubNoteLinks first does
+  // because every wrapper that calls scrubNoteForScope first does
   // `await getAllowed()` (which populates the holder) before `orig(params)`
   // and before this scrub runs. So by the time we read `holder.value` it is
   // the resolved allowlist, never the initial `null`. The `?? null` fallback
   // is the unscoped/holder-absent path; `filterHydratedLinksByTagScope` then
   // keys off `rawTags` (non-null here) for the actual scope check.
-  const scrubNoteLinks = (n: any): any => {
+  const scrubNoteForScope = (n: any): any => {
     if (n && Array.isArray(n.links)) {
       n.links = filterHydratedLinksByTagScope(n.links, allowedHolder?.value ?? null, rawTags);
     }
-    // vault#555 auth review — a note the caller can see may ALSO carry an
-    // out-of-scope co-tag whose schema `validation_status` would otherwise
-    // leak (field name / type / enum values, the #560 class). Scrub it with
-    // the same allowlist the link scrub uses. Reads the resolved holder for
-    // the same reason (see the ordering-invariant note above scrubNoteLinks).
     if (n && n.validation_status) {
       const scrubbed = scrubValidationStatusByScope(n.validation_status, allowedHolder?.value ?? null, rawTags);
       if (scrubbed === undefined) delete n.validation_status;
       else n.validation_status = scrubbed;
     }
-    return n;
+    return scrubNoteTagsByScope(n, allowedHolder?.value ?? null, rawTags);
+  };
+
+  /**
+   * Shape dispatcher for the WRITE tools (vault#568). `create-note` and
+   * `update-note` echo the stored note, so they leak exactly what the read
+   * paths leak — and a no-op `update-note` would otherwise be a one-call
+   * bypass of the read-path scrub. Their result is a single note, a `notes`
+   * array (batch), or a `{created, ids, failed}` batch summary (no note
+   * bodies → nothing to scrub). Errors (`{error, error_type}`) pass through.
+   */
+  const scrubWriteResult = (result: any): any => {
+    if (!result || typeof result !== "object") return result;
+    if (Array.isArray(result)) return result.map(scrubNoteForScope);
+    if ("error" in result) return result;
+    if (Array.isArray((result as any).notes)) {
+      return { ...result, notes: (result as any).notes.map(scrubNoteForScope) };
+    }
+    if ("id" in result && "tags" in result) return scrubNoteForScope(result);
+    return result;
   };
 
   wrapReadTool(tools, "query-notes", async (orig, params) => {
@@ -463,7 +488,7 @@ function applyTagScopeWrappers(
     if (Array.isArray(result)) {
       return result
         .filter((n: any) => noteWithinTagScope(n, allowed, rawTags))
-        .map(scrubNoteLinks);
+        .map(scrubNoteForScope);
     }
     if (
       result &&
@@ -475,7 +500,7 @@ function applyTagScopeWrappers(
       return {
         notes: r.notes
           .filter((n: any) => noteWithinTagScope(n, allowed, rawTags))
-          .map(scrubNoteLinks),
+          .map(scrubNoteForScope),
         ...("next_cursor" in r ? { next_cursor: r.next_cursor } : {}),
         // `warnings` intentionally DROPPED for a tag-scoped session: core's
         // `collectUnknownTagWarnings` (core/src/query-warnings.ts) resolves
@@ -489,7 +514,7 @@ function applyTagScopeWrappers(
     }
     if (result && typeof result === "object" && "id" in result && "tags" in result) {
       return noteWithinTagScope(result as any, allowed, rawTags)
-        ? scrubNoteLinks(result)
+        ? scrubNoteForScope(result)
         : { error: "Note not found", error_type: "not_found", id: (result as any).id };
     }
     return result;
@@ -623,7 +648,10 @@ function applyTagScopeWrappers(
     // both the proactive site and the race-backstop site with one guard. The
     // `await getAllowed()` at the top of this wrapper populates the shared
     // `allowedHolder` the predicate reads, before core's execute runs.
-    return await orig(params);
+    // vault#568 — scrub the echoed note(s): under `if_exists: ignore|update|
+    // replace` the response is a PRE-EXISTING note whose co-tags this caller
+    // never supplied and must not learn.
+    return scrubWriteResult(await orig(params));
   });
 
   wrapReadTool(tools, "update-note", async (orig, params) => {
@@ -646,7 +674,13 @@ function applyTagScopeWrappers(
         return forbidden("update-note: post-update tag set must satisfy the token's allowlist");
       }
     }
-    return await orig(params);
+    // vault#568 — scrub the echoed note(s). Without this a no-op update-note
+    // is a one-call bypass of the read-path `.tags` scrub. Also closes two
+    // pre-existing parity gaps on this tool: the echoed hydrated `links`
+    // (REST's PATCH already scrubbed them at the `filterHydratedLinksByTagScope`
+    // call; MCP did not) and `validation_status` (#555 wired the scrub to the
+    // read paths only).
+    return scrubWriteResult(await orig(params));
   });
 
   wrapReadTool(tools, "delete-note", async (orig, params) => {

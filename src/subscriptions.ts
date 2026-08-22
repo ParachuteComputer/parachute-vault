@@ -65,7 +65,7 @@ import type { DeletedNoteRef, HookEvent, NoteHookPayload } from "../core/src/hoo
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { toNoteIndex } from "../core/src/notes.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
-import { noteWithinTagScope } from "./tag-scope.ts";
+import { noteWithinTagScope, scrubNoteTagsByScope } from "./tag-scope.ts";
 import type { LiveMatcher } from "./live-match.ts";
 
 /** Default per-vault concurrent-subscription cap. Over it → 503. */
@@ -332,7 +332,23 @@ export class SubscriptionManager {
       if (matches) {
         // A lean subscription (list view, `include_content=false`) carries the
         // same `NoteIndex` projection REST lists return — never the full body.
-        this.emit(sub, "upsert", { note: sub.lean ? toNoteIndex(note) : note });
+        //
+        // vault#568 — then scrub `.tags` to this subscriber's in-scope subset.
+        // A live event is a read: a `mine`-scoped socket watching a co-tagged
+        // note must not receive `project-manhattan` in the payload any more
+        // than `GET /api/notes/:id` would hand it over. Order matters twice:
+        // the matcher and the scope gate above both read the FULL tag set (a
+        // live predicate must evaluate against what's actually stored), and
+        // the scrub is NON-MUTATING — `note` is ONE payload fanned out to
+        // every subscriber in this loop, each with its own allowlist, so
+        // mutating it would cross-contaminate the next subscriber's frame.
+        this.emit(sub, "upsert", {
+          note: scrubNoteTagsByScope(
+            sub.lean ? toNoteIndex(note) : note,
+            sub.tagScopeAllowed,
+            sub.tagScopeRaw,
+          ),
+        });
       } else if (event === "updated" && inScope) {
         // Left the set (predicate no longer true) BUT still within this
         // token's scope, so the sub could have held it — idempotent remove
