@@ -780,6 +780,32 @@ matter to the operator; surface the indexed fields they filter on. If the vault
 doesn't yet have the structure a surface wants, that's a signal to design tags +
 schemas first.
 
+## Deploying your surface
+
+A surface is a **static build** — there's no server to run. \`bun run build\`
+produces a \`dist/\` of plain HTML/JS/CSS that any static host serves: GitHub
+Pages, Cloudflare Pages, Netlify, an S3 bucket.
+
+For **GitHub Pages**, push the BUILT FILES to a \`gh-pages\` branch (or a
+\`docs/\` folder on your default branch) and point Settings → Pages at it.
+Deliberately: **don't reach for an Actions workflow.** Some agent GitHub
+integrations can't write \`.github/workflows/*\` — the push comes back 403 —
+and a static build doesn't need CI at all. Build locally, publish the output.
+
+Two things must line up or the deployed surface will load and then fail to
+sign in:
+
+- the **hub origin** your surface points at has to be reachable from wherever
+  the browser is (a \`localhost\` hub won't answer a page served from GitHub
+  Pages);
+- that surface's **origin must be trusted by the hub** for CORS + as an OAuth
+  redirect origin.
+
+Both trace back to the same place the \`createVaultSurface\` config above does:
+\`vault-info\`'s **"This vault's coordinates"** block reports this vault's hub
+origin and name. If sign-in fails from the deployed URL but works from
+\`localhost\`, suspect the origin allowlist before the code.
+
 ## Adapt this note
 
 When you build a surface for this vault, record it here: what it's for, the
