@@ -36,7 +36,8 @@ import {
 } from "./schema-defaults.ts";
 import type { TagFieldSchema } from "./tag-schemas.ts";
 import { getTagDescendants, loadTagHierarchy } from "./tag-hierarchy.ts";
-import { queryNotes, getNoteTagsForNotes } from "./notes.ts";
+import { getNotes, getNoteTagsForNotes } from "./notes.ts";
+import { chunkForInClause } from "./sql-in.ts";
 
 export interface ConformanceViolation {
   /** Note id of a non-conforming note. */
@@ -131,6 +132,9 @@ function overlayProposedSchema(
  *
  * Pure read; no mutation. Returns 0 violating notes when `proposedFields` is
  * empty (nothing to enforce).
+ *
+ * The walk is UNBOUNDED — every note carrying the tag or a descendant, not a
+ * `queryNotes` page (vault#592). `total_notes` is a real total.
  */
 export function countConformanceViolations(
   db: Database,
@@ -155,10 +159,35 @@ export function countConformanceViolations(
   const tagSet = Array.from(getTagDescendants(hierarchy, tag));
   if (tagSet.length === 0) return empty;
 
-  // All notes carrying the tag (or a descendant). `tagMatch: "any"` over the
-  // expanded set — a note on ANY of these tags is in scope. We hydrate tags
-  // ourselves (batched) so the resolver sees the full ancestor set per note.
-  const notes = queryNotes(db, { tags: tagSet, tagMatch: "any" });
+  // All notes carrying the tag (or a descendant) — a note on ANY of these
+  // tags is in scope.
+  //
+  // UNBOUNDED id sweep (vault#592). This used to call
+  // `queryNotes(db, { tags: tagSet, tagMatch: "any" })` with no `limit`,
+  // which silently inherits that function's default `LIMIT 100`
+  // (`notes.ts`) — so on a tag with more than 100 notes both `total_notes`
+  // and the violation scan reported the first page only. The operator was
+  // told "3 of 100 notes violate this" for a 1,200-note tag, and violations
+  // living past note 100 were never even looked at. A conformance count that
+  // undercounts is worse than no count: it is the number the operator
+  // decides on.
+  //
+  // Same shape as `SqliteStore.backfillReferenceFieldLinks` (store.ts),
+  // which fixed the identical inherited-cap bug on the reference backfill: a
+  // direct `note_tags` scan chunked under the IN-param cap, deduped across
+  // tags (a note carrying both `dev` and `dev/log` is ONE note), then
+  // hydrated in a batch. Still a pure read.
+  const idSet = new Set<string>();
+  for (const chunk of chunkForInClause(tagSet)) {
+    const placeholders = chunk.map(() => "?").join(", ");
+    const rows = db
+      .prepare(`SELECT DISTINCT note_id FROM note_tags WHERE tag_name IN (${placeholders})`)
+      .all(...chunk) as { note_id: string }[];
+    for (const r of rows) idSet.add(r.note_id);
+  }
+  if (idSet.size === 0) return empty;
+
+  const notes = getNotes(db, Array.from(idSet));
   if (notes.length === 0) return empty;
 
   if (checkedFields.length === 0) {
