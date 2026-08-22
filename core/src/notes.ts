@@ -2924,8 +2924,10 @@ export function toNoteIndex(note: Note): NoteIndex {
 /**
  * Filter metadata on a note/index result based on an include_metadata param.
  * - true / undefined → return as-is (all metadata)
- * - false → strip metadata entirely
- * - string[] → return only those keys (empty array = no filtering)
+ * - false → strip metadata entirely (key omitted — caller asked for none)
+ * - string[] → return only those keys. Empty array = no filtering (all keys).
+ *   A non-empty array whose keys miss still keeps `metadata: {}` (vault#600
+ *   V1.1 invariant — the key must not vanish from the wire).
  */
 export function filterMetadata(obj: any, includeMetadata: boolean | string[] | undefined): any {
   if (includeMetadata === undefined || includeMetadata === true) return obj;
@@ -2939,7 +2941,7 @@ export function filterMetadata(obj: any, includeMetadata: boolean | string[] | u
   const filtered = Object.fromEntries(
     Object.entries(obj.metadata).filter(([k]) => fields.includes(k)),
   );
-  return { ...obj, metadata: Object.keys(filtered).length > 0 ? filtered : undefined };
+  return { ...obj, metadata: filtered };
 }
 
 /**
