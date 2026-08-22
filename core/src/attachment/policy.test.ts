@@ -4,6 +4,7 @@ import {
   ATTACHMENT_MIME_TYPES,
   sanitizeAttachmentExtension,
   mimeForAttachmentExtension,
+  contentTypeForAttachmentPath,
 } from "./policy.ts";
 
 describe("sanitizeAttachmentExtension", () => {
@@ -47,6 +48,12 @@ describe("mimeForAttachmentExtension", () => {
 
   test("falls back to application/octet-stream for an uncurated extension", () => {
     expect(mimeForAttachmentExtension(".azw3")).toBe("application/octet-stream");
+  });
+
+  test("contentTypeForAttachmentPath ignores a caller-asserted active mime (vault#617)", () => {
+    expect(contentTypeForAttachmentPath("2026-07-17/photo.png")).toBe("image/png");
+    expect(contentTypeForAttachmentPath("notes/evil.png")).toBe("image/png");
+    expect(contentTypeForAttachmentPath("notes/unknown.azw3")).toBe("application/octet-stream");
   });
 
   test("no MIME entry maps to a browser-active type (INVARIANT)", () => {

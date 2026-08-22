@@ -52,6 +52,7 @@ import {
   ATTACHMENT_MIME_TYPES,
   sanitizeAttachmentExtension,
   mimeForAttachmentExtension,
+  contentTypeForAttachmentPath,
 } from "./attachment/policy.js";
 import {
   computeTicketTtlMs,
@@ -2658,6 +2659,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const now = Date.now();
           const expiresAt = now + computeTicketTtlMs(declaredSize);
           const id = generateTicketId();
+          const downloadMime = contentTypeForAttachmentPath(attachment.path);
           const ticket: AttachmentTicket = {
             id,
             kind: "download",
@@ -2665,7 +2667,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             createdAt: now,
             expiresAt,
             attachmentId: attachment.id,
-            mimeType: attachment.mimeType,
+            mimeType: downloadMime,
             sizeBytes: declaredSize,
           };
           await ticketSeam.provider.put(ticket);
@@ -2674,7 +2676,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           return {
             method: "GET",
             url,
-            mime_type: attachment.mimeType,
+            mime_type: downloadMime,
             ...(declaredSize !== undefined ? { size_bytes: declaredSize } : {}),
             expires_at: new Date(expiresAt).toISOString(),
             curl_example: `curl -o downloaded${sanitizeAttachmentExtension(attachment.path) || ""} '${url}'`,
