@@ -679,6 +679,29 @@ export function resolveUnresolvedWikilinks(
          OR target_path = ? COLLATE NOCASE
          OR target_path = ? COLLATE NOCASE
     `).all(notePath, notePath, h1Title, pathDotExt) as typeof rows;
+
+    // vault#589: SQLite COLLATE NOCASE is ASCII-only. `[[CAFÉ]]` vs H1 `café`
+    // (or `[[FOO.CSV]]` vs `foo.csv`) is excluded by the pre-filter even
+    // though findNotesByTitle folds with JS toLowerCase. Union any remaining
+    // pending rows whose target Unicode-folds equal to the H1 or path.ext;
+    // the verify step still decides.
+    if (h1Title || pathDotExt) {
+      const all = db.prepare(
+        "SELECT source_id, target_path, relationship FROM unresolved_wikilinks",
+      ).all() as typeof rows;
+      const seen = new Set(rows.map((r) => `${r.source_id}\0${r.target_path}\0${r.relationship}`));
+      const h1 = h1Title?.toLowerCase();
+      const ext = pathDotExt?.toLowerCase();
+      for (const row of all) {
+        const key = `${row.source_id}\0${row.target_path}\0${row.relationship}`;
+        if (seen.has(key)) continue;
+        const folded = row.target_path.toLowerCase();
+        if ((h1 && folded === h1) || (ext && folded === ext)) {
+          rows.push(row);
+          seen.add(key);
+        }
+      }
+    }
   } catch {
     return 0; // Table doesn't exist
   }

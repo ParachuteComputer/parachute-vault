@@ -630,6 +630,18 @@ describe("delete → recreate re-resolves inbound wikilinks (LB6)", () => {
     expect(getUnresolvedLinksForNote(db, b.id)).toHaveLength(0);
   });
 
+  it("re-heals a non-ASCII title that differs only in case (vault#589 COLLATE NOCASE is ASCII-only)", async () => {
+    const source = await store.createNote("see [[CAFÉ]]", { path: "A" });
+    expect(getUnresolvedLinksForNote(db, source.id).map((r) => r.target_path ?? r.target)).toEqual(["CAFÉ"]);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    const target = await store.createNote("# café\n\nbody", { path: "people/cafe" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target.id);
+    expect(getUnresolvedLinksForNote(db, source.id)).toHaveLength(0);
+  });
+
   // The completed sweep must NOT mis-resolve an AMBIGUOUS target — matching
   // write-time's "don't guess" contract. A pending [[John Doe]] is swept when
   // a same-titled note is created; if TWO notes already share that H1 by the
