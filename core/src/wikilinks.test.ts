@@ -7,6 +7,7 @@ import {
   resolveWikilink,
   resolveWikilinkDetailed,
   resolveUnresolvedWikilinks,
+  queueUnresolvedLink,
   listUnresolvedWikilinks,
   getContentWikilinkWarnings,
   resolveOrQueueLink,
@@ -776,5 +777,21 @@ describe("ensureRelationshipColumn — crash-safe rebuild", () => {
     expect(resolved).toBe(1);
     const links = await store.getLinks(srcId, { direction: "outbound" });
     expect(links.some((l) => l.targetId === targetA!.id && l.relationship === "wikilink")).toBe(true);
+  });
+});
+
+describe("deferred resolution — ID leg (vault#591)", () => {
+  it("heals an ID-valued pending row when the target note is later created", async () => {
+    const source = await store.createNote("src", { path: "Src" });
+    const futureId = "tgt-id-591";
+    queueUnresolvedLink(db, source.id, futureId, "reference");
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    const target = await store.createNote("tgt", { id: futureId, path: "Tgt" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target.id);
+    expect(links[0]!.relationship).toBe("reference");
+    expect(getUnresolvedLinksForNote(db, source.id)).toHaveLength(0);
   });
 });

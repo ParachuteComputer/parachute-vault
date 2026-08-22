@@ -666,19 +666,21 @@ export function resolveUnresolvedWikilinks(
   let rows: { source_id: string; target_path: string; relationship: string }[];
   try {
     // Candidate pre-filter: every pending row whose `target_path` COULD
-    // resolve to this note under any resolveWikilinkDetailed leg — exact
-    // path, basename (target is the last path segment), H1 title, or the
-    // `path.ext` form. A `null` bind (no H1 heading / no extension) makes its
-    // clause never match (`target_path = NULL` is NULL, i.e. falsy in SQL).
-    // The verify step below is what enforces correctness; this clause only
-    // BOUNDS how many rows reach the (title-fallback-scanning) resolver.
+    // resolve to this note under any resolveLinkTargetDetailed leg — exact
+    // path, basename (target is the last path segment), H1 title, the
+    // `path.ext` form, or a raw note ID (vault#591: typed `reference` fields
+    // and ID-form structured links). A `null` bind (no H1 heading / no
+    // extension) makes its clause never match (`target_path = NULL` is NULL,
+    // i.e. falsy in SQL). The verify step below is what enforces correctness;
+    // this clause only BOUNDS how many rows reach the resolver.
     rows = db.prepare(`
       SELECT source_id, target_path, relationship FROM unresolved_wikilinks
       WHERE target_path = ? COLLATE NOCASE
          OR ? LIKE '%/' || target_path
          OR target_path = ? COLLATE NOCASE
          OR target_path = ? COLLATE NOCASE
-    `).all(notePath, notePath, h1Title, pathDotExt) as typeof rows;
+         OR target_path = ?
+    `).all(notePath, notePath, h1Title, pathDotExt, noteId) as typeof rows;
 
     // vault#589: SQLite COLLATE NOCASE is ASCII-only. `[[CAFÉ]]` vs H1 `café`
     // (or `[[FOO.CSV]]` vs `foo.csv`) is excluded by the pre-filter even
@@ -717,7 +719,10 @@ export function resolveUnresolvedWikilinks(
     // target string actually resolves to THIS note now. A miss or an
     // ambiguous result leaves the row queued (surfaced as a visible broken
     // link, and re-tried on the next matching note create).
-    const detail = resolveWikilinkDetailed(db, row.target_path);
+    // ID-then-path/title — same resolver structured links use at write time
+    // (vault#591). Wikilink pending rows never carry a raw ID, so the extra
+    // leg is a no-op for them.
+    const detail = resolveLinkTargetDetailed(db, row.target_path);
     if (!detail.resolved || detail.note_id !== noteId) continue;
 
     const relationship = row.relationship || WIKILINK_REL;
