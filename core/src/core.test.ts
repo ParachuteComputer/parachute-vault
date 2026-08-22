@@ -4358,7 +4358,8 @@ describe("MCP tools", async () => {
     }) as any;
     const page = Array.isArray(pageResult) ? pageResult : pageResult.notes;
     expect(page).toHaveLength(2);
-    expect(pageResult.warnings?.some((w: any) => w.code === "truncated" && w.limit === 2)).toBe(true);
+    // vault#601: explicit offset is deliberate paging — no truncated warning.
+    expect(pageResult.warnings?.some((w: any) => w.code === "truncated") ?? false).toBe(false);
   });
 
   it("query-notes exclude_path_prefix drops matching paths and keeps pathless notes (vault#628)", async () => {

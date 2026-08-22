@@ -1709,7 +1709,9 @@ async function handleNotesInner(
       // `limit` (i.e. there may be more rows the caller never saw). Cursor
       // mode is exempt — it already carries `next_cursor` as the honest
       // "more may follow" signal, so a second warning would be redundant.
-      if (!cursorMode && results.length === queryOpts.limit) {
+      // Explicit offset is also exempt (vault#601): the caller is already
+      // paging, not hitting an accidental full default page.
+      if (!cursorMode && queryOpts.offset === undefined && results.length === queryOpts.limit) {
         queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
       }
 
