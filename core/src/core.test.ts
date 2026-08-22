@@ -4411,13 +4411,17 @@ describe("MCP tools", async () => {
     expect(b.metadata).toEqual({ summary: "b" }); // status absent → omitted
   });
 
-  it("query-notes include_metadata: string[] with no matching fields returns undefined metadata", async () => {
+  it("query-notes include_metadata: string[] with no matching fields keeps metadata: {} (vault#600)", async () => {
+    // V1.1 invariant: rowToNote always emits `metadata: {}`. The projection
+    // branch used to set `metadata: undefined` when no requested keys
+    // matched, so the key vanished from the wire again.
     await store.createNote("A", { tags: ["no-match-meta"], metadata: { summary: "a" } });
     const tools = generateMcpTools(store);
     const query = tools.find((t) => t.name === "query-notes")!;
     const result = await query.execute({ tag: "no-match-meta", include_metadata: ["nonexistent"] }) as any[];
     expect(result).toHaveLength(1);
-    expect(result[0].metadata).toBeUndefined();
+    expect(result[0]).toHaveProperty("metadata", {});
+    expect(JSON.parse(JSON.stringify(result[0]))).toHaveProperty("metadata", {});
   });
 
   it("query-notes near param scopes results to graph neighborhood", async () => {

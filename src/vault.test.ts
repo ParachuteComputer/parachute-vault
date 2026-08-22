@@ -2530,6 +2530,14 @@ describe("HTTP /notes", async () => {
     expect(body.metadata).toEqual({ summary: "s" });
   });
 
+  test("GET /notes?include_metadata=nonexistent keeps metadata: {} (vault#600)", async () => {
+    await store.createNote("a", { tags: ["m600"], metadata: { summary: "hello" } });
+    const res = await handleNotes(mkReq("GET", "/notes?tag=m600&include_metadata=nonexistent"), store, "");
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0]).toHaveProperty("metadata", {});
+  });
+
   test("GET /notes/:id?expand_links=true inlines wikilink content", async () => {
     await store.createNote("target body", { path: "Target" });
     await store.createNote("see [[Target]]", { id: "src", path: "Src" });
