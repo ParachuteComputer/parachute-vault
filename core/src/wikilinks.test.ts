@@ -7,6 +7,7 @@ import {
   resolveWikilink,
   resolveWikilinkDetailed,
   resolveUnresolvedWikilinks,
+  queueUnresolvedLink,
   listUnresolvedWikilinks,
   getContentWikilinkWarnings,
   resolveOrQueueLink,
@@ -776,5 +777,49 @@ describe("ensureRelationshipColumn — crash-safe rebuild", () => {
     expect(resolved).toBe(1);
     const links = await store.getLinks(srcId, { direction: "outbound" });
     expect(links.some((l) => l.targetId === targetA!.id && l.relationship === "wikilink")).toBe(true);
+  });
+});
+
+describe("deferred resolution — ID leg (vault#591)", () => {
+  it("heals an ID-valued pending row when the target note is later created", async () => {
+    const source = await store.createNote("src", { path: "Src" });
+    const futureId = "tgt-id-591";
+    queueUnresolvedLink(db, source.id, futureId, "reference");
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    const target = await store.createNote("tgt", { id: futureId, path: "Tgt" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target.id);
+    expect(links[0]!.relationship).toBe("reference");
+    expect(getUnresolvedLinksForNote(db, source.id)).toHaveLength(0);
+  });
+
+  // Watch-fail: a shared ID-first verify lets a decoy whose id equals the
+  // pending bracket text short-circuit resolveLinkTargetDetailed. The
+  // titled note's sweep then sees detail.note_id !== noteId and leaves the
+  // row queued forever. Write-time resolveWikilinkDetailed has no ID leg,
+  // so a fresh save would heal to the titled note.
+  it("does not let an ID-named decoy steal a pending wikilink from a later titled note", async () => {
+    await store.createNote("decoy body", { id: "shadow", path: "people/decoy" });
+    const source = await store.createNote("see [[shadow]]", { path: "Src" });
+    expect(getUnresolvedLinksForNote(db, source.id).map((l) => l.target)).toEqual(["shadow"]);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    const titled = await store.createNote("# shadow\n\nreal.", { path: "people/shadow" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(titled.id);
+    expect(links[0]!.relationship).toBe("wikilink");
+    expect(getUnresolvedLinksForNote(db, source.id)).toHaveLength(0);
+  });
+
+  it("does not heal a pending wikilink against a later note whose id equals the bracket text", async () => {
+    const source = await store.createNote("see [[foo591]]", { path: "Src" });
+    expect(getUnresolvedLinksForNote(db, source.id).map((l) => l.target)).toEqual(["foo591"]);
+
+    await store.createNote("unrelated", { id: "foo591", path: "elsewhere" });
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+    expect(getUnresolvedLinksForNote(db, source.id).map((l) => l.target)).toEqual(["foo591"]);
   });
 });
