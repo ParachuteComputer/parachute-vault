@@ -70,7 +70,16 @@ export function chunkForInClause<T>(items: readonly T[], size = IN_PARAM_CHUNK):
  */
 export const IN_VIA_JSON_EACH = "(SELECT value FROM json_each(?))";
 
-/** Serialize an id-set for the single {@link IN_VIA_JSON_EACH} bound param. */
-export function jsonEachParam(values: readonly (string | number)[]): string {
+/**
+ * Serialize a value-set for the single {@link IN_VIA_JSON_EACH} bound param.
+ *
+ * Accepts `boolean`/`null` as well as ids because the metadata `in`/`not_in`
+ * operators route through this too (vault#536), and those take any primitive
+ * the caller can put in a metadata field. `bigint` is deliberately NOT
+ * accepted — `JSON.stringify` throws on it — so callers must narrow first.
+ */
+export function jsonEachParam(
+  values: readonly (string | number | boolean | null)[],
+): string {
   return JSON.stringify(values);
 }

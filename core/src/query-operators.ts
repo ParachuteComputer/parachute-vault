@@ -17,6 +17,7 @@
 
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { getIndexedField, type IndexedField } from "./indexed-fields.js";
+import { IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 
 export const SUPPORTED_OPS = [
   "eq",
@@ -115,6 +116,52 @@ function toBinding(field: string, op: string, value: unknown): SQLQueryBindings 
  * validation elsewhere, not this function's job); `undefined` when no tag
  * declares this field name, or its `fields` JSON doesn't parse.
  */
+/**
+ * Narrow one `in`/`not_in` element to something `JSON.stringify` can carry
+ * into {@link jsonEachParam} (vault#536).
+ *
+ * Runs `toBinding` first so the primitive-only validation and its error
+ * message are unchanged from the one-param-per-value era. Then two shapes
+ * need explicit handling, because JSON has no equivalent of what bun:sqlite
+ * did implicitly when the value was bound directly:
+ *
+ * - `boolean` → `1`/`0`, matching the INTEGER a boolean is stored as, so
+ *   `{ in: [true] }` still matches rows written with `true`. A raw JSON
+ *   `true` would come out of `json_each` as `1` anyway on current SQLite,
+ *   but converting here makes the intent explicit rather than dependent on
+ *   that.
+ * - `bigint` → `JSON.stringify` THROWS on it ("Do not know how to serialize
+ *   a BigInt"). Converted when it fits exactly in a double; otherwise
+ *   rejected with a real error instead of a crash or a silently wrong
+ *   comparison. (Unreachable from MCP/REST — `JSON.parse` never yields a
+ *   bigint — so this only guards a direct in-process caller.)
+ */
+function toJsonEachMember(
+  field: string,
+  op: string,
+  value: unknown,
+): string | number | boolean | null {
+  const bound = toBinding(field, op, value);
+  if (typeof bound === "boolean") return bound ? 1 : 0;
+  if (typeof bound === "bigint") {
+    if (bound >= BigInt(Number.MIN_SAFE_INTEGER) && bound <= BigInt(Number.MAX_SAFE_INTEGER)) {
+      return Number(bound);
+    }
+    throw new QueryError(
+      `operator "${op}" on metadata field "${field}" got a bigint outside the safe integer range (${bound}); it cannot be compared exactly`,
+      "INVALID_OPERATOR_VALUE",
+    );
+  }
+  // `toBinding` is declared as the full `SQLQueryBindings` union (which
+  // includes TypedArray/Record shapes it never actually returns), so narrow
+  // to what JSON can carry rather than asserting.
+  if (bound === null || typeof bound === "string" || typeof bound === "number") return bound;
+  throw new QueryError(
+    `operator "${op}" on metadata field "${field}" expects a primitive value (string, number, boolean, bigint, or null)`,
+    "INVALID_OPERATOR_VALUE",
+  );
+}
+
 function findDeclaredFieldType(db: Database, field: string): string | undefined {
   const rows = db.prepare(
     `SELECT fields FROM tags WHERE fields IS NOT NULL`,
@@ -235,13 +282,31 @@ export function buildOperatorClause(
           parts.push(op === "in" ? "0" : "1");
           break;
         }
-        const placeholders = value.map(() => "?").join(", ");
+        // ONE bound param for the whole set, regardless of its size
+        // (vault#536). This used to emit `IN (?, ?, …)` — one param per
+        // value — which on Cloudflare Durable Object SQLite (100 bound
+        // params per statement, vs bun:sqlite's 999+) turned any `in` array
+        // over ~100 elements into a `too many SQL variables` 500 on cloud
+        // vaults, while self-host never noticed.
+        //
+        // This is an EMBEDDED filter inside a paginated statement, so the
+        // chunk-and-union approach used for standalone id-lists isn't
+        // available — chunking would break the shared LIMIT/OFFSET window.
+        // The json_each shape #535 introduced for the `near` neighborhood is
+        // the one that works here: bind the array as a single JSON param and
+        // let SQLite expand it into a one-column table. See sql-in.ts.
+        //
+        // Every element still goes through `toBinding`, so the same
+        // primitive-only validation (and the same error message) applies as
+        // before — the values are just serialized into JSON instead of bound
+        // one by one.
+        const members = value.map((v) => toJsonEachMember(field, op, v));
         if (op === "in") {
-          parts.push(`${col} IN (${placeholders})`);
+          parts.push(`${col} IN ${IN_VIA_JSON_EACH}`);
         } else {
-          parts.push(`(${col} IS NULL OR ${col} NOT IN (${placeholders}))`);
+          parts.push(`(${col} IS NULL OR ${col} NOT IN ${IN_VIA_JSON_EACH})`);
         }
-        for (const v of value) params.push(toBinding(field, op, v));
+        params.push(jsonEachParam(members));
         break;
       }
       case "exists":

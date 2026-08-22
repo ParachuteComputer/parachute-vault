@@ -133,6 +133,80 @@ describe("id-list query paths stay under the DO 100-bound-param cap", () => {
     expect(notes.length).toBe(0);
   });
 
+  describe("metadata in / not_in operators (vault#536)", () => {
+    /**
+     * `in` / `not_in` used to build `meta_<field> IN (?, ?, …)` — one bound
+     * param per user-supplied value, with no chunking and no json_each. It's
+     * an embedded filter inside a paginated statement, so chunking isn't
+     * available (it would break the shared LIMIT/OFFSET window); the fix is
+     * the single-json_each-param shape #535 introduced for `near`.
+     */
+    beforeEach(async () => {
+      await store.upsertTagRecord("doc", {
+        fields: { rank: { type: "integer", indexed: true } },
+      });
+      for (let i = 0; i < 250; i++) {
+        await store.updateNote(`n${pad(i)}`, { tags: ["doc"], metadata: { rank: i } });
+      }
+    });
+
+    it("a >100-value `in` binds one json_each param, not one per value", async () => {
+      const wanted = Array.from({ length: 150 }, (_, i) => i);
+      const spy = installBindSpy(db);
+      let notes;
+      try {
+        notes = await store.queryNotes({
+          metadata: { rank: { in: wanted } },
+          limit: 1000,
+          sort: "asc",
+        });
+      } finally {
+        spy.restore();
+      }
+      expect(notes.length).toBe(150);
+      expect(spy.usedJsonEach()).toBe(true);
+      expect(spy.maxPlaceholderInBinds()).toBeLessThanOrEqual(IN_PARAM_CHUNK);
+      expect(spy.maxAnyBinds()).toBeLessThanOrEqual(DO_PARAM_CAP);
+    });
+
+    it("a >100-value `not_in` binds one json_each param too", async () => {
+      const excluded = Array.from({ length: 150 }, (_, i) => i);
+      const spy = installBindSpy(db);
+      let notes;
+      try {
+        notes = await store.queryNotes({
+          metadata: { rank: { not_in: excluded } },
+          limit: 1000,
+          sort: "asc",
+        });
+      } finally {
+        spy.restore();
+      }
+      // 250 notes, 150 excluded → the 100 with rank >= 150.
+      expect(notes.length).toBe(100);
+      expect(spy.usedJsonEach()).toBe(true);
+      expect(spy.maxAnyBinds()).toBeLessThanOrEqual(DO_PARAM_CAP);
+    });
+
+    it("stays under the cap alongside LIMIT/OFFSET pagination params", async () => {
+      const wanted = Array.from({ length: 200 }, (_, i) => i);
+      const spy = installBindSpy(db);
+      let notes;
+      try {
+        notes = await store.queryNotes({
+          metadata: { rank: { in: wanted } },
+          limit: 25,
+          offset: 10,
+          sort: "asc",
+        });
+      } finally {
+        spy.restore();
+      }
+      expect(notes.length).toBe(25);
+      expect(spy.maxAnyBinds()).toBeLessThanOrEqual(DO_PARAM_CAP);
+    });
+  });
+
   describe("export a >100-note vault", () => {
     let outDir: string;
     beforeEach(() => { outDir = mkdtempSync(join(tmpdir(), "do-cap-export-")); });
