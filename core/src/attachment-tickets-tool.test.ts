@@ -245,6 +245,21 @@ describe("request-attachment-download — mint", () => {
     expect(stored.attachmentId).toBe(attachment.id);
   });
 
+  test("mime_type is derived from the path, not the caller-asserted row mime (vault#617)", async () => {
+    const note = await store.createNote("# T\n", { path: "t7-mime" });
+    const attachment = await store.addAttachment(note.id, "2026-07-17/photo.png", "text/html", { size: 42 });
+    const provider = new FakeTicketProvider();
+    const tools = generateMcpTools(store, {
+      attachmentTickets: { provider, vaultName: "v1", urlBase: "https://host/vault/v1" },
+    });
+    const result = await callTool(findTool(tools, "request-attachment-download"), {
+      attachment_id: attachment.id,
+    });
+    expect(result.mime_type).toBe("image/png");
+    const ticketId = result.url.split("/tickets/")[1] as string;
+    expect(provider.tickets.get(ticketId)!.mimeType).toBe("image/png");
+  });
+
   test("missing attachment_id → missing_required_field", async () => {
     const provider = new FakeTicketProvider();
     const tools = generateMcpTools(store, {

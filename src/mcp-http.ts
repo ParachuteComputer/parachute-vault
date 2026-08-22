@@ -258,6 +258,7 @@ export async function handleMcp(
           field: e.field,
           got: e.got,
           hint: e.hint,
+          ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
         });
       }
       // Advanced-mode full-text search syntax error (vault#551) — a

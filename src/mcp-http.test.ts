@@ -128,6 +128,18 @@ describe("handleMcp JSON-RPC error mapping — end to end (vault#555 fix 6)", ()
     expect(body.error.data.field).toBe("limit");
   });
 
+  test("invalid_query forwards how_to (vault#617 bun/cloud symmetry)", async () => {
+    const body = await callBoom(() => {
+      throw Object.assign(new Error("size_bytes must be a positive number"), {
+        error_type: "invalid_query",
+        field: "size_bytes",
+        how_to: "pass the exact byte length of the file you're about to upload",
+      });
+    });
+    expect(body.error.data.error_type).toBe("invalid_query");
+    expect(body.error.data.how_to).toBe("pass the exact byte length of the file you're about to upload");
+  });
+
   test("a truly unknown error (no error_type anywhere) falls through to the unstructured isError text, not a thrown McpError", async () => {
     const body = await callBoom(() => {
       throw new Error("plain unstructured failure");
