@@ -1869,7 +1869,7 @@ function applySearchTitleBoost(
 export function searchNotes(
   db: Database,
   query: string,
-  opts?: { tags?: string[]; limit?: number; mode?: SearchMode; sort?: "asc" | "desc" },
+  opts?: QueryOpts & { mode?: SearchMode },
 ): Note[] {
   const limit = typeof opts?.limit === "number" ? opts.limit : 50;
   // Literal-by-default (vault#551): escape the caller's text so FTS5's own
@@ -1929,51 +1929,37 @@ export function searchNotes(
         ? "n.created_at DESC, n.id DESC"
         : "score DESC, n.id ASC";
 
-  if (opts?.tags && opts.tags.length > 0) {
-    // Canonical-bare-tag guard backstop (vault#XXX) for direct-core callers.
-    const searchTags = opts.tags.map(stripTagHash).filter((t) => t !== "");
-    if (searchTags.length === 0) {
-      // All tag filters collapsed to empty — fall through to the untagged
-      // search path below (no tag constraint).
-      opts = { ...opts, tags: undefined };
-    } else {
-    try {
-      // Tag membership as a semijoin — same rationale as queryNotes: a
-      // `JOIN note_tags` multiplies rows for multi-tagged notes and forced
-      // DISTINCT over full rows. The FTS join itself is 1:1 on rowid.
-      const tagPlaceholders = searchTags.map(() => "?").join(", ");
-      const rows = db.prepare(`
-        SELECT n.*, ${scoreExpr} AS score FROM notes n
-        JOIN notes_fts fts ON fts.rowid = n.rowid
-        WHERE notes_fts MATCH ?
-          AND n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${tagPlaceholders}))
-        ORDER BY ${orderBy}
-        LIMIT ?
-      `).all(ftsQuery, ...searchTags, limit) as (NoteRow & { score: number })[];
-      return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort);
-    } catch (err) {
-      // Surface EVERY FTS5 error structured, never a raw rethrow (vault#551):
-      // advanced mode expects it (the caller passed raw syntax); literal
-      // mode should never reach it (escaping + control-char sanitization
-      // make the query valid) but if the invariant breaks we still want an
-      // honest error, not an unstructured 500. A QueryError we threw
-      // ourselves (empty-limit validation, etc.) is re-raised untouched.
-      if (err instanceof QueryError) throw err;
-      throw searchSyntaxError(query, err, mode);
-    }
-    }
-  }
+  // vault#647: compose FTS with the SAME filter builder queryNotes /
+  // semanticSearch use (excludeTags, dateFrom/dateFilter, path, metadata,
+  // …). Pre-fix only `tags` reached the WHERE clause; every other filter
+  // was silently dropped. Historical FTS tag semantics are "any tag
+  // matches" (a single IN (...)); preserve that when the caller didn't
+  // set `tagMatch`. LIMIT still applies AFTER the filters, not to an
+  // unfiltered FTS page.
+  const filterOpts: QueryOpts = {
+    ...(opts ?? {}),
+    tagMatch: opts?.tagMatch ?? (opts?.tags && opts.tags.length > 0 ? "any" : undefined),
+  };
+  const { conditions, params } = buildFilterConditions(db, filterOpts);
+  const extraWhere = conditions.length > 0 ? `AND ${conditions.join(" AND ")}` : "";
 
   try {
     const rows = db.prepare(`
       SELECT n.*, ${scoreExpr} AS score FROM notes n
       JOIN notes_fts fts ON fts.rowid = n.rowid
       WHERE notes_fts MATCH ?
+        ${extraWhere}
       ORDER BY ${orderBy}
       LIMIT ?
-    `).all(ftsQuery, limit) as (NoteRow & { score: number })[];
+    `).all(ftsQuery, ...params, limit) as (NoteRow & { score: number })[];
     return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort);
   } catch (err) {
+    // Surface EVERY FTS5 error structured, never a raw rethrow (vault#551):
+    // advanced mode expects it (the caller passed raw syntax); literal
+    // mode should never reach it (escaping + control-char sanitization
+    // make the query valid) but if the invariant breaks we still want an
+    // honest error, not an unstructured 500. A QueryError we threw
+    // ourselves (empty-limit validation, etc.) is re-raised untouched.
     if (err instanceof QueryError) throw err;
     throw searchSyntaxError(query, err, mode);
   }

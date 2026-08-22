@@ -504,8 +504,13 @@ export interface Store {
    * rather than silently returning `[]`. `sort` (vault#551): omitted stays
    * FTS5 relevance ranking (default); an explicit "asc"/"desc" switches to
    * `created_at` ordering. See `core/src/search-query.ts`.
+   *
+   * Every other `QueryOpts` filter (excludeTags, dateFrom/dateFilter, path,
+   * metadata, …) composes the same way `queryNotes` / `semanticSearch` do
+   * (vault#647). Unspecified `tagMatch` defaults to `"any"` so historical
+   * FTS tag semantics (a single IN (...)) stay put.
    */
-  searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode; mode?: SearchMode; sort?: "asc" | "desc" }): Promise<Note[]>;
+  searchNotes(query: string, opts?: QueryOpts & { mode?: SearchMode }): Promise<Note[]>;
   /**
    * Semantic search (EXPERIMENTAL — see `QueryOpts.nearText`/`semantic`).
    * The one invocation point for the store's `EmbeddingProvider`: embeds

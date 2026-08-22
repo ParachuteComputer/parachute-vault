@@ -832,55 +832,22 @@ export class BunSqliteStore implements Store {
     return { ...opts, _tagsExpanded: expanded } as QueryOpts;
   }
 
-  async searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode; mode?: SearchMode; sort?: "asc" | "desc" }): Promise<Note[]> {
-    // Canonical-bare-tag guard (vault#XXX): strip leading `#` from search tag
-    // filters before expansion, so `#manual` and `manual` resolve identically.
-    if (opts?.tags && opts.tags.length > 0) {
-      opts = { ...opts, tags: opts.tags.map(stripTagHash).filter((t) => t !== "") };
-    }
-    // Same tag-expansion treatment as queryNotes, along the SAME `expand` axis
-    // (vault tag `expand` axis) — searching `#manual` should match notes
-    // tagged with any descendant under "subtypes", any `manual/*` under
-    // "namespace", etc. The underlying FTS path already uses `IN (...)` for
-    // tags, so we flatten the per-input expansions into a single union (search
-    // semantics are "any tag matches").
-    //
-    // `_default` collapse is a SUBTYPES-axis concept (the universal *parent*):
-    // when `_default` is among the requested tags and a `_default` row exists,
-    // the OR collapses to "every note" — drop the tag filter entirely so the
-    // search hits the full corpus and untagged notes are reachable. It fires
-    // only on the subtypes/both axes (mirrors `expandQueryTags`).
-    if (opts?.tags && opts.tags.length > 0) {
-      const mode: TagExpandMode = opts.expand ?? DEFAULT_TAG_EXPAND_MODE;
-      const subtypeAxis = mode === "subtypes" || mode === "both";
-      const hierarchy = this.getTagHierarchy();
-      if (subtypeAxis && hierarchy.allTags.has(DEFAULT_TAG_NAME) && opts.tags.includes(DEFAULT_TAG_NAME)) {
-        const { tags: _drop, expand: _e, ..._rest } = opts;
-        return noteOps.searchNotes(this.db, query, _rest);
-      }
-      // Subtypes fast-path: with no declared hierarchy there are no
-      // descendants, so the tags pass through unchanged (byte-identical to
-      // pre-axis behavior). `exact` likewise needs no expansion.
-      // Namespace/both must still run (lexical expansion is independent of
-      // `parent_names`).
-      const skipExpansion =
-        mode === "exact" || (mode === "subtypes" && hierarchy.childrenOf.size === 0);
-      if (!skipExpansion) {
-        const expanded = new Set<string>();
-        for (const t of opts.tags) {
-          for (const x of getTagExpansion(hierarchy, t, mode)) expanded.add(x);
-        }
-        const { expand: _e, ..._rest } = opts;
-        return noteOps.searchNotes(this.db, query, { ..._rest, tags: Array.from(expanded) });
-      }
-    }
-    // Strip the internal `expand` before passing to noteOps (it has no field
-    // for it; harmless but keep the boundary clean).
-    if (opts && "expand" in opts) {
-      const { expand: _e, ..._rest } = opts;
-      return noteOps.searchNotes(this.db, query, _rest);
-    }
-    return noteOps.searchNotes(this.db, query, opts);
+  async searchNotes(query: string, opts?: QueryOpts & { mode?: SearchMode }): Promise<Note[]> {
+    // Same bare-tag strip + hierarchy expansion queryNotes uses, so
+    // `search` + `tag: "manual"` still matches declared descendants
+    // (vault#227) and `#tag` / `tag` resolve identically. Default
+    // `tagMatch` to `"any"` when the caller didn't set it — historical FTS
+    // tag semantics are a single IN (...) ("any tag matches"), which also
+    // makes `_default` collapse drop the whole tag filter (OR + universal
+    // parent = every note).
+    const incoming = opts ?? {};
+    const withTagMatch: QueryOpts & { mode?: SearchMode } = {
+      ...incoming,
+      tagMatch: incoming.tagMatch ?? (incoming.tags && incoming.tags.length > 0 ? "any" : undefined),
+    };
+    const expanded = this.expandQueryTags(this.normalizeQueryTags(withTagMatch));
+    const { expand: _e, ...rest } = expanded as QueryOpts & { mode?: SearchMode };
+    return noteOps.searchNotes(this.db, query, rest);
   }
 
   /**
