@@ -1134,8 +1134,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // requested, so `next_cursor` never surfaces as an honest
             // "more may follow" signal — this is that signal. Mirrors the
             // REST structured-query path in src/routes.ts.
-            if (results.length === queryOpts.limit) {
-              queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
+            if (queryOpts.offset === undefined && results.length === queryOpts.limit) {
+              queryWarnings.push(truncatedResultsWarning(queryOpts.limit, "mcp"));
             }
           }
         }

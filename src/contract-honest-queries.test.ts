@@ -286,7 +286,39 @@ describe("contract: truncation-honesty warning (V1.3)", () => {
     const query = tools.find((t) => t.name === "query-notes")!;
     const result = (await query.execute({ limit: 2 })) as any;
     expect(result.warnings).toBeDefined();
-    expect(result.warnings.some((w: any) => w.code === "truncated" && w.limit === 2)).toBe(true);
+    const truncated = result.warnings.find((w: any) => w.code === "truncated" && w.limit === 2);
+    expect(truncated).toBeDefined();
+    expect(truncated.message).toContain('cursor: ""');
+    expect(truncated.message).not.toContain("?cursor=");
+  });
+
+  it("an explicit-offset page does not carry a truncated warning (vault#601)", async () => {
+    for (let i = 0; i < 3; i++) await store.createNote(`offset note ${i}`);
+    const res = await getNotes("limit=2&offset=1");
+    expect(res.status).toBe(200);
+    const body: any[] = await res.json();
+    expect(body.length).toBe(2);
+    const warnings = decodeWarningsHeader(res);
+    expect(warnings?.some((w) => w.code === "truncated") ?? false).toBe(false);
+  });
+
+  it("MCP query-notes with explicit offset does not warn (vault#601)", async () => {
+    for (let i = 0; i < 3; i++) await store.createNote(`mcp offset ${i}`);
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = (await query.execute({ limit: 2, offset: 1 })) as any;
+    const notes = Array.isArray(result) ? result : result.notes;
+    expect(notes).toHaveLength(2);
+    expect(result.warnings?.some((w: any) => w.code === "truncated") ?? false).toBe(false);
+  });
+
+  it("REST truncated wording still names ?cursor= (vault#601)", async () => {
+    for (let i = 0; i < 3; i++) await store.createNote(`rest wording ${i}`);
+    const res = await getNotes("limit=2");
+    const warnings = decodeWarningsHeader(res);
+    const truncated = warnings!.find((w) => w.code === "truncated");
+    expect(truncated.message).toContain("?cursor=");
+    expect(truncated.message).not.toContain('cursor: ""');
   });
 });
 
