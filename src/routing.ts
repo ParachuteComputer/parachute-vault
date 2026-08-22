@@ -1156,6 +1156,8 @@ export async function route(
   // straggler on a cached pre-WS notes-ui bundle — gets a clean 410 Gone
   // pointing at the WS binding so its consumer degrades to polling gracefully;
   // NEVER a 500 or an unhandled path.
+  // Not method-gated: a POST here is still a straggler on the removed SSE
+  // transport, not a missing verb on a live resource, so 410 (not 405).
   if (apiPath === "/subscribe") {
     return Response.json(
       {
