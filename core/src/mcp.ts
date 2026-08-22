@@ -1023,6 +1023,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               hasBrokenLinks: params.has_broken_links as boolean | undefined,
               path: params.path as string | undefined,
               pathPrefix: params.path_prefix as string | undefined,
+              excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
               extension: params.extension as string | string[] | undefined,
               ids: nearScope ? [...nearScope] : undefined,
               metadata: params.metadata as Record<string, unknown> | undefined,
