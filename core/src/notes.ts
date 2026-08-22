@@ -2839,9 +2839,26 @@ export function computeDisplayTitle(content: string | null | undefined): string 
 export const LEDE_MAX_LEN = 400;
 
 /**
- * Derive a note's "lede": the first non-empty PARAGRAPH after the title
+ * Opens (or closes) a fenced code block: three or more backticks or tildes.
+ * Capture 1 is the run itself so the scanner can require the CLOSING fence to
+ * use the same character and be at least as long, per CommonMark.
+ */
+const FENCE_OPEN_RE = /^(`{3,}|~{3,})/;
+/** A closing fence carries nothing but the run (an info string opens, never closes). */
+const FENCE_CLOSE_RE = /^(`{3,}|~{3,})\s*$/;
+/** An ATX heading line: 1-6 `#` followed by whitespace or end-of-line. */
+const HEADING_LINE_RE = /^#{1,6}(?:\s|$)/;
+/**
+ * A thematic break (`---`, `***`, `___`) or a setext heading underline
+ * (`---`, `===`). Both are pure markup with no text of their own — the
+ * setext case is why `Title\n---\n\nreal text` used to yield a `---` lede.
+ */
+const BREAK_LINE_RE = /^(?:-{3,}|\*{3,}|_{3,}|={3,})$/;
+
+/**
+ * Derive a note's "lede": the first non-empty PROSE PARAGRAPH after the title
  * line (a run of consecutive non-blank lines, whitespace-collapsed to one
- * line, truncated to `LEDE_MAX_LEN` code points). `null` when there's no
+ * line, truncated to `LEDE_MAX_LEN` code points). `null` when there's no such
  * paragraph after the title — a title-only note has no lede to report, and
  * callers must not fall back to repeating the title itself.
  *
@@ -2853,6 +2870,22 @@ export const LEDE_MAX_LEN = 400;
  * what it finds, honestly, using the SAME title-line rule as
  * `computeDisplayTitle` (including its frontmatter skip) so a caller that
  * shows both title and lede sees them agree on where the title ends.
+ *
+ * Non-prose blocks are SKIPPED (vault#616). A note that opens with a code
+ * fence, a section heading, or a horizontal rule used to have that raw markup
+ * returned as its lede — backticks, `## ` markers and all — which contradicted
+ * this function's own "first paragraph" contract and read as garbage in
+ * `expand_mode: "summary"`. The scan now walks past fenced blocks (to the
+ * matching closing fence, or to end-of-content when the fence is never
+ * closed), heading lines, and break/underline lines until it reaches real
+ * text, and returns `null` if it never does. Those same three shapes also
+ * TERMINATE a paragraph already in progress, matching how markdown lets a
+ * fence or heading interrupt a paragraph.
+ *
+ * Deliberately NOT normalized: list blocks. A `- milk` list is genuine prose
+ * content, and how to flatten it into one line (drop the markers? join with
+ * what?) is a rendering decision this function shouldn't make silently — it
+ * reports the list as written.
  */
 export function computeLede(content: string | null | undefined): string | null {
   if (!content) return null;
@@ -2869,14 +2902,51 @@ export function computeLede(content: string | null | undefined): string | null {
   if (titleLine === -1) return null; // no title at all — nothing to find a lede after
 
   let i = titleLine + 1;
-  while (i < lines.length && lines[i]!.trim() === "") i++; // skip blank lines after the title
-
   const paragraphLines: string[] = [];
-  while (i < lines.length && lines[i]!.trim() !== "") {
-    paragraphLines.push(lines[i]!);
-    i++;
+
+  // Walk blocks until one of them is prose. Each iteration consumes exactly
+  // one block (blank run, fence, heading, break, or paragraph), so `i` always
+  // advances and the loop terminates.
+  scan: while (i < lines.length) {
+    const trimmed = lines[i]!.trim();
+
+    if (trimmed === "") {
+      i++;
+      continue;
+    }
+
+    const opening = FENCE_OPEN_RE.exec(trimmed);
+    if (opening) {
+      const marker = opening[1]!;
+      i++;
+      while (i < lines.length) {
+        const closing = FENCE_CLOSE_RE.exec(lines[i]!.trim());
+        i++;
+        if (closing && closing[1]![0] === marker[0] && closing[1]!.length >= marker.length) break;
+      }
+      continue; // an unclosed fence runs off the end and leaves i past the last line
+    }
+
+    if (HEADING_LINE_RE.test(trimmed) || BREAK_LINE_RE.test(trimmed)) {
+      i++;
+      continue;
+    }
+
+    // Real text — gather the paragraph, stopping at a blank line or at any
+    // block-level marker that interrupts it.
+    while (i < lines.length) {
+      const line = lines[i]!;
+      const t = line.trim();
+      if (t === "" || FENCE_OPEN_RE.test(t) || HEADING_LINE_RE.test(t) || BREAK_LINE_RE.test(t)) {
+        break scan;
+      }
+      paragraphLines.push(line);
+      i++;
+    }
+    break;
   }
-  if (paragraphLines.length === 0) return null; // title-only note
+
+  if (paragraphLines.length === 0) return null; // title-only note, or nothing but markup
 
   const paragraph = paragraphLines.join(" ").replace(/\s+/g, " ").trim();
   if (paragraph === "") return null;
