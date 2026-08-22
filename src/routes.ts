@@ -804,8 +804,7 @@ function parseMetadataJsonAlias(url: URL): {
 
 /**
  * Parse + validate the `?expand=` tag-expansion axis (vault tag `expand` axis).
- * Shared by `parseNotesQueryOpts` (structured + subscribe) AND the full-text
- * search branch of `handleNotes` (which bypasses `parseNotesQueryOpts`), so the
+ * Shared by `parseNotesQueryOpts` (structured, subscribe, and search) so the
  * enum lives in exactly one place and `GET /notes?search=...&expand=bogus` is
  * validated identically to the structured path.
  *
@@ -875,8 +874,10 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
  * Factored out of `handleNotesInner`'s structured-query branch so the
  * `/subscribe` route evaluates the SAME predicate the snapshot query does —
  * predicate parity by construction, not copy-paste. `handleNotesInner` keeps
- * its own inline parsing for the single-note (`id`) and full-text (`search`)
- * branches; this helper covers the structured-query shape both endpoints share.
+ * its own inline parsing for the single-note (`id`) branch; the full-text
+ * (`search`) branch now reuses this helper for every structured filter
+ * (vault#647) so `exclude_tag` / date / path / metadata compose with
+ * `?search=` instead of being silently dropped.
  *
  * Returns `{ error }` (a 400 Response) on a malformed metadata filter, exactly
  * as the inline code did. `hasSearch` is surfaced from the raw `search` param
@@ -1364,23 +1365,17 @@ async function handleNotesInner(
 
       // Full-text search
       if (search) {
-        const searchTags = parseQueryList(url, "tag");
-        const limit = parseInt10(parseQuery(url, "limit")) ?? 50;
-        // Tag-expansion axis (vault tag `expand` axis). This branch bypasses
-        // `parseNotesQueryOpts`, so validate `?expand=` here too — otherwise
-        // `GET /notes?search=x&expand=bogus` would silently ignore the bad
-        // value. The validated mode is threaded into the search tag-narrowing.
-        const tagExpand = parseExpandParam(url);
-        if (tagExpand.error) return tagExpand.error;
-        // `search_mode` (vault#551) — same loud-validation policy as
-        // `expand` above; also bypasses `parseNotesQueryOpts` so it needs
-        // its own check here.
+        // vault#647: parse the structured filter grammar here too. Pre-fix
+        // this branch bypassed `parseNotesQueryOpts` and only forwarded
+        // tag/limit/expand/mode/sort, so `exclude_tag` and date/path/metadata
+        // were silently dropped — a well-formed result set answering a
+        // different question. `search_mode` is still parsed here because it
+        // is search-specific (the helper does not know about it).
+        const parsed = parseNotesQueryOpts(url);
+        if (parsed.error) return parsed.error;
         const searchModeParsed = parseSearchModeParam(url);
         if (searchModeParsed.error) return searchModeParsed.error;
         const mode: SearchMode = searchModeParsed.mode ?? "literal";
-        // `sort` under search (vault#551 item 3): omit for FTS5 relevance
-        // (default, unchanged); explicit asc/desc switches to created_at.
-        const sort = (parseQuery(url, "sort") as "asc" | "desc" | null) ?? undefined;
 
         const searchWarnings: QueryWarning[] = [...nearTextIgnored];
         // `offset` under full-text search (vault contracts-brief V1.2):
@@ -1414,11 +1409,13 @@ async function handleNotesInner(
             // the pre-#551 silent `[]` — caught below and formatted the
             // same way the structured-query path formats a `QueryError`.
             rawResults = await store.searchNotes(search, {
-              tags: searchTags,
-              limit,
-              expand: tagExpand.expand,
+              ...parsed.queryOpts,
               mode,
-              sort,
+              // Search has no offset/cursor/orderBy contract (offset is
+              // warned above; cursor is rejected before this branch).
+              offset: undefined,
+              cursor: undefined,
+              orderBy: undefined,
             });
           } catch (e: any) {
             if (e && e.name === "QueryError") {

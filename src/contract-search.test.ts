@@ -133,6 +133,40 @@ describe("contract: search — passing (lock in current behavior)", () => {
   });
 });
 
+describe("contract: search composes with structured filters (vault#647)", () => {
+  it("REST ?search= + exclude_tag drops notes that carry the excluded tag", async () => {
+    await store.createNote("unique-647-term keep", { tags: ["keep-tag"] });
+    await store.createNote("unique-647-term drop", { tags: ["keep-tag", "drop-tag"] });
+    const res = await search("search=unique-647-term&tag=keep-tag&exclude_tag=drop-tag&include_content=true");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    const contents = body.map((n: any) => n.content);
+    expect(contents).toContain("unique-647-term keep");
+    expect(contents).not.toContain("unique-647-term drop");
+  });
+
+  it("REST ?search= + meta[created_at][gte] drops notes below the date floor", async () => {
+    // REST removed the flat date_from param at 0.6.4; the live date grammar
+    // is bracket-style. Same composition hole as MCP date_from.
+    await store.createNote("unique-647-date recent", {
+      tags: ["keep-tag"],
+      created_at: "2026-07-01T00:00:00.000Z",
+    });
+    await store.createNote("unique-647-date old", {
+      tags: ["keep-tag"],
+      created_at: "2023-06-01T00:00:00.000Z",
+    });
+    const res = await search(
+      "search=unique-647-date&tag=keep-tag&meta[created_at][gte]=2026-06-01&include_content=true",
+    );
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    const contents = body.map((n: any) => n.content);
+    expect(contents).toContain("unique-647-date recent");
+    expect(contents).not.toContain("unique-647-date old");
+  });
+});
+
 describe('contract: search — literal-by-default (#551, flipped from todo)', () => {
   it(`unquoted search "didn't" finds the contraction content (literal-by-default — the bare apostrophe used to split into two AND'd tokens and return [])`, async () => {
     const res = await search(`search=${encodeURIComponent("didn't")}&include_content=true`);

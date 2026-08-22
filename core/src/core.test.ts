@@ -2334,6 +2334,25 @@ describe("searchNotes", async () => {
     expect(results[0].tags).toContain("daily");
   });
 
+  it("filters search by excludeTags (vault#647)", async () => {
+    await store.createNote("Flagstaff keep", { tags: ["daily"] });
+    await store.createNote("Flagstaff drop", { tags: ["daily", "archived"] });
+
+    const results = await store.searchNotes("Flagstaff", { tags: ["daily"], excludeTags: ["archived"] });
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toContain("keep");
+    expect(results[0].tags).not.toContain("archived");
+  });
+
+  it("filters search by dateFrom (vault#647)", async () => {
+    await store.createNote("Flagstaff recent", { tags: ["daily"], created_at: "2026-07-01T00:00:00.000Z" });
+    await store.createNote("Flagstaff old", { tags: ["daily"], created_at: "2023-06-01T00:00:00.000Z" });
+
+    const results = await store.searchNotes("Flagstaff", { tags: ["daily"], dateFrom: "2026-06-01" });
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toContain("recent");
+  });
+
   it("returns empty for no match", async () => {
     await store.createNote("Hello world");
     const results = await store.searchNotes("nonexistent");
@@ -5384,6 +5403,37 @@ describe("MCP tools", async () => {
     const r = await queryNotes.execute({ tag: "email", exclude_tags: ["urgent"], include_content: true }) as any[];
     expect(r).toHaveLength(1);
     expect(r[0].content).toBe("a");
+  });
+
+  it("query-notes search composes with exclude_tags (vault#647)", async () => {
+    // Pre-fix the FTS branch forwarded only `{tags, limit, expand, mode, sort}`
+    // so exclude_tags was silently dropped: the response looked like a real
+    // result set that simply answered a different question.
+    await store.createNote("widget keep", { tags: ["email"] });
+    await store.createNote("widget drop", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({
+      search: "widget",
+      tag: "email",
+      exclude_tags: "urgent",
+      include_content: true,
+    }) as any[];
+    expect(r.map((n: any) => n.content)).toEqual(["widget keep"]);
+  });
+
+  it("query-notes search composes with date_from (vault#647)", async () => {
+    await store.createNote("widget recent", { tags: ["email"], created_at: "2026-07-01T00:00:00.000Z" });
+    await store.createNote("widget old", { tags: ["email"], created_at: "2023-06-01T00:00:00.000Z" });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({
+      search: "widget",
+      tag: "email",
+      date_from: "2026-06-01",
+      include_content: true,
+    }) as any[];
+    expect(r.map((n: any) => n.content)).toEqual(["widget recent"]);
   });
 
   it("query-notes routes through store.queryNotes so tag-hierarchy expansion fires", async () => {

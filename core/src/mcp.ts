@@ -985,6 +985,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           }
           // Normalize tag param
           const tags = normalizeTags(params.tag);
+          const excludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
+          const excludeTags = normalizeTags(excludeTagsRaw);
           const mode: SearchMode = searchMode ?? "literal";
           // "Only whitespace/quotes" (vault#551 edge case): short-circuit
           // BEFORE ever calling FTS5 — an empty/all-punctuation phrase can
@@ -1004,10 +1006,34 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // `invalid_search_syntax`, vault#551) — uncaught on purpose, it
             // propagates to `src/mcp-http.ts`, which maps it to a JSON-RPC
             // error the same way it maps `invalid_query`.
+            // vault#647: forward the same QueryOpts the structured /
+            // semantic branches already pass. Pre-fix only tags/limit/
+            // expand/mode/sort reached searchNotes, so exclude_tags and
+            // date_from were silently dropped (a well-formed result set
+            // answering a different question).
             results = await store.searchNotes(params.search as string, {
               tags,
-              limit: (params.limit as number) ?? 50,
+              tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
               expand,
+              excludeTags,
+              hasTags: params.has_tags as boolean | undefined,
+              hasLinks: params.has_links as boolean | undefined,
+              hasBrokenLinks: params.has_broken_links as boolean | undefined,
+              path: params.path as string | undefined,
+              pathPrefix: params.path_prefix as string | undefined,
+              extension: params.extension as string | string[] | undefined,
+              ids: nearScope ? [...nearScope] : undefined,
+              metadata: params.metadata as Record<string, unknown> | undefined,
+              createdBy: params.created_by as string | undefined,
+              lastUpdatedBy: params.last_updated_by as string | undefined,
+              createdVia: params.created_via as string | undefined,
+              lastUpdatedVia: params.last_updated_via as string | undefined,
+              dateFrom: params.date_from as string | undefined,
+              dateTo: params.date_to as string | undefined,
+              dateFilter: params.date_filter as
+                | { field?: string; from?: string; to?: string }
+                | undefined,
+              limit: (params.limit as number) ?? 50,
               mode,
               sort: params.sort as "asc" | "desc" | undefined,
             });
