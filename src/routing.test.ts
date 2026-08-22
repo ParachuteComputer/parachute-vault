@@ -678,6 +678,30 @@ describe("per-vault routing under /vault/<name>/", () => {
     expect(res.status).toBe(401);
   });
 
+  test("authed GET /api/subscribe without Upgrade → 410 SSE_TRANSPORT_REMOVED (vault#543)", async () => {
+    createVault("journal");
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
+    const path = "/vault/journal/api/subscribe";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      path,
+    );
+    expect(res.status).toBe(410);
+    const body = (await res.json()) as { code?: string };
+    expect(body.code).toBe("SSE_TRANSPORT_REMOVED");
+  });
+
+  test("anon GET /api/subscribe → 401, not the SSE tombstone (vault#543)", async () => {
+    createVault("journal");
+    const path = "/vault/journal/api/subscribe";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { code?: string };
+    expect(body.code).not.toBe("SSE_TRANSPORT_REMOVED");
+  });
+
   test("/vault/<name>/oauth/* returns 410 Gone (standalone issuer retired — workstream E)", async () => {
     // The standalone OAuth issuer on vault was removed in vault#366 once hub
     // became required. The 410 carries a pointer to the protected-resource
