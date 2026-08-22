@@ -301,16 +301,25 @@ export async function installPythonBackend(
     record(await warmPullModel(deps, spec, opts.model ?? spec.defaultModel));
   }
 
-  // --- Verify: a runnable binary via the same ladder the daemon uses --------
+  // --- Verify: EXECUTE the binary (--help), not just existsSync (vault#539) --
+  // Same honesty as probeTranscribeCliRunnable: a venv entrypoint can exist
+  // and still fail (moved PARACHUTE_HOME, deleted interpreter, half-finished
+  // pip). Per-request capability gates stay spawn-free; this is install-time.
   const binPath = resolveBin(spec, deps);
-  const runnable = !!binPath && deps.existsImpl(binPath);
   const venv = pythonVenvDir(deps.env);
-  if (!runnable) {
+  if (!binPath || !deps.existsImpl(binPath)) {
     const detail = `install ran but no runnable \`${spec.bin}\` was found (looked at ${join(venv, "bin", spec.bin)} and PATH).`;
     record({ name: "verify", status: "failed", detail });
     return fail(`${spec.provider} install did not produce a runnable binary. ${detail}`);
   }
-  record({ name: "verify", status: "ok", detail: `runnable binary at ${binPath}.` });
+  const help = await deps.run([binPath, "--help"]);
+  if (help.exitCode !== 0) {
+    const reason = help.stderr.trim().split("\n")[0]?.slice(0, 200) || `exit ${help.exitCode}`;
+    const detail = `\`${spec.bin} --help\` failed (${reason}). A present file is not a runnable provider.`;
+    record({ name: "verify", status: "failed", detail });
+    return fail(`${spec.provider} binary exists but is not runnable. ${detail}`);
+  }
+  record({ name: "verify", status: "ok", detail: `runnable binary at ${binPath} (verified --help).` });
 
   const summary = `${spec.provider} installed and verified runnable (${binPath}).`;
   deps.log(summary);

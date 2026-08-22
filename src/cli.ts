@@ -4283,10 +4283,18 @@ async function cmdTranscriptionStatus(): Promise<void> {
     legacy.push(`  transcribe-cpp   ${probe.ok ? "runnable" : `not runnable (${probe.reason})`}`);
   }
   if (active === "parakeet-mlx" || parakeetMlxInstalled()) {
-    legacy.push(`  parakeet-mlx     ${parakeetMlxInstalled() ? `runnable (${resolveParakeetMlxBin()})` : "not installed"}`);
+    const bin = resolveParakeetMlxBin();
+    const probe = bin ? await probeTranscribeCliRunnable(bin) : { ok: false, reason: "not installed" };
+    legacy.push(
+      `  parakeet-mlx     ${probe.ok ? `runnable (${bin})` : `not runnable (${probe.reason})`}`,
+    );
   }
   if (active === "onnx-asr" || onnxAsrInstalled()) {
-    legacy.push(`  onnx-asr         ${onnxAsrInstalled() ? `runnable (${resolveOnnxAsrBin()})` : "not installed"}`);
+    const bin = resolveOnnxAsrBin();
+    const probe = bin ? await probeTranscribeCliRunnable(bin) : { ok: false, reason: "not installed" };
+    legacy.push(
+      `  onnx-asr         ${probe.ok ? `runnable (${bin})` : `not runnable (${probe.reason})`}`,
+    );
   }
   if (legacy.length > 0) {
     console.log("\nLegacy providers (superseded by whisper-cpp):");
