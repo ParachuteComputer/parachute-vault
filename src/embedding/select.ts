@@ -14,8 +14,11 @@
  *     bearer token, when the endpoint needs one.
  *   - **Bundled floor** (`onnx-transformers.ts`): no env at all → the
  *     zero-config default, `bge-small-en-v1.5` (q8 ONNX) running
- *     in-process. This is what makes semantic search work on a fresh
- *     install with no operator action.
+ *     in-process. This is what makes semantic search work with no
+ *     provider configuration — but note it is still gated by the opt-in
+ *     switch below, so "no env at all" now means NO provider, not the
+ *     bundled one. Pre-0.7.3 this tier made the feature work on a fresh
+ *     install with no operator action at all; that is no longer true.
  *
  * **Opt-in gate (0.7.3, Aaron-ratified):** semantic search is OFF by
  * default. `buildEmbeddingProvider` returns a provider ONLY when the
@@ -25,7 +28,17 @@
  *
  *   1. **`EMBEDDINGS_ENABLED` env var** — the low-level override. `true`/`1`
  *      forces ON, `false`/`0` forces OFF, anything else (incl. unset)
- *      defers to the persisted setting. Mirrors the cloud wrangler var.
+ *      defers to the persisted setting.
+ *
+ *      NOTE: this is **tri-state** (on / off / defer), not the plain
+ *      off-switch it used to be — before 0.7.3 the feature was on unless
+ *      this var turned it off, so an UNSET var meant ON; now an unset var
+ *      means "defer", and the persisted setting defaults OFF. Anything
+ *      that consumes this selector and relies on the old
+ *      unset-means-enabled reading will silently come up with semantic
+ *      search DISABLED. If the cloud worker shares this selector, set its
+ *      embeddings default EXPLICITLY rather than leaving it to this
+ *      default-off (vault#623).
  *   2. **Persisted `embeddings_enabled`** (config.yaml, wired in by the
  *      caller — see `getSharedEmbeddingProvider`) — the self-host settings
  *      toggle, so an operator can turn semantic search on without editing

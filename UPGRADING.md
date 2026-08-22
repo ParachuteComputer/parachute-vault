@@ -31,6 +31,13 @@ Previously the bundled embedding provider was resolved on every install, so
 semantic search was on by default and a fresh box paid the embed-on-write
 cost and the first-use model download whether or not anyone used it. As of
 0.7.3 (Aaron-ratified), **semantic search is off unless you turn it on**.
+
+> **Coming from `@rc`?** rc.1–rc.15 had semantic search **on** by default, so
+> landing on 0.7.3 turns it **off** and `query-notes { semantic: true }` starts
+> returning `semantic_unavailable`. Re-enable it with either knob below and it
+> comes straight back — **your existing vectors are preserved and reused, with
+> no re-embed**, because staleness is keyed on model + content hash, which
+> haven't changed. (Not a `@latest` concern: 0.7.2 never had the feature.)
 With it off there is no embedding provider, no embed-on-write hook work, no
 backfill sweep, and no model download — `query-notes { semantic: true }`
 returns an honest `semantic_unavailable` (never a silent keyword fallback).
