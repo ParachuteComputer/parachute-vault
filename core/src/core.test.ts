@@ -4361,6 +4361,17 @@ describe("MCP tools", async () => {
     expect(pageResult.warnings?.some((w: any) => w.code === "truncated" && w.limit === 2)).toBe(true);
   });
 
+  it("query-notes exclude_path_prefix drops matching paths and keeps pathless notes (vault#628)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("bare"); // no path
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const r = await query.execute({ exclude_path_prefix: ".parachute/", include_content: true }) as any[];
+    const contents = r.map((n: any) => n.content).sort();
+    expect(contents).toEqual(["bare", "user"]);
+  });
+
   it("query-notes full-text search works", async () => {
     await store.createNote("Flagstaff trail");
     const tools = generateMcpTools(store);

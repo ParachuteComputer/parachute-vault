@@ -238,6 +238,14 @@ describe("BunStore", async () => {
     expect(results.map((n) => n.path)).toContain("Projects/Parachute/README");
     expect(results.map((n) => n.path)).toContain("Projects/Parachute/Notes");
   });
+
+  test("queryNotes excludePathPrefix drops matching paths (vault#628)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("bare");
+    const results = await store.queryNotes({ excludePathPrefix: [".parachute/"] });
+    expect(results.map((n) => n.content).sort()).toEqual(["bare", "user"]);
+  });
 });
 
 describe("metadata", async () => {
@@ -2494,6 +2502,20 @@ describe("HTTP /notes", async () => {
     expect(body).not.toHaveProperty("content");
     expect(body.byteSize).toBe(5);
     expect(body.preview).toBe("hello");
+  });
+
+  test("GET /notes?exclude_path_prefix=.parachute/ drops system-space (vault#628)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("bare");
+    const res = await handleNotes(
+      mkReq("GET", "/notes?exclude_path_prefix=.parachute/&include_content=true"),
+      store,
+      "",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content).sort()).toEqual(["bare", "user"]);
   });
 
   test("GET /notes?include_metadata=false strips metadata from list", async () => {

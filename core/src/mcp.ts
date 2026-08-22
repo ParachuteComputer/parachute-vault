@@ -818,6 +818,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             hasBrokenLinks: params.has_broken_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
+            excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
             extension: params.extension as string | string[] | undefined,
             metadata: params.metadata as Record<string, unknown> | undefined,
             createdBy: params.created_by as string | undefined,
@@ -939,6 +940,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             hasBrokenLinks: params.has_broken_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
+            excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
             extension: params.extension as string | string[] | undefined,
             // Same `near[]` neighborhood push-down `search`/structured-query
             // use — a semantic query can be scoped to a graph neighborhood too.
@@ -1089,6 +1091,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             hasBrokenLinks: params.has_broken_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
+            excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
             extension: params.extension as string | string[] | undefined,
             // Push the near-scope into the SQL WHERE so that LIMIT and ORDER
             // BY apply to the neighborhood. Without this, queryNotes would
