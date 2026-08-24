@@ -29,7 +29,7 @@
 #                           per-vault tokens + hub JWT validation paths.
 #   SCRIBE_URL            — opt-in scribe endpoint for transcription worker.
 
-ARG BUN_VERSION=1.3
+ARG BUN_VERSION=1.4
 FROM oven/bun:${BUN_VERSION}-alpine AS builder
 
 WORKDIR /app

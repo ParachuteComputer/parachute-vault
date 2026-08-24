@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3
+          bun-version: 1.4
       - id: decide
         name: compare package.json version against npm
         run: |
@@ -142,7 +142,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3
+          bun-version: 1.4
       - name: install deps
         run: bun install --frozen-lockfile
       - name: typecheck
@@ -169,7 +169,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3
+          bun-version: 1.4
       - uses: actions/setup-node@v6
         with:
           # Node 24 ships npm 11.5+ which has Trusted Publishing OIDC
