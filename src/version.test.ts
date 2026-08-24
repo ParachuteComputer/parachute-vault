@@ -21,6 +21,14 @@ function runCli(args: string[]): {
     cmd: ["bun", CLI, ...args],
     stdout: "pipe",
     stderr: "pipe",
+    // `env` is NOT optional here. Bun hands a child the environ the parent
+    // process *started* with, not the live `process.env` — so runtime
+    // assignments never reach it, including the temp PARACHUTE_HOME that
+    // `core/src/test-preload.ts` sets for the suite. Spawn without this and
+    // the child resolves its parachute home to the developer's real
+    // `~/.parachute`. Nothing here writes, but the next copy of this helper
+    // might; spreading `process.env` is the shape every CLI test should use.
+    env: { ...process.env } as Record<string, string>,
   });
   return {
     exitCode: proc.exitCode ?? -1,
