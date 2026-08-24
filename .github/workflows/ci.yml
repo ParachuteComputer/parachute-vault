@@ -20,7 +20,7 @@
 #   manual pre-build steps. That's the point — a #505-class "dist not built"
 #   gap should surface here as a real failure, not be papered over.
 #
-# Runner + bun version are pinned to match release.yml (ubuntu-latest, bun 1.3)
+# Runner + bun version are pinned to match release.yml (ubuntu-latest, bun 1.4)
 # so PR CI and the release gate exercise the same platform + toolchain.
 
 name: CI
