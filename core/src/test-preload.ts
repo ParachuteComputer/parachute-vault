@@ -18,36 +18,36 @@
 // either assigns it at run time or passes it explicitly to the child it
 // spawns. Docker and CI set PARACHUTE_HOME for the *server*, never for
 // `bun test`.
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { join } from "path";
 
 const TEST_HOME = mkdtempSync(join(tmpdir(), "parachute-test-home-"));
 process.env.PARACHUTE_HOME = TEST_HOME;
 
-// Tripwire — cheap, and it fires before a single test module loads. Mirrors
-// the rule in `configDirPath()`: `process.env.PARACHUTE_HOME ?? join(homedir(),
-// ".parachute")`. If the override above ever stops landing somewhere
-// disposable, fail the run loudly instead of quietly writing into a vault
-// somebody actually uses.
+// Tripwire, and a live one: `mkdtempSync` builds on `tmpdir()`, which honors
+// TMPDIR. An operator or CI that points TMPDIR inside the parachute home
+// (`TMPDIR=~/.parachute/tmp` is not exotic) would have this file dutifully
+// create the suite's "isolated" home *inside the live install*, which is the
+// failure this preload exists to prevent, arrived at by another road. Assert
+// the temp home is neither the real home nor nested under it.
+//
+// The check on `process.env.PARACHUTE_HOME` itself is deliberately NOT here:
+// it was just assigned two lines up, so any such comparison is dead code that
+// reads as live defense. `configDirPath()` in `src/config.ts` carries the real
+// runtime tripwire, at the one function that resolves the root.
 const REAL_HOME = join(homedir(), ".parachute");
-const resolved = process.env.PARACHUTE_HOME || REAL_HOME;
-if (resolved === REAL_HOME) {
+if (TEST_HOME === REAL_HOME || TEST_HOME.startsWith(REAL_HOME + "/")) {
   throw new Error(
-    `[test-preload] refusing to run the test suite: PARACHUTE_HOME resolves to the live ` +
-      `install at ${REAL_HOME}. Tests would create real vaults there — this happened on ` +
-      `2026-08-22. Fix the preload; do not work around it.`,
+    `[test-preload] refusing to run the test suite: the temp home ${TEST_HOME} is inside ` +
+      `the live install at ${REAL_HOME} — check TMPDIR. Tests would create real vaults ` +
+      `there; that happened on 2026-08-22.`,
   );
 }
 
-// Best-effort cleanup. A leftover directory under tmpdir() is a rounding
-// error; a leftover directory in the live install is the bug this file exists
-// to prevent. `exit` only fires on a clean exit — a killed run leaves the temp
-// dir behind, which is an acceptable trade.
-process.on("exit", () => {
-  try {
-    rmSync(TEST_HOME, { recursive: true, force: true });
-  } catch {
-    // ignore — never let cleanup fail a green run
-  }
-});
+// No cleanup handler on purpose. `bun test` dispatches neither `exit` nor
+// `beforeExit` (verified on Bun 1.3.14 — a handler registered here never runs,
+// even on a clean green exit), so a cleanup hook would be a comment promising
+// something that does not happen. Each run therefore leaves one empty-ish
+// `parachute-test-home-*` under tmpdir(); the OS reaps them, and a dropping in
+// tmpdir is a rounding error next to a dropping in someone's real vault.

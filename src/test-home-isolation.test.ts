@@ -67,6 +67,10 @@ describe("test-home isolation", () => {
       });
 
       const out = res.stdout + res.stderr;
+      // Assert the child actually got as far as writing a vault — without
+      // this, a child that crashed on startup would satisfy every "nothing
+      // landed in the live install" assertion below for the wrong reason.
+      expect(res.exitCode).toBe(0);
       expect(out).not.toContain(`RESOLVED_HOME=${inherited}`);
       expect(out).toContain("RESOLVED_HOME=");
       // The load-bearing assertion: nothing landed in the "live" install.
@@ -106,8 +110,12 @@ describe("test-home isolation", () => {
       env: { PARACHUTE_HOME: undefined, NODE_ENV: "test" },
     });
 
+    const out = res.stdout + res.stderr;
     expect(res.exitCode).not.toBe(0);
-    expect(res.stdout + res.stderr).toContain("refusing to fall back to the live install");
+    expect(out).toContain("refusing to default to the live install");
+    // The message has to be actionable for an npm consumer whose test runner
+    // set NODE_ENV=test, not just for a contributor in this repo.
+    expect(out).toContain("Set PARACHUTE_HOME explicitly");
   });
 
   test("configDirPath() still falls back to ~/.parachute outside tests", async () => {
