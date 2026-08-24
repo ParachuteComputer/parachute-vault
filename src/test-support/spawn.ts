@@ -18,6 +18,18 @@
  * `runSubprocess` uses async `Bun.spawn` + `await proc.exited`, so the
  * parent's event loop keeps servicing requests while the child runs.
  *
+ * THE OTHER RULE — always give a spawned child an explicit `env`.
+ *
+ * Bun hands a child the environ the parent process *started* with, not the
+ * live `process.env`: assignments made at runtime are invisible to it. That
+ * includes the temp `PARACHUTE_HOME` that `core/src/test-preload.ts` sets for
+ * the whole suite, so a child spawned with no `env` resolves its parachute
+ * home to the developer's real `~/.parachute` (verified with Bun 1.3.14).
+ * `runSubprocess` handles this for you — it spreads the live `process.env`
+ * below and merges `opts.env` over it. Hand-rolled `Bun.spawnSync` calls must
+ * do the same; `src/version.test.ts` was silently pointing its CLI child at
+ * the real install until the config.ts NODE_ENV=test guard caught it.
+ *
  * NOTE on what's *fine*: `Bun.spawnSync` is safe in tests that don't run
  * an in-test server the child talks to over HTTP — e.g. shelling out to
  * `git` to build a fixture repo (`mirror-*.test.ts`), or a `Bun.serve`

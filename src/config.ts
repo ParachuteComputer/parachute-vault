@@ -61,7 +61,27 @@ import {
 // ---------------------------------------------------------------------------
 
 function configDirPath(): string {
-  return process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
+  const fromEnv = process.env.PARACHUTE_HOME;
+  if (fromEnv) return fromEnv;
+  // Second layer of the test-isolation defense (`core/src/test-preload.ts` is
+  // the first). The preload is loaded by `bunfig.toml`, which Bun reads
+  // relative to the *cwd* — run `bun test path/to/parachute-vault/src/...`
+  // from a parent directory and the preload silently never loads, leaving
+  // every unset-PARACHUTE_HOME test writing real vaults into the developer's
+  // live install. `bun test` sets NODE_ENV=test, so the ambiguity is
+  // detectable here, at the one function that resolves the root. Deliberately
+  // narrow: only the *unset* case throws. Tests legitimately point
+  // PARACHUTE_HOME at a sandbox whose HOME is that same sandbox (init.test.ts
+  // does exactly this), so an equality check against `~/.parachute` would fire
+  // on correct code.
+  if (process.env.NODE_ENV === "test") {
+    throw new Error(
+      "[parachute-vault] PARACHUTE_HOME is unset under NODE_ENV=test — refusing to fall " +
+        "back to the live install at ~/.parachute. Run `bun test` from the repo root so " +
+        "bunfig.toml's preload applies, or set PARACHUTE_HOME to a temp dir for this process.",
+    );
+  }
+  return join(homedir(), ".parachute");
 }
 
 function vaultHomePath(): string {
