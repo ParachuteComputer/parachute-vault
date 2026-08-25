@@ -149,6 +149,72 @@ describe("REST GET /notes — aggregate errors", () => {
     const body: any = await res.json();
     expect(body.field).toBe("aggregate");
   });
+
+  it("400s when aggregate is combined with search (no silent fall-through to rows)", async () => {
+    const res = await get("?search=hello&aggregate[op]=count");
+    expect(res.status).toBe(400);
+    const body: any = await res.json();
+    expect(body.field).toBe("aggregate");
+    expect(body.code).toBe("INVALID_QUERY");
+    expect(body.error_type).toBe("invalid_query");
+  });
+
+  it("400s when aggregate is combined with semantic (no silent fall-through to rows)", async () => {
+    const res = await get("?semantic=true&near_text=hello&aggregate[op]=count");
+    expect(res.status).toBe(400);
+    const body: any = await res.json();
+    expect(body.field).toBe("aggregate");
+    expect(body.code).toBe("INVALID_QUERY");
+    expect(body.error_type).toBe("invalid_query");
+  });
+
+  it("400s when sum has no group_by", async () => {
+    await store.upsertTagRecord("expense", { fields: { amount: { type: "integer", indexed: true } } });
+    const res = await get("?aggregate[op]=sum&aggregate[field]=amount");
+    expect(res.status).toBe(400);
+    const body: any = await res.json();
+    expect(body.field).toBe("aggregate.group_by");
+  });
+});
+
+describe("REST GET /notes — aggregate: count without group_by (vault#626)", () => {
+  it("returns [{group: null, value: N}] for the filtered set", async () => {
+    await store.createNote("a", { tags: ["work"] });
+    await store.createNote("b", { tags: ["work"] });
+    await store.createNote("c", { tags: ["personal"] });
+
+    const all = await get("?aggregate[op]=count");
+    expect(all.status).toBe(200);
+    expect(await all.json()).toEqual([{ group: null, value: 3 }]);
+
+    const filtered = await get("?tag=work&aggregate[op]=count");
+    expect(filtered.status).toBe(200);
+    expect(await filtered.json()).toEqual([{ group: null, value: 2 }]);
+  });
+
+  it("an empty vault still returns the zero row, not []", async () => {
+    const res = await get("?aggregate[op]=count");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([{ group: null, value: 0 }]);
+  });
+
+  it("a scoped token with no visible matches gets a zero total, not a leak", async () => {
+    await store.createNote("out-of-scope only", { tags: ["work"] });
+    const scoped: TagScopeCtx = { allowed: new Set(["health"]), raw: ["health"] };
+    const res = await get("?aggregate[op]=count", scoped);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([{ group: null, value: 0 }]);
+  });
+
+  it("a scoped token's total excludes out-of-scope notes", async () => {
+    await store.createNote("in", { tags: ["health"] });
+    await store.createNote("out 1", { tags: ["work"] });
+    await store.createNote("out 2", { tags: ["work"] });
+    const scoped: TagScopeCtx = { allowed: new Set(["health"]), raw: ["health"] };
+    const res = await get("?aggregate[op]=count", scoped);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([{ group: null, value: 1 }]);
+  });
 });
 
 describe("REST GET /notes — aggregate: group_by \"tag\"", () => {

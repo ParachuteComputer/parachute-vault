@@ -13,6 +13,7 @@
  *   - errors on a non-indexed / non-numeric sum field
  *   - errors on a malformed aggregate spec (missing op/group_by/field)
  *   - a note missing the group_by field collects into `group: null`
+ *   - count without group_by is the filtered total (vault#626)
  *
  * Tag-scope enforcement (server-layer, injected as an `ids` prefilter or an
  * `aggregateVisibility` predicate) is covered separately at the MCP/REST
@@ -32,6 +33,50 @@ let store: SqliteStore;
 beforeEach(() => {
   db = new Database(":memory:");
   store = new SqliteStore(db);
+});
+
+describe("aggregateNotes — count without group_by (vault#626 filtered total)", () => {
+  it("returns [{group: null, value: N}] over the whole set", async () => {
+    await store.createNote("a");
+    await store.createNote("b");
+    await store.createNote("c");
+    expect(aggregateNotes(db, { aggregate: { op: "count" } })).toEqual([
+      { group: null, value: 3 },
+    ]);
+  });
+
+  it("an empty match still returns one zero row, not []", () => {
+    expect(aggregateNotes(db, { aggregate: { op: "count" } })).toEqual([
+      { group: null, value: 0 },
+    ]);
+  });
+
+  it("a tag prefilter narrows the total", async () => {
+    await store.createNote("a", { tags: ["work"] });
+    await store.createNote("b", { tags: ["work"] });
+    await store.createNote("c", { tags: ["personal"] });
+    expect(aggregateNotes(db, { tags: ["work"], aggregate: { op: "count" } })).toEqual([
+      { group: null, value: 2 },
+    ]);
+  });
+
+  it("ids: [] (tag-scope empty) is a zero total, not []", () => {
+    expect(aggregateNotes(db, { ids: [], aggregate: { op: "count" } })).toEqual([
+      { group: null, value: 0 },
+    ]);
+  });
+
+  it("sum without group_by is still INVALID_QUERY", async () => {
+    await store.upsertTagRecord("expense", { fields: { amount: { type: "integer", indexed: true } } });
+    try {
+      aggregateNotes(db, { aggregate: { op: "sum", field: "amount" } });
+      throw new Error("expected throw");
+    } catch (e: any) {
+      expect(e.name).toBe("QueryError");
+      expect(e.code).toBe("INVALID_QUERY");
+      expect(e.field).toBe("aggregate.group_by");
+    }
+  });
 });
 
 describe("aggregateNotes — count by an indexed enum field", () => {

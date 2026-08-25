@@ -977,30 +977,34 @@ export function parseNotesQueryOpts(url: URL): {
  * aggregation params (bracket-style, consistent with `meta[field][op]=`
  * above) into an `AggregateSpec`. Absent entirely (none of the three keys
  * present) → `{}` — no aggregate intent, the caller falls through to a
- * normal query. `group_by` + `op` are required together when ANY of the
- * three is present; `field` is optional at the parser level (its
- * requiredness depends on `op`, enforced by `aggregateNotes` itself). Value
- * validity beyond shape (indexed field, numeric type, sum-requires-field)
- * is ALSO enforced by `aggregateNotes` — same FIELD_NOT_INDEXED /
- * INVALID_QUERY contract every other query surface uses.
+ * normal query. `op` is required when ANY of the three is present.
+ * `group_by` is required for `sum` and optional for `count` (vault#626 —
+ * `?aggregate[op]=count` alone is the filtered total). `field` is optional
+ * at the parser level (its requiredness depends on `op`, enforced by
+ * `aggregateNotes` itself). Value validity beyond shape (indexed field,
+ * numeric type, sum-requires-field) is ALSO enforced by `aggregateNotes` —
+ * same FIELD_NOT_INDEXED / INVALID_QUERY contract every other query
+ * surface uses.
  *
  * Returns `{ aggregate? }` or `{ error }` (a 400 Response) on a malformed
- * shape (missing `group_by`/`op`, or an unrecognized `op`).
+ * shape (missing `op`, `sum` without `group_by`, or an unrecognized `op`).
  */
 function parseAggregateParam(url: URL): { aggregate?: AggregateSpec; error?: Response } {
-  const groupBy = parseQuery(url, "aggregate[group_by]");
+  const groupByRaw = parseQuery(url, "aggregate[group_by]");
   const op = parseQuery(url, "aggregate[op]");
   const field = parseQuery(url, "aggregate[field]");
+  // Empty `aggregate[group_by]=` is omitted, not an empty grouping key.
+  const groupBy = groupByRaw === "" ? null : groupByRaw;
   if (groupBy === null && op === null && field === null) return {};
-  if (groupBy === null || op === null) {
+  if (op === null) {
     return {
       error: json(
         {
-          error: `aggregate requires both aggregate[group_by] and aggregate[op] — group_by is an indexed metadata field or "tag"; op is "count" or "sum".`,
+          error: `aggregate requires aggregate[op] ("count" or "sum"). group_by is optional for count (filtered total) and required for sum.`,
           code: "INVALID_QUERY",
           error_type: "invalid_query",
           field: "aggregate",
-          hint: `pass ?aggregate[group_by]=<field|tag>&aggregate[op]=<count|sum>[&aggregate[field]=<numeric field>]`,
+          hint: `pass ?aggregate[op]=count or ?aggregate[group_by]=<field|tag>&aggregate[op]=<count|sum>[&aggregate[field]=<numeric field>]`,
         },
         400,
       ),
@@ -1021,7 +1025,27 @@ function parseAggregateParam(url: URL): { aggregate?: AggregateSpec; error?: Res
       ),
     };
   }
-  return { aggregate: { group_by: groupBy, op, field: field ?? undefined } };
+  if (op === "sum" && groupBy === null) {
+    return {
+      error: json(
+        {
+          error: `aggregate[group_by] is required when aggregate[op] is "sum"`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate.group_by",
+          hint: `pass ?aggregate[group_by]=<field|tag>&aggregate[op]=sum&aggregate[field]=<numeric field>`,
+        },
+        400,
+      ),
+    };
+  }
+  return {
+    aggregate: {
+      ...(groupBy !== null ? { group_by: groupBy } : {}),
+      op,
+      field: field ?? undefined,
+    },
+  };
 }
 
 /**
@@ -1259,6 +1283,20 @@ async function handleNotesInner(
             400,
           );
         }
+        const semanticAggregate = parseAggregateParam(url);
+        if (semanticAggregate.error) return semanticAggregate.error;
+        if (semanticAggregate.aggregate) {
+          return json(
+            {
+              error: "aggregate is incompatible with semantic search — a rollup returns groups, not ranked notes.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `semantic`/`near_text` when using `aggregate`",
+            },
+            400,
+          );
+        }
         if (parseQuery(url, "cursor") !== null) {
           return json(
             {
@@ -1372,6 +1410,25 @@ async function handleNotesInner(
           },
           400,
         );
+      }
+
+      // vault#626 — `search=` used to silently ignore `aggregate[...]` and
+      // return note rows. MCP already rejects the combo; REST must too.
+      if (search) {
+        const searchAggregate = parseAggregateParam(url);
+        if (searchAggregate.error) return searchAggregate.error;
+        if (searchAggregate.aggregate) {
+          return json(
+            {
+              error: "aggregate is incompatible with full-text search — pick one.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `search` when using `aggregate`",
+            },
+            400,
+          );
+        }
       }
 
       // Full-text search
@@ -1612,9 +1669,9 @@ async function handleNotesInner(
             // (reusing the `ids` filter `near` already pushes into SQL).
             const allMatches = await store.queryNotes({ ...queryOpts, limit: 1000000, offset: 0 });
             const visible = filterNotesByTagScope(allMatches, tagScope.allowed, tagScope.raw);
-            rows = visible.length === 0
-              ? []
-              : await store.aggregateNotes({ ids: visible.map((n) => n.id), aggregate: aggregateParsed.aggregate });
+            // Always run the rollup, even on an empty visible set: ungrouped
+            // count (vault#626) must return `[{group:null,value:0}]`, not `[]`.
+            rows = await store.aggregateNotes({ ids: visible.map((n) => n.id), aggregate: aggregateParsed.aggregate });
             // That note-level narrowing isn't sufficient on its own under
             // `group_by: "tag"`: a note can be in scope via one tag while
             // ALSO carrying an out-of-scope co-tag, and a tag rollup's

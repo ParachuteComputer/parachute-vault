@@ -757,7 +757,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         }
 
         // --- Aggregation / rollup mode (top new-feature ask from a UX round) ---
-        // Mutually exclusive with `search`/`near`/`cursor` — a rollup returns
+        // Mutually exclusive with `search`/`near`/`cursor`/`semantic` — a rollup returns
         // one row per group, not a paginated / graph-scoped / ranked note
         // list — so reject those combos loudly before touching the DB.
         if (params.aggregate) {
@@ -792,7 +792,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const aggRaw = params.aggregate as Record<string, unknown>;
           if (typeof aggRaw !== "object" || aggRaw === null || Array.isArray(aggRaw)) {
             throw new QueryError(
-              `aggregate must be an object: {group_by, op, field?}`,
+              `aggregate must be an object: {op, group_by?, field?}`,
               "INVALID_QUERY",
               { error_type: "invalid_query", field: "aggregate", got: aggRaw },
             );
@@ -802,7 +802,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // `aggregateNotes` itself, reusing the exact FIELD_NOT_INDEXED /
           // INVALID_QUERY contract every other query surface uses.
           const aggregateSpec = {
-            group_by: aggRaw.group_by as string,
+            ...(typeof aggRaw.group_by === "string" ? { group_by: aggRaw.group_by } : {}),
             op: aggRaw.op as "count" | "sum",
             field: aggRaw.field as string | undefined,
           };
@@ -843,7 +843,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // Core stays scope-unaware — it only invokes the plain closure.
           const aggAllMatches = await store.queryNotes({ ...aggFilterOpts, limit: 1000000 });
           const aggVisibleIds = aggAllMatches.filter(aggregateVisibility).map((n) => n.id);
-          if (aggVisibleIds.length === 0) return [];
+          // Always run the rollup, even on an empty visible set: ungrouped
+          // count (vault#626) must return `[{group:null,value:0}]`, not `[]`.
           return await store.aggregateNotes({ ids: aggVisibleIds, aggregate: aggregateSpec });
         }
 
