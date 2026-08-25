@@ -99,6 +99,84 @@ describe("countConformanceViolations", () => {
     expect(r.violating_notes).toBe(5);
     expect(r.sample.length).toBe(2);
   });
+  describe("past the queryNotes default LIMIT 100 (vault#592)", () => {
+    it("counts every note on a >100-note tag, not just the first page", async () => {
+      for (let i = 0; i < 137; i++) {
+        await store.createNote(`n${i}`, { tags: ["task"], metadata: {} });
+      }
+      const r = countConformanceViolations(db, "task", {
+        req: { type: "string", required: true },
+      });
+      expect(r.total_notes).toBe(137);
+      expect(r.violating_notes).toBe(137);
+    });
+
+    it("reports total_notes honestly past the cap with no fields proposed", async () => {
+      for (let i = 0; i < 137; i++) {
+        await store.createNote(`n${i}`, { tags: ["task"], metadata: {} });
+      }
+      const r = countConformanceViolations(db, "task", {});
+      expect(r.total_notes).toBe(137);
+      expect(r.violating_notes).toBe(0);
+    });
+
+    it("finds violations that live only past the first 100 notes", async () => {
+      // 120 conforming notes first, then 5 violators — under the old LIMIT 100
+      // walk the violators were never even looked at.
+      for (let i = 0; i < 120; i++) {
+        await store.createNote(`ok${i}`, { tags: ["task"], metadata: { req: "here" } });
+      }
+      for (let i = 0; i < 5; i++) {
+        await store.createNote(`bad${i}`, { tags: ["task"], metadata: {} });
+      }
+      const r = countConformanceViolations(db, "task", {
+        req: { type: "string", required: true },
+      });
+      expect(r.total_notes).toBe(125);
+      expect(r.violating_notes).toBe(5);
+    });
+
+    it("counts across a tag hierarchy past the cap (descendants included)", async () => {
+      await store.upsertTagRecord("dev/log", { parent_names: ["dev"] });
+      for (let i = 0; i < 60; i++) {
+        await store.createNote(`p${i}`, { tags: ["dev"], metadata: {} });
+      }
+      for (let i = 0; i < 60; i++) {
+        await store.createNote(`c${i}`, { tags: ["dev/log"], metadata: {} });
+      }
+      const r = countConformanceViolations(db, "dev", {
+        req: { type: "string", required: true },
+      });
+      expect(r.total_notes).toBe(120);
+      expect(r.violating_notes).toBe(120);
+    });
+
+    it("counts a note carrying BOTH the tag and a descendant exactly once", async () => {
+      await store.upsertTagRecord("dev/log", { parent_names: ["dev"] });
+      for (let i = 0; i < 105; i++) {
+        await store.createNote(`both${i}`, { tags: ["dev", "dev/log"], metadata: {} });
+      }
+      const r = countConformanceViolations(db, "dev", {
+        req: { type: "string", required: true },
+      });
+      expect(r.total_notes).toBe(105);
+      expect(r.violating_notes).toBe(105);
+    });
+
+    it("still caps the sample at sampleLimit while counting the full set", async () => {
+      for (let i = 0; i < 137; i++) {
+        await store.createNote(`n${i}`, { tags: ["task"], metadata: {} });
+      }
+      const r = countConformanceViolations(
+        db,
+        "task",
+        { req: { type: "string", required: true } },
+        { sampleLimit: 3 },
+      );
+      expect(r.violating_notes).toBe(137);
+      expect(r.sample.length).toBe(3);
+    });
+  });
 });
 
 describe("store.countTagConformance", () => {

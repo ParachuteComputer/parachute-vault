@@ -36,6 +36,7 @@ import {
   welcomePack,
   YOURS_TO_KEEP_PATH,
 } from "../core/src/seed-packs.ts";
+import { PathConflictError } from "../core/src/notes.ts";
 import {
   buildVaultProjection,
   projectionToMarkdown,
@@ -290,6 +291,73 @@ describe("applySeedPack — surface-starter via add-pack", () => {
     expect(after!.content).toBe(edited);
     const all = await store.queryNotes({});
     expect(all.filter((n) => n.path === SURFACE_STARTER_PATH)).toHaveLength(1);
+  });
+});
+
+describe("applySeedPack — concurrent-apply skip grace (vault#527)", () => {
+  /**
+   * The applier's idempotency is check-then-create: `getNoteByPath` decides,
+   * then `createNote` writes. Two callers applying the same pack at once can
+   * BOTH see "absent" and both try to create; the loser hits the path UNIQUE
+   * constraint. That race can't be scheduled deterministically from a test,
+   * so we inject it — a store proxy whose `getNoteByPath` reports absent (as
+   * it genuinely would for the racer that checked first) while `createNote`
+   * rejects with the PathConflictError the real store raises when the winner
+   * has already committed. That is exactly the state the loser observes.
+   */
+  function racingStore(target: BunStore, racedPaths: Set<string>) {
+    return new Proxy(target, {
+      get(obj, prop, recv) {
+        if (prop === "createNote") {
+          return async (content: string, opts: { path?: string } = {}) => {
+            if (opts.path && racedPaths.has(opts.path)) {
+              throw new PathConflictError(opts.path);
+            }
+            return (obj as BunStore).createNote(content, opts as never);
+          };
+        }
+        return Reflect.get(obj, prop, recv);
+      },
+    }) as BunStore;
+  }
+
+  test("a path lost to a concurrent creator is reported skipped, not thrown", async () => {
+    const raced = new Set(SURFACE_STARTER_PACK.notes.map((n) => n.path));
+    const proxied = racingStore(store, raced);
+
+    const result = await applySeedPack(proxied, SURFACE_STARTER_PACK);
+
+    expect(result.seededNotes).toEqual([]);
+    expect(result.skippedNotes).toEqual(SURFACE_STARTER_PACK.notes.map((n) => n.path));
+  });
+
+  test("losing one path does not abort the rest of the pack", async () => {
+    // welcomePack is multi-note, so this proves the loop CONTINUES past a
+    // lost race rather than aborting the whole pack on the first conflict.
+    const pack = welcomePack();
+    const [first, ...rest] = pack.notes;
+    expect(rest.length).toBeGreaterThan(0);
+    const proxied = racingStore(store, new Set([first!.path]));
+
+    const result = await applySeedPack(proxied, pack);
+
+    expect(result.skippedNotes).toContain(first!.path);
+    for (const n of rest) expect(result.seededNotes).toContain(n.path);
+  });
+
+  test("a PathConflictError is the ONLY create failure swallowed — others still propagate", async () => {
+    const boom = new Proxy(store, {
+      get(obj, prop, recv) {
+        if (prop === "createNote") {
+          return async () => {
+            throw new Error("disk on fire");
+          };
+        }
+        return Reflect.get(obj, prop, recv);
+      },
+    }) as BunStore;
+
+    expect(applySeedPack(boom, SURFACE_STARTER_PACK)).rejects.toThrow(/disk on fire/);
   });
 });
 

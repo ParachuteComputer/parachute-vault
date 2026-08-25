@@ -72,6 +72,66 @@ describe("computeLede", () => {
     });
   });
 
+  describe("markdown blocks that are not prose (vault#616)", () => {
+    it("skips a fenced code block and returns the first prose paragraph after it", () => {
+      expect(
+        computeLede("# Title\n\n```js\nconst x = 1;\n```\n\nThe real lede."),
+      ).toBe("The real lede.");
+    });
+
+    it("skips a fenced block that is not blank-line separated from the title", () => {
+      expect(computeLede("# Title\n```\nraw\n```\n\nThe real lede.")).toBe("The real lede.");
+    });
+
+    it("skips a tilde-fenced code block", () => {
+      expect(computeLede("# Title\n\n~~~\nraw\n~~~\n\nThe real lede.")).toBe("The real lede.");
+    });
+
+    it("skips a fence whose body contains blank lines", () => {
+      expect(
+        computeLede("# Title\n\n```\nline one\n\nline two\n```\n\nThe real lede."),
+      ).toBe("The real lede.");
+    });
+
+    it("returns null when an unterminated fence runs to end of content", () => {
+      expect(computeLede("# Title\n\n```js\nconst x = 1;")).toBeNull();
+    });
+
+    it("returns null when a code fence is all the content after the title", () => {
+      expect(computeLede("# Title\n\n```js\nconst x = 1;\n```")).toBeNull();
+    });
+
+    it("skips a heading-only block rather than returning its raw marker", () => {
+      expect(computeLede("# Title\n\n## Section\n\nThe real lede.")).toBe("The real lede.");
+    });
+
+    it("skips consecutive headings and fences until it finds prose", () => {
+      expect(
+        computeLede("# Title\n\n## Section\n\n### Sub\n\n```\ncode\n```\n\nThe real lede."),
+      ).toBe("The real lede.");
+    });
+
+    it("returns null when only headings follow the title", () => {
+      expect(computeLede("# Title\n\n## Section\n\n### Sub")).toBeNull();
+    });
+
+    it("keeps a paragraph whose FIRST line is a heading-marked line but has prose under it", () => {
+      // A heading immediately followed by prose with no blank line: markdown
+      // ends the heading at the newline, so the prose is the lede.
+      expect(computeLede("# Title\n\n## Section\nThe real lede.")).toBe("The real lede.");
+    });
+
+    it("skips a setext underline / thematic break block under the title", () => {
+      expect(computeLede("Title\n---\n\nThe real lede.")).toBe("The real lede.");
+      expect(computeLede("# Title\n\n***\n\nThe real lede.")).toBe("The real lede.");
+      expect(computeLede("Title\n===\n\nThe real lede.")).toBe("The real lede.");
+    });
+
+    it("does not mistake a prose line for a thematic break", () => {
+      expect(computeLede("# Title\n\n--- and then some prose.")).toBe("--- and then some prose.");
+    });
+  });
+
   describe("length cap", () => {
     it("truncates to LEDE_MAX_LEN code points", () => {
       const longParagraph = "a".repeat(1000);

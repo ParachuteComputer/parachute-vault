@@ -328,7 +328,8 @@ describe("installPythonBackend — warm-pull + verify", () => {
       files,
       run: async (cmd) => {
         if (cmd.some((c) => c.endsWith("/pip"))) files.add(venvBin("onnx-asr"));
-        if (cmd.includes("--help")) return { exitCode: 1, stdout: "", stderr: "offline" };
+        // Warm-pull is `<bin> <model> --help`; verify is `<bin> --help`.
+        if (cmd.includes("--help") && cmd.length > 2) return { exitCode: 1, stdout: "", stderr: "offline" };
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     });
@@ -349,7 +350,8 @@ describe("installPythonBackend — warm-pull + verify", () => {
     const out = await installPythonBackend(deps, { provider: "parakeet-mlx" });
     expect(out.ok).toBe(true);
     expect(out.steps.find((s) => s.name === "model-warm-pull")!.status).toBe("skipped");
-    expect(runs.some((r) => r.includes("--help"))).toBe(false);
+    expect(runs.some((r) => r.length > 2 && r.includes("--help"))).toBe(false);
+    expect(runs.some((r) => r.length === 2 && r[1] === "--help")).toBe(true);
   });
 
   test("HONEST verify: pip 'succeeds' but no binary appears → ok:false, no activation signal", async () => {
@@ -362,5 +364,24 @@ describe("installPythonBackend — warm-pull + verify", () => {
     expect(out.ok).toBe(false);
     expect(out.binPath).toBeUndefined();
     expect(out.steps.find((s) => s.name === "verify")!.status).toBe("failed");
+  });
+
+  test("HONEST verify: binary exists but --help fails → ok:false (vault#539)", async () => {
+    const files = new Set<string>([venvBin("onnx-asr")]);
+    const { deps } = makeDeps({
+      path: { python3: "/usr/bin/python3", ffmpeg: "/usr/bin/ffmpeg" },
+      files,
+      run: async (cmd) => {
+        if (cmd.length === 2 && cmd[1] === "--help") {
+          return { exitCode: 127, stdout: "", stderr: "No such file or directory: python3" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    const out = await installPythonBackend(deps, { provider: "onnx-asr", skipModel: true });
+    expect(out.ok).toBe(false);
+    expect(out.binPath).toBeUndefined();
+    expect(out.steps.find((s) => s.name === "verify")!.status).toBe("failed");
+    expect(out.steps.find((s) => s.name === "verify")!.detail).toMatch(/--help/);
   });
 });

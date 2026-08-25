@@ -61,7 +61,40 @@ import {
 // ---------------------------------------------------------------------------
 
 function configDirPath(): string {
-  return process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
+  const fromEnv = process.env.PARACHUTE_HOME;
+  if (fromEnv) return fromEnv;
+  // Second layer of the test-isolation defense (`core/src/test-preload.ts` is
+  // the first). The preload is loaded by `bunfig.toml`, which Bun reads
+  // relative to the *cwd* — run `bun test path/to/parachute-vault/src/...`
+  // from a parent directory and the preload silently never loads, leaving
+  // every unset-PARACHUTE_HOME test writing real vaults into the developer's
+  // live install. `bun test` sets NODE_ENV=test, so the ambiguity is
+  // detectable here, at the one function that resolves the root. Deliberately
+  // narrow: only the *unset* case throws. Tests legitimately point
+  // PARACHUTE_HOME at a sandbox whose HOME is that same sandbox (init.test.ts
+  // does exactly this), so an equality check against `~/.parachute` would fire
+  // on correct code.
+  //
+  // This is reachable in SHIPPED code, not just in this repo's suite: the
+  // package ships source (`bin` points at `src/cli.ts`, no bundler) and
+  // `CONFIG_DIR` below is evaluated at module load, so an end user whose
+  // vitest/jest integration test shells out to the CLI hits it — those runners
+  // set NODE_ENV=test too. The message has to serve that reader as well as a
+  // contributor. The escape hatch needs no new env var: the guard only fires
+  // when PARACHUTE_HOME is UNSET, so setting it — to a sandbox, or to the real
+  // `~/.parachute` if that is genuinely what the test wants — is both the fix
+  // and the statement of intent.
+  if (process.env.NODE_ENV === "test") {
+    throw new Error(
+      "[parachute-vault] NODE_ENV=test and PARACHUTE_HOME is unset — refusing to default " +
+        "to the live install at ~/.parachute, because a test run that writes there creates " +
+        "real vaults in a real install. Set PARACHUTE_HOME explicitly for this process: a " +
+        "temp dir to keep the test hermetic, or ~/.parachute if you truly mean the live " +
+        "install. (Contributors to parachute-vault: running `bun test` from the repo root " +
+        "sets it for you via bunfig.toml's preload.)",
+    );
+  }
+  return join(homedir(), ".parachute");
 }
 
 function vaultHomePath(): string {

@@ -37,7 +37,7 @@ import { readVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { authenticateVaultRequest, type AuthResult } from "./auth.ts";
 import { hasScopeForVault } from "./scopes.ts";
-import { expandTokenTagScope, filterNotesByTagScope } from "./tag-scope.ts";
+import { expandTokenTagScope, filterNotesByTagScope, scrubNotesTagsByScope } from "./tag-scope.ts";
 import { buildLiveMatcher } from "./live-match.ts";
 import {
   subscriptionManager,
@@ -254,7 +254,17 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
     // Project AFTER the tag-scope filter (which reads note.tags). `toNoteIndex`
     // is the SAME lean shape the REST list route returns, so a client that
     // renders REST lists renders these snapshot frames unchanged.
-    const frames = buildSnapshotFrames(lean ? snapshotNotes.map(toNoteIndex) : snapshotNotes);
+    //
+    // Then scrub each surviving note's `.tags` down to the in-scope subset
+    // (vault#568) — a snapshot is a read, and it must not disclose the NAMES
+    // of a visible note's out-of-scope co-tags any more than `GET /api/notes`
+    // does. Scrubbing AFTER the projection keeps the filter reading the full
+    // tag set. No-op for an unscoped subscription.
+    const frames = buildSnapshotFrames(
+      lean
+        ? scrubNotesTagsByScope(snapshotNotes.map(toNoteIndex), tagScopeAllowed, auth.scoped_tags)
+        : scrubNotesTagsByScope(snapshotNotes, tagScopeAllowed, auth.scoped_tags),
+    );
 
     // --- SYNCHRONOUS from here (no await) so no write interleaves between
     //     register and the snapshot flush.

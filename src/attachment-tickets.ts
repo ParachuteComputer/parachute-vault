@@ -20,7 +20,7 @@ import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync } from "fs
 import { join, normalize } from "path";
 import type { Store } from "../core/src/types.ts";
 import type { AttachmentTicket, AttachmentTicketProvider } from "../core/src/attachment/tickets.ts";
-import { sanitizeAttachmentExtension } from "../core/src/attachment/policy.ts";
+import { sanitizeAttachmentExtension, contentTypeForAttachmentPath } from "../core/src/attachment/policy.ts";
 import { assetsDir, readVaultConfig } from "./config.ts";
 import {
   NO_PROVIDER_ERROR,
@@ -370,7 +370,7 @@ async function handleDownloadSpend(
   return new Response(fileBuffer, {
     status: 200,
     headers: {
-      "Content-Type": attachment.mimeType || "application/octet-stream",
+      "Content-Type": contentTypeForAttachmentPath(attachment.path),
       "Content-Length": String(stat.size),
       // Same defense-in-depth as the existing GET /storage/<path> byte-serve
       // (src/routes.ts) — never let a browser MIME-sniff a stored asset into

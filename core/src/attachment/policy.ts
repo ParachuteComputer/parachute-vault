@@ -129,3 +129,12 @@ export function sanitizeAttachmentExtension(filename: string): string {
 export function mimeForAttachmentExtension(ext: string): string {
   return ATTACHMENT_MIME_TYPES[ext] ?? "application/octet-stream";
 }
+
+/**
+ * Download Content-Type for an attachment path (vault#617).
+ * Extension wins; the row's caller-asserted `mime_type` is never consulted.
+ * Matches REST `GET /storage/<path>` (`src/routes.ts`).
+ */
+export function contentTypeForAttachmentPath(path: string): string {
+  return mimeForAttachmentExtension(sanitizeAttachmentExtension(path));
+}

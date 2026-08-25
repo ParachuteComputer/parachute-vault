@@ -176,7 +176,7 @@ import {
   TRANSCRIBE_CPP_SOURCE_REF,
   type CliBuildResult,
 } from "./transcription/build.ts";
-import { downloadTo } from "./transcription/download.ts";
+import { downloadTo, ensureDownloaded } from "./transcription/download.ts";
 import {
   describeWhisperPlan,
   planWhisperInstall,
@@ -3983,11 +3983,31 @@ async function runTranscribeCppInstall(opts: {
 
     // 2) Model GGUF.
     const modelDest = join(paths.modelsDir, plan.model!.file);
-    if (existsSync(modelDest) && !force) {
-      console.log(`✓ model already present (${modelDest}) — skipping (use --force to re-download).`);
-    } else {
-      console.log(`Downloading model ${plan.model!.file} (~${plan.model!.approxSizeMb}MB) …`);
-      await downloadTo(plan.model!.url, modelDest);
+    // `ensureDownloaded` (vault#531) replaces a bare existsSync skip: when the
+    // host publishes a digest (HuggingFace does for every GGUF here) an
+    // already-present file is VERIFIED before it's trusted, so a model left
+    // corrupt by an interrupted run gets repaired instead of being skipped
+    // forever by every future non---force re-run.
+    const modelResult = await ensureDownloaded(plan.model!.url, modelDest, {
+      force,
+      onBeforeDownload: (reason) => {
+        if (reason === "corrupt") {
+          console.log(
+            `⚠  model at ${modelDest} failed its checksum — re-downloading ${plan.model!.file} …`,
+          );
+        } else {
+          console.log(`Downloading model ${plan.model!.file} (~${plan.model!.approxSizeMb}MB) …`);
+        }
+      },
+    });
+    if (modelResult.outcome === "reused") {
+      console.log(
+        modelResult.verified
+          ? `✓ model already present and checksum-verified (${modelDest}) — skipping.`
+          : `✓ model already present (${modelDest}) — skipping (use --force to re-download).`,
+      );
+    } else if (modelResult.verified) {
+      console.log(`✓ model checksum verified.`);
     }
 
     // 3) Build transcribe-cli from source against the extracted dylibs.
@@ -4283,10 +4303,18 @@ async function cmdTranscriptionStatus(): Promise<void> {
     legacy.push(`  transcribe-cpp   ${probe.ok ? "runnable" : `not runnable (${probe.reason})`}`);
   }
   if (active === "parakeet-mlx" || parakeetMlxInstalled()) {
-    legacy.push(`  parakeet-mlx     ${parakeetMlxInstalled() ? `runnable (${resolveParakeetMlxBin()})` : "not installed"}`);
+    const bin = resolveParakeetMlxBin();
+    const probe = bin ? await probeTranscribeCliRunnable(bin) : { ok: false, reason: "not installed" };
+    legacy.push(
+      `  parakeet-mlx     ${probe.ok ? `runnable (${bin})` : `not runnable (${probe.reason})`}`,
+    );
   }
   if (active === "onnx-asr" || onnxAsrInstalled()) {
-    legacy.push(`  onnx-asr         ${onnxAsrInstalled() ? `runnable (${resolveOnnxAsrBin()})` : "not installed"}`);
+    const bin = resolveOnnxAsrBin();
+    const probe = bin ? await probeTranscribeCliRunnable(bin) : { ok: false, reason: "not installed" };
+    legacy.push(
+      `  onnx-asr         ${probe.ok ? `runnable (${bin})` : `not runnable (${probe.reason})`}`,
+    );
   }
   if (legacy.length > 0) {
     console.log("\nLegacy providers (superseded by whisper-cpp):");

@@ -52,6 +52,20 @@ one-command setup; one Bun server (port 1940) hosts many vaults, each its own SQ
   default is a per-run inference. A box with a previously persisted `autostart: true`
   keeps self-registering even under a hub — clear it once with
   `parachute-vault init --no-autostart`.
+- **Test isolation of `PARACHUTE_HOME` is unconditional, on purpose.**
+  `core/src/test-preload.ts` (loaded via `bunfig.toml`) always points the suite at a fresh
+  temp dir — it does *not* defer to an inherited value, because the inherited value on a
+  developer box is the live install. It used to defer, and on 2026-08-22 two runs created
+  ~158 real vaults (`tagscope-*`, `mint-*`, `retier-*`, `solo`) under
+  `~/.parachute/vault/data/` on a machine whose shell profile exported
+  `PARACHUTE_HOME="$HOME/.parachute"`. `configDirPath()` in `src/config.ts` carries the
+  second layer: under `NODE_ENV=test` (which `bun test` sets) an *unset* `PARACHUTE_HOME`
+  throws rather than falling back to `~/.parachute`, covering the case where bunfig — and
+  therefore the preload — was never found because `bun test` ran from the wrong cwd.
+  Pinned by `src/test-home-isolation.test.ts`. Related: **Bun hands a spawned child the
+  environ the parent process *started* with, not the live `process.env`** — so the
+  preload's assignment never reaches a child spawned without an explicit `env`. Always
+  spread `process.env` into a spawned CLI's env (`runSubprocess` already does).
 - **BYO GitHub App for the mirror backup flow**: `PARACHUTE_GITHUB_CLIENT_ID` +
   `PARACHUTE_GITHUB_APP_SLUG` must be set both-or-neither and name the SAME GitHub App —
   mixing apps breaks the install probe (the client_id mints the tokens, the slug builds

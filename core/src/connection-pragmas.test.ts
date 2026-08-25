@@ -13,7 +13,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { applyConnectionPragmas, initSchema } from "./schema.ts";
+import { applyConnectionPragmas, BUSY_TIMEOUT_MS, initSchema } from "./schema.ts";
 
 let dir: string;
 
@@ -131,6 +131,32 @@ describe("applyConnectionPragmas — :memory: DB", () => {
     const db = new Database(":memory:");
     applyConnectionPragmas(db);
     expect(pragma(db, "foreign_keys")).toBe(1);
+    db.close();
+  });
+
+  it("sets busy_timeout on the non-WAL branch too (vault#527)", () => {
+    // SQLITE_BUSY is not WAL-specific — a rollback-journal DB serializes even
+    // harder. The timeout must not be gated on the WAL success path.
+    const db = new Database(":memory:");
+    applyConnectionPragmas(db);
+    expect(pragma(db, "busy_timeout")).toBe(BUSY_TIMEOUT_MS);
+    db.close();
+  });
+});
+
+describe("applyConnectionPragmas — busy_timeout (vault#527)", () => {
+  it("sets a non-zero busy_timeout so SQLITE_BUSY retries instead of failing instantly", () => {
+    const db = new Database(join(dir, "busy.db"));
+    applyConnectionPragmas(db);
+    expect(pragma(db, "busy_timeout")).toBe(BUSY_TIMEOUT_MS);
+    expect(BUSY_TIMEOUT_MS).toBeGreaterThan(0);
+    db.close();
+  });
+
+  it("initSchema's open path carries the busy_timeout", () => {
+    const db = new Database(join(dir, "busy-init.db"));
+    initSchema(db);
+    expect(pragma(db, "busy_timeout")).toBe(BUSY_TIMEOUT_MS);
     db.close();
   });
 });

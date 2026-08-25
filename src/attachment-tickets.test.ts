@@ -431,6 +431,68 @@ describe("attachment tickets — download lifecycle", () => {
     expect(secondRes.status).toBe(404);
   });
 
+  test("spend Content-Type is extension-derived, not the caller-asserted row mime (vault#617)", async () => {
+    const vaultName = freshVault("tickets-download-mime");
+    const store = getVaultStore(vaultName);
+    const note = await store.createNote("# T\n", { path: "t" });
+
+    const uploadMint = await callTool(vaultName, "request-attachment-upload", {
+      note: note.id,
+      filename: "photo.png",
+      size_bytes: 4,
+      mime_type: "text/html",
+    });
+    const uploadRes = await routeReq(
+      new Request(uploadMint.url, {
+        method: "PUT",
+        headers: { "content-type": "text/html" },
+        body: new Uint8Array([137, 80, 78, 71]),
+      }),
+    );
+    const attachment = (await uploadRes.json()) as any;
+    expect(attachment.mimeType).toBe("text/html");
+
+    const downloadMint = await callTool(vaultName, "request-attachment-download", {
+      attachment_id: attachment.id,
+    });
+    const downloadRes = await routeReq(new Request(downloadMint.url, { method: "GET" }));
+    expect(downloadRes.status).toBe(200);
+    expect(downloadRes.headers.get("content-type")).toBe("image/png");
+    expect(downloadRes.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(downloadMint.mime_type).toBe("image/png");
+  });
+
+  test("uncurated extension with caller-asserted text/html serves octet-stream (vault#617)", async () => {
+    const vaultName = freshVault("tickets-download-octet");
+    const store = getVaultStore(vaultName);
+    const note = await store.createNote("# T\n", { path: "t" });
+
+    const uploadMint = await callTool(vaultName, "request-attachment-upload", {
+      note: note.id,
+      filename: "payload.bin",
+      size_bytes: 4,
+      mime_type: "text/html",
+    });
+    const uploadRes = await routeReq(
+      new Request(uploadMint.url, {
+        method: "PUT",
+        headers: { "content-type": "text/html" },
+        body: new Uint8Array([10, 20, 30, 40]),
+      }),
+    );
+    expect(uploadRes.status).toBe(201);
+    const attachment = (await uploadRes.json()) as any;
+
+    const downloadMint = await callTool(vaultName, "request-attachment-download", {
+      attachment_id: attachment.id,
+    });
+    const downloadRes = await routeReq(new Request(downloadMint.url, { method: "GET" }));
+    expect(downloadRes.status).toBe(200);
+    expect(downloadRes.headers.get("content-type")).toBe("application/octet-stream");
+    expect(downloadRes.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(downloadMint.mime_type).toBe("application/octet-stream");
+  });
+
   test("path confinement: an attachment row pointing outside assetsDir can't be walked to via a download ticket", async () => {
     const vaultName = freshVault("tickets-confinement");
     const store = getVaultStore(vaultName);

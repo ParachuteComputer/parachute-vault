@@ -949,26 +949,26 @@ Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name: lowerc
 
 ### Cloud platforms
 
-#### Render — recommended (hub-managed, v0.6)
+#### A VPS — the tested path
 
-Most users deploy vault via parachute-hub's `/admin/modules` after the
-hub itself is on Render. See <https://parachute.computer/deploy/render/>
-for the primary v0.6 self-host story: one Render Blueprint provisions
-hub on a persistent disk, then you install vault (and the other
-Parachute modules) from the hub's admin UI. The hub container
-supervises vault's process, the shared persistent disk holds vault
-state, and module upgrades flow through the admin UI rather than
-separate Render redeploys.
+The current self-host story is a **bun-native install on a plain
+Ubuntu/Debian box**: create the box, open a root shell, paste one line.
+See <https://parachute.computer/start/>, which walks it click by click
+for DigitalOcean and works the same on Hetzner, EC2, or a machine in
+your closet. That's the path the project tests and supports.
 
-#### Render — standalone vault (advanced)
+The PaaS Blueprints below still work and stay in tree for operators who
+want them, but they're a **legacy** shape — reach for them only if you
+specifically want that platform's ergonomics.
+
+#### Render — standalone vault (legacy)
 
 The `render.yaml` Blueprint at the repo root deploys vault as its own
-Render web service, separate from hub. This is the **advanced path** —
-useful when you want vault on its own container (separate scaling,
-isolated logs, vault-only deploy without a hub) but not what the
-typical v0.6 self-host wants. If you're not sure, use the hub-managed
-path above. The standalone Blueprint stays in tree because some
-operators specifically want this shape (vault#341).
+Render web service, separate from hub — useful when you want vault on
+its own container (separate scaling, isolated logs, vault-only deploy
+without a hub). If you're not sure, use the VPS path above. The
+Blueprint stays in tree because some operators specifically want this
+shape (vault#341).
 
 Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name:
 lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it

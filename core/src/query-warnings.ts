@@ -229,12 +229,20 @@ export function ignoredParamWarning(param: string, reason: string): QueryWarning
  * /api/notes` on a >limit-note vault returns the OLDEST rows with zero
  * signal that the NEWEST ones didn't make it. `?cursor=` (bootstrap or
  * watermark) sidesteps this entirely — the warning only fires in its
- * absence.
+ * absence. Explicit `offset` is also exempt (vault#601): offset-paging is
+ * deliberate pagination, not an accidental full default page.
  */
-export function truncatedResultsWarning(limit: number): QueryWarning {
+export function truncatedResultsWarning(
+  limit: number,
+  channel: "rest" | "mcp" = "rest",
+): QueryWarning {
+  const pageHint =
+    channel === "mcp"
+      ? `Pass cursor: "" to page, or sort: "desc" for newest-first.`
+      : "Pass ?cursor= to page, or sort=desc for newest-first.";
   return {
     code: "truncated",
-    message: `${limit} = limit rows returned; there may be more. Pass ?cursor= to page, or sort=desc for newest-first.`,
+    message: `${limit} = limit rows returned; there may be more. ${pageHint}`,
     limit,
   };
 }

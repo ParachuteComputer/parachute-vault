@@ -21,6 +21,8 @@
  *   - `excludeTags` — raw exact-name match (engine does NOT expand excludes).
  *   - `path` — case-insensitive exact (engine: `n.path = ? COLLATE NOCASE`).
  *   - `pathPrefix` — prefix (engine: `n.path LIKE prefix || '%'`).
+ *   - `excludePathPrefix` — NOT those prefixes (engine: `n.path IS NULL OR
+ *     n.path NOT LIKE prefix || '%'`). Repeatable. vault#628.
  *   - `extension` — lower-cased, default "md" (engine: `LOWER(n.extension)`),
  *     a note with no extension is treated as "md".
  *   - `metadata` operator objects (eq/ne/gt/gte/lt/lte/in/not_in/exists) +
@@ -281,6 +283,19 @@ function matchAgainst(
   // and SQLite LIKE is ASCII-case-insensitive by default) ----
   if (opts.pathPrefix) {
     if (!note.path || !note.path.toLowerCase().startsWith(opts.pathPrefix.toLowerCase())) return false;
+  }
+
+  // ---- excludePathPrefix (vault#628) — same CI prefix match as pathPrefix;
+  // a note with no path is not under the prefix, so it stays.
+  if (opts.excludePathPrefix && opts.excludePathPrefix.length > 0) {
+    const p = note.path;
+    if (p) {
+      const lower = p.toLowerCase();
+      for (const prefix of opts.excludePathPrefix) {
+        if (typeof prefix !== "string" || prefix.length === 0) continue;
+        if (lower.startsWith(prefix.toLowerCase())) return false;
+      }
+    }
   }
 
   // ---- extension (lower-cased; default "md") ----

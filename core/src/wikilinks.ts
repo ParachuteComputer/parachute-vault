@@ -624,26 +624,27 @@ function syncUnresolvedWikilinks(
  * (a structured link queued via {@link queueUnresolvedLink} backfills with
  * the caller's original relationship, not "wikilink").
  *
- * Deferred resolution now covers all four legs of
- * {@link resolveWikilinkDetailed}: exact path, basename, H1 title, and the
- * explicit `path.ext` form. (Caveat: the candidate pre-filter below matches the
- * title/ext legs via SQL `COLLATE NOCASE`, which case-folds ASCII only — a
- * non-ASCII title differing from the target only in letter case is missed at
- * the candidate stage and re-heals on the source's next save instead. Rare;
- * tracked as a follow-up.) Before this, the sweep matched a pending row to
- * the new note by PATH TEXT ONLY (`target_path = path OR path LIKE
- * '%/'||target_path`) — so a `[[John Doe]]` that resolved at write time via
- * the H1-title fallback (its note's displayed title differs from its path,
- * e.g. `people/jdoe`), or a `[[Foo.csv]]` that resolved via the extension
- * leg, silently never re-healed on a delete→recreate (the exact LB6 gap) and
+ * Deferred resolution covers all four legs of
+ * {@link resolveWikilinkDetailed} (exact path, basename, H1 title, explicit
+ * `path.ext`) plus, for structured-link pending rows, the ID leg of
+ * {@link resolveLinkTargetDetailed} (vault#591). Verify picks the resolver
+ * by `row.relationship` so a wikilink row cannot heal via ID. (Caveat: the
+ * candidate pre-filter below matches the title/ext legs via SQL
+ * `COLLATE NOCASE`, which case-folds ASCII only — a non-ASCII title
+ * differing from the target only in letter case is missed at the candidate
+ * stage and re-heals on the source's next save instead. Rare; tracked as a
+ * follow-up.) Before this, the sweep matched a pending row to the new note
+ * by PATH TEXT ONLY (`target_path = path OR path LIKE '%/'||target_path`)
+ * — so a `[[John Doe]]` that resolved at write time via the H1-title
+ * fallback (its note's displayed title differs from its path, e.g.
+ * `people/jdoe`), or a `[[Foo.csv]]` that resolved via the extension leg,
+ * silently never re-healed on a delete→recreate (the exact LB6 gap) and
  * more broadly never backfilled when the target note was created AFTER the
- * referencing note. Each candidate pending row is now VERIFIED through
- * `resolveWikilinkDetailed` against the current DB — a row is healed only
- * when its target string actually resolves to THIS note. An AMBIGUOUS target
- * (≥2 notes now share the path/title) resolves to neither and stays queued,
- * identical to write-time's "don't guess" contract — this also closes the
- * pre-existing asymmetry where the path-only sweep would link an ambiguous
- * `[[Foo]]` to whichever colliding note happened to be created.
+ * referencing note. An AMBIGUOUS target (≥2 notes now share the
+ * path/title) resolves to neither and stays queued, identical to
+ * write-time's "don't guess" contract — this also closes the pre-existing
+ * asymmetry where the path-only sweep would link an ambiguous `[[Foo]]` to
+ * whichever colliding note happened to be created.
  *
  * Returns the number of links resolved.
  */
@@ -666,19 +667,45 @@ export function resolveUnresolvedWikilinks(
   let rows: { source_id: string; target_path: string; relationship: string }[];
   try {
     // Candidate pre-filter: every pending row whose `target_path` COULD
-    // resolve to this note under any resolveWikilinkDetailed leg — exact
-    // path, basename (target is the last path segment), H1 title, or the
-    // `path.ext` form. A `null` bind (no H1 heading / no extension) makes its
-    // clause never match (`target_path = NULL` is NULL, i.e. falsy in SQL).
-    // The verify step below is what enforces correctness; this clause only
-    // BOUNDS how many rows reach the (title-fallback-scanning) resolver.
+    // resolve to this note under any resolveLinkTargetDetailed leg — exact
+    // path, basename (target is the last path segment), H1 title, the
+    // `path.ext` form, or a raw note ID (vault#591: typed `reference` fields
+    // and ID-form structured links). A `null` bind (no H1 heading / no
+    // extension) makes its clause never match (`target_path = NULL` is NULL,
+    // i.e. falsy in SQL). The verify step below is what enforces correctness;
+    // this clause only BOUNDS how many rows reach the resolver.
     rows = db.prepare(`
       SELECT source_id, target_path, relationship FROM unresolved_wikilinks
       WHERE target_path = ? COLLATE NOCASE
          OR ? LIKE '%/' || target_path
          OR target_path = ? COLLATE NOCASE
          OR target_path = ? COLLATE NOCASE
-    `).all(notePath, notePath, h1Title, pathDotExt) as typeof rows;
+         OR target_path = ?
+    `).all(notePath, notePath, h1Title, pathDotExt, noteId) as typeof rows;
+
+    // vault#589: SQLite COLLATE NOCASE is ASCII-only. `[[CAFÉ]]` vs H1
+    // `café` is excluded by the SQL pre-filter even though
+    // findNotesByTitle folds with JS toLowerCase. Union remaining pending
+    // rows whose target Unicode-folds equal to the H1; verify still
+    // decides. The path.ext fold is omitted: write-time's extension leg
+    // also uses COLLATE NOCASE on path, so a unicode-only path.ext miss
+    // would fail verify too. (`[[FOO.CSV]]` vs `foo.csv` is ASCII and
+    // already caught by the SQL clause.)
+    if (h1Title) {
+      const all = db.prepare(
+        "SELECT source_id, target_path, relationship FROM unresolved_wikilinks",
+      ).all() as typeof rows;
+      const seen = new Set(rows.map((r) => `${r.source_id}\0${r.target_path}\0${r.relationship}`));
+      const h1 = h1Title.toLowerCase();
+      for (const row of all) {
+        const key = `${row.source_id}\0${row.target_path}\0${row.relationship}`;
+        if (seen.has(key)) continue;
+        if (row.target_path.toLowerCase() === h1) {
+          rows.push(row);
+          seen.add(key);
+        }
+      }
+    }
   } catch {
     return 0; // Table doesn't exist
   }
@@ -694,10 +721,17 @@ export function resolveUnresolvedWikilinks(
     // target string actually resolves to THIS note now. A miss or an
     // ambiguous result leaves the row queued (surfaced as a visible broken
     // link, and re-tried on the next matching note create).
-    const detail = resolveWikilinkDetailed(db, row.target_path);
-    if (!detail.resolved || detail.note_id !== noteId) continue;
-
+    // Resolver is picked by relationship (vault#591): wikilink rows go
+    // through resolveWikilinkDetailed (write-time has no ID leg).
+    // Structured-link rows go through resolveLinkTargetDetailed
+    // (ID-then-path). A shared ID-first resolver over-heals `[[foo591]]`
+    // against a later note with that id, and lets a decoy whose id equals
+    // the bracket text steal a pending wikilink from a later titled note.
     const relationship = row.relationship || WIKILINK_REL;
+    const detail = relationship === WIKILINK_REL
+      ? resolveWikilinkDetailed(db, row.target_path)
+      : resolveLinkTargetDetailed(db, row.target_path);
+    if (!detail.resolved || detail.note_id !== noteId) continue;
     linkOps.createLink(db, row.source_id, noteId, relationship);
     resolved++;
 

@@ -238,6 +238,14 @@ describe("BunStore", async () => {
     expect(results.map((n) => n.path)).toContain("Projects/Parachute/README");
     expect(results.map((n) => n.path)).toContain("Projects/Parachute/Notes");
   });
+
+  test("queryNotes excludePathPrefix drops matching paths (vault#628)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("bare");
+    const results = await store.queryNotes({ excludePathPrefix: [".parachute/"] });
+    expect(results.map((n) => n.content).sort()).toEqual(["bare", "user"]);
+  });
 });
 
 describe("metadata", async () => {
@@ -1877,11 +1885,16 @@ describe("scoped MCP wrapper", async () => {
     // note, so it's not a schema-shape indicator.)
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain("fizzbuzz");
-    // The tag NAME must be gone from validation_status specifically. NOTE:
-    // it still appears in the note's `.tags` array — that's PRE-EXISTING
-    // scoped-read behavior (noteWithinTagScope has never scrubbed a returned
-    // note's tag set), independent of fix 3, and out of scope for this fix.
+    // The tag NAME must be gone from validation_status specifically.
+    // (Historical note: this assertion used to be narrowed to
+    // `validation_status` because the name STILL appeared in the note's
+    // `.tags` array — pre-existing scoped-read behavior, filed as vault#568
+    // and out of scope for fix 3. #568 has since scrubbed `.tags` too, so
+    // the name is now absent from the whole response; the narrow assertion
+    // is kept as-is because it pins THIS fix's field specifically.
+    // `tag-scope-note-tags.test.ts` owns the `.tags` coverage.)
     expect(JSON.stringify(result.validation_status)).not.toContain("project-manhattan");
+    expect(result.tags).toEqual(["work"]);
 
     // The in-scope tag's own warning DOES survive.
     const vs = result.validation_status;
@@ -2496,6 +2509,20 @@ describe("HTTP /notes", async () => {
     expect(body.preview).toBe("hello");
   });
 
+  test("GET /notes?exclude_path_prefix=.parachute/ drops system-space (vault#628)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("bare");
+    const res = await handleNotes(
+      mkReq("GET", "/notes?exclude_path_prefix=.parachute/&include_content=true"),
+      store,
+      "",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content).sort()).toEqual(["bare", "user"]);
+  });
+
   test("GET /notes?include_metadata=false strips metadata from list", async () => {
     await store.createNote("a", { tags: ["m"], metadata: { summary: "hello", status: "ok" } });
     await store.createNote("b", { tags: ["m"], metadata: { summary: "world" } });
@@ -2528,6 +2555,14 @@ describe("HTTP /notes", async () => {
     const res = await handleNotes(mkReq("GET", "/notes/xm2?include_metadata=summary"), store, "/xm2");
     const body = await res.json() as any;
     expect(body.metadata).toEqual({ summary: "s" });
+  });
+
+  test("GET /notes?include_metadata=nonexistent keeps metadata: {} (vault#600)", async () => {
+    await store.createNote("a", { tags: ["m600"], metadata: { summary: "hello" } });
+    const res = await handleNotes(mkReq("GET", "/notes?tag=m600&include_metadata=nonexistent"), store, "");
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0]).toHaveProperty("metadata", {});
   });
 
   test("GET /notes/:id?expand_links=true inlines wikilink content", async () => {

@@ -51,7 +51,7 @@ export const MCP_TOOL_MANIFEST: readonly McpToolManifestEntry[] = [
       description: `Query notes. Returns notes matching the given filters.
 
 - **Single note**: pass \`id\` (accepts note ID, path, e.g., "Projects/README", or — as a last-resort fallback when id/path both miss cleanly and exactly one note matches — its H1 title, e.g. "Weekly Review")
-- **Filter**: pass \`tag\`, \`path\`, \`path_prefix\`, \`search\`, \`metadata\`, date range
+- **Filter**: pass \`tag\`, \`path\`, \`path_prefix\`, \`exclude_path_prefix\`, \`search\`, \`metadata\`, date range
 - **Graph neighborhood**: pass \`near\` to scope results to notes within N hops of an anchor note
 - **No filters**: returns all notes (paginated)
 
@@ -123,6 +123,20 @@ Response shape (vault#550 — three variants, pick by what you passed):
           has_broken_links: { type: "boolean", description: "Presence filter (vault#555): true = only notes with at least one dangling outbound link — a [[wikilink]] or structured `links` target that never resolved to a note; false = only notes with none. Backed by the unresolved_wikilinks table (same data `doctor`/list-unresolved surfaces); safe on a vault where no link has ever gone unresolved (true matches nothing, false is a no-op)." },
           path: { type: "string", description: "Exact path match (case-insensitive)" },
           path_prefix: { type: "string", description: "Path prefix match (e.g., 'Projects/')" },
+          exclude_path_prefix: {
+            oneOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description: "Exclude notes whose path matches any of these prefixes (vault#628). Same matching as `path_prefix`. Repeatable. A note with no path is not excluded. First client: `.parachute/` system-space. Alias `excludePathPrefix` is also accepted.",
+          },
+          excludePathPrefix: {
+            oneOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description: "Alias for `exclude_path_prefix` (camelCase).",
+          },
           extension: {
             oneOf: [
               { type: "string" },

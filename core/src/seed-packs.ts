@@ -780,6 +780,32 @@ matter to the operator; surface the indexed fields they filter on. If the vault
 doesn't yet have the structure a surface wants, that's a signal to design tags +
 schemas first.
 
+## Deploying your surface
+
+A surface is a **static build** — there's no server to run. \`bun run build\`
+produces a \`dist/\` of plain HTML/JS/CSS that any static host serves: GitHub
+Pages, Cloudflare Pages, Netlify, an S3 bucket.
+
+For **GitHub Pages**, push the BUILT FILES to a \`gh-pages\` branch (or a
+\`docs/\` folder on your default branch) and point Settings → Pages at it.
+Deliberately: **don't reach for an Actions workflow.** Some agent GitHub
+integrations can't write \`.github/workflows/*\` — the push comes back 403 —
+and a static build doesn't need CI at all. Build locally, publish the output.
+
+Two things must line up or the deployed surface will load and then fail to
+sign in:
+
+- the **hub origin** your surface points at has to be reachable from wherever
+  the browser is (a \`localhost\` hub won't answer a page served from GitHub
+  Pages);
+- that surface's **origin must be trusted by the hub** for CORS + as an OAuth
+  redirect origin.
+
+Both trace back to the same place the \`createVaultSurface\` config above does:
+\`vault-info\`'s **"This vault's coordinates"** block reports this vault's hub
+origin and name. If sign-in fails from the deployed URL but works from
+\`localhost\`, suspect the origin allowlist before the code.
+
 ## Adapt this note
 
 When you build a surface for this vault, record it here: what it's for, the
@@ -1045,6 +1071,12 @@ export interface ApplySeedPackResult {
  * rows — so a re-run can never duplicate, and never clobbers a note the
  * operator/AI has since edited or recreated.
  *
+ * The per-note check is check-then-create, so two appliers running at once
+ * can both see "absent" and both try to create. The loser's path-UNIQUE
+ * rejection is caught and reported as a SKIP (vault#527) — same outcome the
+ * non-racing branch reports, because the note it would have written is there.
+ * Only a path conflict is absorbed; see `isPathConflict`.
+ *
  * **Tag description preservation** (Aaron-ratified 2026-07-17): a pack writes
  * a tag's `description` only when (a) the tag has no prior description (new
  * tag, or an existing bare row nothing ever described), or (b) the prior
@@ -1112,13 +1144,50 @@ export async function applySeedPack(
       result.skippedNotes.push(note.path);
       continue;
     }
-    await store.createNote(note.content, {
-      path: note.path,
-      tags: note.tags,
-      metadata: note.metadata,
-    });
+    try {
+      await store.createNote(note.content, {
+        path: note.path,
+        tags: note.tags,
+        metadata: note.metadata,
+      });
+    } catch (err) {
+      // Lost a check-then-create race (vault#527). The `getNoteByPath` above
+      // said absent, but another applier committed that path before our
+      // insert landed, and the path UNIQUE index rejected us. The OUTCOME is
+      // the one this applier already promises — a note exists at that path
+      // and we didn't clobber it — so report it the same way the non-racing
+      // branch does, as a skip, rather than aborting the pack mid-way with a
+      // raw constraint error the operator can only answer by re-running.
+      //
+      // Narrow by design: ONLY a path conflict is absorbed. Any other create
+      // failure still propagates, per this function's "errors propagate"
+      // contract above.
+      if (!isPathConflict(err)) throw err;
+      result.skippedNotes.push(note.path);
+      continue;
+    }
     result.seededNotes.push(note.path);
   }
 
   return result;
+}
+
+/**
+ * Is this the store's "a note already uses that path" rejection?
+ *
+ * Duck-typed on the STABLE `error_type` / `code` contract (vault#554) rather
+ * than `instanceof PathConflictError`, because this module is deliberately
+ * import-type-only — it carries no runtime dependency on `notes.ts`/`bun:sqlite`
+ * so the cloud Durable Object can share it. Both fields are pinned public API
+ * on the self-host class and on the REST/MCP error mapping, so matching them
+ * is not a guess about internals.
+ */
+function isPathConflict(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { error_type?: unknown; code?: unknown; name?: unknown };
+  return (
+    e.error_type === "path_conflict" ||
+    e.code === "PATH_CONFLICT" ||
+    e.name === "PathConflictError"
+  );
 }

@@ -122,6 +122,14 @@ describe("live-match — predicate parity with the query engine", () => {
     expect(ids.size).toBe(2);
   });
 
+  it("excludePathPrefix (vault#628)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("bare");
+    const ids = await assertParity({ excludePathPrefix: [".parachute/"] });
+    expect(ids.size).toBe(2);
+  });
+
   it("hasTags true/false (M1 — presence parity)", async () => {
     await store.createNote("tagged", { tags: ["x"] });
     await store.createNote("bare", {});

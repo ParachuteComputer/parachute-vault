@@ -52,6 +52,7 @@ import {
   ATTACHMENT_MIME_TYPES,
   sanitizeAttachmentExtension,
   mimeForAttachmentExtension,
+  contentTypeForAttachmentPath,
 } from "./attachment/policy.js";
 import {
   computeTicketTtlMs,
@@ -818,6 +819,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             hasBrokenLinks: params.has_broken_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
+            excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
             extension: params.extension as string | string[] | undefined,
             metadata: params.metadata as Record<string, unknown> | undefined,
             createdBy: params.created_by as string | undefined,
@@ -939,6 +941,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             hasBrokenLinks: params.has_broken_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
+            excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
             extension: params.extension as string | string[] | undefined,
             // Same `near[]` neighborhood push-down `search`/structured-query
             // use — a semantic query can be scoped to a graph neighborhood too.
@@ -985,6 +988,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           }
           // Normalize tag param
           const tags = normalizeTags(params.tag);
+          const excludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
+          const excludeTags = normalizeTags(excludeTagsRaw);
           const mode: SearchMode = searchMode ?? "literal";
           // "Only whitespace/quotes" (vault#551 edge case): short-circuit
           // BEFORE ever calling FTS5 — an empty/all-punctuation phrase can
@@ -1004,10 +1009,35 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // `invalid_search_syntax`, vault#551) — uncaught on purpose, it
             // propagates to `src/mcp-http.ts`, which maps it to a JSON-RPC
             // error the same way it maps `invalid_query`.
+            // vault#647: forward the same QueryOpts the structured /
+            // semantic branches already pass. Pre-fix only tags/limit/
+            // expand/mode/sort reached searchNotes, so exclude_tags and
+            // date_from were silently dropped (a well-formed result set
+            // answering a different question).
             results = await store.searchNotes(params.search as string, {
               tags,
-              limit: (params.limit as number) ?? 50,
+              tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
               expand,
+              excludeTags,
+              hasTags: params.has_tags as boolean | undefined,
+              hasLinks: params.has_links as boolean | undefined,
+              hasBrokenLinks: params.has_broken_links as boolean | undefined,
+              path: params.path as string | undefined,
+              pathPrefix: params.path_prefix as string | undefined,
+              excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
+              extension: params.extension as string | string[] | undefined,
+              ids: nearScope ? [...nearScope] : undefined,
+              metadata: params.metadata as Record<string, unknown> | undefined,
+              createdBy: params.created_by as string | undefined,
+              lastUpdatedBy: params.last_updated_by as string | undefined,
+              createdVia: params.created_via as string | undefined,
+              lastUpdatedVia: params.last_updated_via as string | undefined,
+              dateFrom: params.date_from as string | undefined,
+              dateTo: params.date_to as string | undefined,
+              dateFilter: params.date_filter as
+                | { field?: string; from?: string; to?: string }
+                | undefined,
+              limit: (params.limit as number) ?? 50,
               mode,
               sort: params.sort as "asc" | "desc" | undefined,
             });
@@ -1063,6 +1093,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             hasBrokenLinks: params.has_broken_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
+            excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
             extension: params.extension as string | string[] | undefined,
             // Push the near-scope into the SQL WHERE so that LIMIT and ORDER
             // BY apply to the neighborhood. Without this, queryNotes would
@@ -1103,8 +1134,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // requested, so `next_cursor` never surfaces as an honest
             // "more may follow" signal — this is that signal. Mirrors the
             // REST structured-query path in src/routes.ts.
-            if (results.length === queryOpts.limit) {
-              queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
+            if (queryOpts.offset === undefined && results.length === queryOpts.limit) {
+              queryWarnings.push(truncatedResultsWarning(queryOpts.limit, "mcp"));
             }
           }
         }
@@ -2632,6 +2663,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const now = Date.now();
           const expiresAt = now + computeTicketTtlMs(declaredSize);
           const id = generateTicketId();
+          const downloadMime = contentTypeForAttachmentPath(attachment.path);
           const ticket: AttachmentTicket = {
             id,
             kind: "download",
@@ -2639,7 +2671,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             createdAt: now,
             expiresAt,
             attachmentId: attachment.id,
-            mimeType: attachment.mimeType,
+            mimeType: downloadMime,
             sizeBytes: declaredSize,
           };
           await ticketSeam.provider.put(ticket);
@@ -2648,7 +2680,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           return {
             method: "GET",
             url,
-            mime_type: attachment.mimeType,
+            mime_type: downloadMime,
             ...(declaredSize !== undefined ? { size_bytes: declaredSize } : {}),
             expires_at: new Date(expiresAt).toISOString(),
             curl_example: `curl -o downloaded${sanitizeAttachmentExtension(attachment.path) || ""} '${url}'`,
