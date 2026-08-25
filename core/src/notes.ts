@@ -1507,6 +1507,11 @@ export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<
  * `indexed-fields.ts`'s `TYPE_MAP` — and a `TEXT`-backed field can't be
  * summed). `op: "count"` ignores `field`.
  *
+ * `op: "count"` with no `group_by` (vault#626) is the filtered total: one
+ * row `[{group: null, value: N}]` so list parsers keep a single shape.
+ * `op: "sum"` still requires `group_by`. An empty match set still returns
+ * that one row with `value: 0`, never `[]`.
+ *
  * A note whose group_by value is absent/null collects into one
  * `{group: null, ...}` row — standard SQL `GROUP BY` behavior, not silently
  * dropped.
@@ -1520,19 +1525,7 @@ export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
       {
         error_type: "invalid_query",
         field: "aggregate",
-        hint: `pass { group_by, op } — group_by is an indexed metadata field or "tag"; op is "count" or "sum"`,
-      },
-    );
-  }
-  if (typeof spec.group_by !== "string" || spec.group_by.length === 0) {
-    throw new QueryError(
-      `aggregate.group_by is required — an indexed metadata field name, or "tag"`,
-      "INVALID_QUERY",
-      {
-        error_type: "invalid_query",
-        field: "aggregate.group_by",
-        got: spec.group_by,
-        hint: `pass an indexed metadata field name, or "tag"`,
+        hint: `pass { op, group_by? } — op is "count" or "sum"; group_by is an indexed metadata field or "tag" (required for sum, optional for count)`,
       },
     );
   }
@@ -1541,6 +1534,23 @@ export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
       `invalid aggregate.op: ${JSON.stringify(spec.op)} — must be "count" or "sum"`,
       "INVALID_QUERY",
       { error_type: "invalid_query", field: "aggregate.op", got: spec.op, hint: `pass "count" or "sum"` },
+    );
+  }
+  const ungroupedCount = spec.op === "count" && spec.group_by === undefined;
+  if (!ungroupedCount && (typeof spec.group_by !== "string" || spec.group_by.length === 0)) {
+    throw new QueryError(
+      spec.op === "sum"
+        ? `aggregate.group_by is required when aggregate.op is "sum" — an indexed metadata field name, or "tag"`
+        : `aggregate.group_by is required — an indexed metadata field name, or "tag"`,
+      "INVALID_QUERY",
+      {
+        error_type: "invalid_query",
+        field: "aggregate.group_by",
+        got: spec.group_by,
+        hint: spec.op === "count"
+          ? `omit group_by for a filtered total, or pass an indexed metadata field name / "tag"`
+          : `pass an indexed metadata field name, or "tag"`,
+      },
     );
   }
   if (spec.op === "sum" && (typeof spec.field !== "string" || spec.field.length === 0)) {
@@ -1556,6 +1566,14 @@ export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
   }
 
   const { conditions, params } = buildFilterConditions(db, opts);
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  if (ungroupedCount) {
+    const row = db.prepare(
+      `SELECT COUNT(*) AS value FROM notes n ${whereClause}`,
+    ).get(...params) as { value: number | null } | null;
+    return [{ group: null, value: row?.value ?? 0 }];
+  }
 
   const groupByTag = spec.group_by === "tag";
   let groupExpr: string;
@@ -1567,7 +1585,7 @@ export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
     // `group_by` came from indexed_fields (validated via FIELD_NAME_RE at
     // declaration time), so interpolating the column name is safe — same
     // justification `orderBy`/`buildOperatorClause` use.
-    requireIndexedField(db, spec.group_by);
+    requireIndexedField(db, spec.group_by!);
     groupExpr = `"meta_${spec.group_by}"`;
     fromClause = "FROM notes n";
   }
@@ -1592,7 +1610,6 @@ export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
     valueExpr = `SUM("meta_${spec.field}")`;
   }
 
-  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const sql = `
     SELECT ${groupExpr} AS group_key, ${valueExpr} AS value
     ${fromClause}

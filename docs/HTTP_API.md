@@ -1068,31 +1068,44 @@ Query params:
 - **Cursor pagination** (see [Cursor pagination](#cursor-pagination--the-since-last-checked-pattern))
   - `cursor=<opaque>` — switches response to `{notes, next_cursor}`.
 
-- **Aggregation / rollup** — group_by + count/sum
-  - `aggregate[group_by]=<field|tag>&aggregate[op]=count|sum&aggregate[field]=<numeric field>` —
-    every OTHER filter above (`tag`, `meta[...]`/`metadata=`, date filters,
-    write-attribution, ...) narrows the input set FIRST, exactly as a normal
-    query would; the matching notes are then grouped and the response
-    becomes `[{group, value}]` — one row per group — instead of `NoteIndex[]`
-    / `Note[]`. `value` is the count (or sum, per `op`) for that group.
+- **Aggregation / rollup** — count/sum, optional group_by
+  - `aggregate[op]=count|sum` with optional `aggregate[group_by]=<field|tag>`
+    and `aggregate[field]=<numeric field>` — every OTHER filter above
+    (`tag`, `meta[...]`/`metadata=`, date filters, write-attribution, ...)
+    narrows the input set FIRST, exactly as a normal query would; the
+    matching notes are then grouped and the response becomes
+    `[{group, value}]` — one row per group — instead of `NoteIndex[]` /
+    `Note[]`. `value` is the count (or sum, per `op`) for that group.
+  - **Filtered total (vault#626):** `?aggregate[op]=count` with no
+    `group_by` returns `[{"group":null,"value":N}]` — the count of the
+    filtered set, including `value: 0` when nothing matches. Same row
+    shape as a grouped rollup so parsers need no second envelope. MCP
+    `query-notes` takes `{aggregate: {op: "count"}}`.
   - `aggregate[group_by]` is either the special value `tag` (group by tag
     MEMBERSHIP — a note carrying N of the tags present in the filtered
     result set contributes to N separate groups; a membership rollup, not a
     partition) or an indexed metadata field name. A non-`"tag"` value must
     be declared `indexed: true` in a tag schema — same `FIELD_NOT_INDEXED`
-    contract `meta[field][op]=` operators and `order_by` use.
-  - `aggregate[op]=count` — number of matching notes per group.
-    `aggregate[op]=sum` additionally requires `aggregate[field]=<field>` — a
-    SECOND indexed metadata field, numeric (declared `type: "integer"` or
-    `type: "boolean"` — the only indexable numeric storage shapes; a bare
-    `type: "number"` field is never indexed, and a `TEXT`-backed field can't
-    be summed) — and sums that field's value per group.
+    contract `meta[field][op]=` operators and `order_by` use. Required for
+    `sum`; optional for `count`.
+  - `aggregate[op]=count` — number of matching notes per group, or the
+    filtered total when `group_by` is omitted.
+    `aggregate[op]=sum` additionally requires `aggregate[group_by]` and
+    `aggregate[field]=<field>` — a SECOND indexed metadata field, numeric
+    (declared `type: "integer"` or `type: "boolean"` — the only indexable
+    numeric storage shapes; a bare `type: "number"` field is never indexed,
+    and a `TEXT`-backed field can't be summed) — and sums that field's
+    value per group.
   - A note whose `group_by` value is absent/unset collects into one
     `{group: null, value: ...}` row — standard SQL `GROUP BY` behavior, not
-    silently dropped from the rollup.
-  - **Mutually exclusive with `cursor` and `near[...]`** — a rollup has no
-    pagination watermark or graph-neighborhood shape to compose with;
-    combining either is `400 invalid_query` (`field: "aggregate"`).
+    silently dropped from the rollup. Ungrouped count always uses this
+    same `{group: null}` row for the total.
+  - **Mutually exclusive with `cursor`, `near[...]`, `search`, and
+    `semantic`** — a rollup has no pagination watermark, graph-neighborhood,
+    or ranked-search shape to compose with; combining any of them is
+    `400 invalid_query` (`field: "aggregate"`). REST used to silently
+    ignore `aggregate[...]` under `search=` and return note rows; both
+    doors now reject.
   - **Tag-scope respected.** A tag-scoped token's rollup is computed only
     over notes it can see — exactly like a normal query — AND, under
     `group_by: "tag"`, group NAMES themselves are scrubbed to the token's
@@ -1158,11 +1171,12 @@ Error shapes notable to callers:
   `indexed: true` in any tag schema. Same contract as `meta[field][op]=`
   operators and `order_by`.
 - `400 invalid_query` (`field: "aggregate"` / `"aggregate.field"` /
-  `"aggregate.op"`) — `aggregate[op]=sum` without `aggregate[field]`, an
-  unrecognized `aggregate[op]` value, `aggregate[group_by]`/`aggregate[op]`
-  passed without the other, `aggregate[field]` naming a non-numeric
-  (TEXT-backed) indexed field under `sum`, or `aggregate[...]` combined with
-  `cursor`/`near[...]`.
+  `"aggregate.op"` / `"aggregate.group_by"`) — `aggregate[op]=sum` without
+  `aggregate[field]` or without `aggregate[group_by]`, an unrecognized
+  `aggregate[op]` value, `aggregate[group_by]` without `aggregate[op]`,
+  `aggregate[field]` naming a non-numeric (TEXT-backed) indexed field under
+  `sum`, or `aggregate[...]` combined with
+  `cursor`/`near[...]`/`search`/`semantic`.
 
 Response may also carry a `warnings` field / `X-Parachute-Warnings` header —
 see [Honest queries](#honest-queries--warnings-channel--structured-invalids-vault550) above.
