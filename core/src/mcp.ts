@@ -757,7 +757,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         }
 
         // --- Aggregation / rollup mode (top new-feature ask from a UX round) ---
-        // Mutually exclusive with `search`/`near`/`cursor` — a rollup returns
+        // Mutually exclusive with `search`/`near`/`cursor`/`semantic` — a rollup returns
         // one row per group, not a paginated / graph-scoped / ranked note
         // list — so reject those combos loudly before touching the DB.
         if (params.aggregate) {

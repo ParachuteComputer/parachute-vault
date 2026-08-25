@@ -159,6 +159,15 @@ describe("REST GET /notes — aggregate errors", () => {
     expect(body.error_type).toBe("invalid_query");
   });
 
+  it("400s when aggregate is combined with semantic (no silent fall-through to rows)", async () => {
+    const res = await get("?semantic=true&near_text=hello&aggregate[op]=count");
+    expect(res.status).toBe(400);
+    const body: any = await res.json();
+    expect(body.field).toBe("aggregate");
+    expect(body.code).toBe("INVALID_QUERY");
+    expect(body.error_type).toBe("invalid_query");
+  });
+
   it("400s when sum has no group_by", async () => {
     await store.upsertTagRecord("expense", { fields: { amount: { type: "integer", indexed: true } } });
     const res = await get("?aggregate[op]=sum&aggregate[field]=amount");
