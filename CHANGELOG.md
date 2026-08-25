@@ -23,11 +23,13 @@ isolation that stopped the suite writing real vaults.** Everything merged to
   fields used to omit the key; clients that distinguish "no metadata" from
   "not projected" can now rely on an empty object.
 
-- **`in` / `not_in` bind as one `json_each` param (#676).** SQLite affinity
-  no longer disagrees with the column type for those operators.
+- **`in` / `not_in` bind as one `json_each` param (#676).** A >100-element
+  `in` used to 500 on Durable Object SQLite (100-param cap). The array is
+  now one `json_each` bind regardless of size; CAST restores the old
+  placeholder-list affinity so a numeric `5` still matches a TEXT `'5'`.
 
-- **Offset pagers no longer warn "truncated" (#665).** The warning was for
-  a capped first page; walking by `content_offset` is not that. MCP copy
+- **Query `offset` pagers no longer warn "truncated" (#665).** The warning
+  was for a capped first page; `limit` + `offset` is not that. MCP copy
   matches.
 
 - **Tag-scoped reads filter `.tags` to the in-scope subset (#674, closes
@@ -45,8 +47,9 @@ isolation that stopped the suite writing real vaults.** Everything merged to
   provider is no longer treated as runnable. Downloaded artifacts are
   checksum-verified; corrupt ones are repaired instead of transcribed.
 
-- **Lede skips fences, headings, and rules (#670).** Preview text no
-  longer starts at the first fenced block or heading underline.
+- **Lede skips fences, headings, and rules (#670).** `computeLede` /
+  `expand_mode: "summary"` no longer starts at the first fenced block or
+  heading underline. `NoteIndex.preview` is unchanged.
 
 - **Conformance counts every note on the tag (#671).** The first-100 cap
   was silently under-counting.
@@ -59,8 +62,9 @@ isolation that stopped the suite writing real vaults.** Everything merged to
   `PARACHUTE_HOME`; `configDirPath()` tripwires a test run that would fall
   through to `~/.parachute`. This is the 2026-08-22 test-vault leak.
 
-- **CI: Bun 1.4 floor (#679); next-targeted PRs run verification (#655).**
-  Docs: Render deploy story retired (#677).
+- **CI: Bun 1.4 floor (#679).** Docs: Render deploy story retired (#677).
+  (next-targeted PR CI, #655, already shipped in the 0.7.6 squash on
+  `main`.)
 
 ## [0.7.6] - 2026-08-22
 
