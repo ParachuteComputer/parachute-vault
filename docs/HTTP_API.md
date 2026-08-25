@@ -1103,9 +1103,10 @@ Query params:
   - **Mutually exclusive with `cursor`, `near[...]`, `search`, and
     `semantic`** — a rollup has no pagination watermark, graph-neighborhood,
     or ranked-search shape to compose with; combining any of them is
-    `400 invalid_query` (`field: "aggregate"`). REST used to silently
-    ignore `aggregate[...]` under `search=` and return note rows; both
-    doors now reject.
+    `400 invalid_query` (`field: "aggregate"`). Bun REST used to silently
+    ignore `aggregate[...]` under `search=` and return note rows; the bun
+    door now rejects. Cloud REST still has no `aggregate` parser — those
+    params are ignored and note rows come back (parachute-cloud#134 B.4).
   - **Tag-scope respected.** A tag-scoped token's rollup is computed only
     over notes it can see — exactly like a normal query — AND, under
     `group_by: "tag"`, group NAMES themselves are scrubbed to the token's
