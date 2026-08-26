@@ -15,7 +15,23 @@ commit on `next` after 0.7.7-rc.1 (`9ed846c`, vault#683 / towards #626).
 - REST `search=` + `aggregate` (and `semantic` + `aggregate`) is a 400 on
   the bun door. Cloud REST has no aggregate parser — parachute-cloud#134 B.4.
 
-Does not close #626 until the other door ships.
+Leaves #626 open until the other door ships.
+
+## [0.7.7] - 2026-08-26
+
+**Stable promotion of 0.7.7-rc.1.** No new code. Suffix-drop only. npm `@rc`
+is 0.7.7-rc.1; this is the matching `@latest`.
+
+Same contents as rc.1: FTS filters actually apply (#656), `exclude_path_prefix`
+(#658), empty `include_metadata` stays `{}` (#657), `in`/`not_in` one param
+(#676), offset pagers drop the bogus truncated warning (#665), tag-scoped
+`.tags` scrubbed to the in-scope subset (#674), wikilink ID forward-refs
+(#666) and unicode-fold titles (#668), transcription `--help` probe (#667)
+and download checksum repair (#673), lede skips fences (#670), conformance
+counts every note (#671), add-pack race (#672), ticket Content-Type from
+extension (#660), suite isolation (#678), Bun 1.4 floor (#679).
+
+Does **not** include `?aggregate[op]=count` (#683). That is 0.7.8-rc.1.
 
 ## [0.7.7-rc.1] - 2026-08-25
 
