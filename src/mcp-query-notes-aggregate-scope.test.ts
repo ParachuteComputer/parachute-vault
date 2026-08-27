@@ -154,6 +154,48 @@ describe("MCP query-notes aggregate × tag-scope — group_by \"tag\"", () => {
   });
 });
 
+describe("MCP query-notes aggregate — count without group_by (vault#626)", () => {
+  test("returns [{group: null, value: N}] for the filtered set", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("a", { tags: ["work"] });
+    await store.createNote("b", { tags: ["work"] });
+    await store.createNote("c", { tags: ["personal"] });
+
+    const tool = await queryNotesTool("journal", null);
+    expect(await tool.execute({ aggregate: { op: "count" } })).toEqual([
+      { group: null, value: 3 },
+    ]);
+    expect(await tool.execute({ tag: "work", aggregate: { op: "count" } })).toEqual([
+      { group: null, value: 2 },
+    ]);
+  });
+
+  test("a scoped token's total excludes out-of-scope notes", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("in", { tags: ["health"] });
+    await store.createNote("out 1", { tags: ["work"] });
+    await store.createNote("out 2", { tags: ["work"] });
+
+    const scopedTool = await queryNotesTool("journal", ["health"]);
+    expect(await scopedTool.execute({ aggregate: { op: "count" } })).toEqual([
+      { group: null, value: 1 },
+    ]);
+  });
+
+  test("a scoped token with no visible matches gets a zero total, not []", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("out-of-scope only", { tags: ["work"] });
+
+    const scopedTool = await queryNotesTool("journal", ["health"]);
+    expect(await scopedTool.execute({ aggregate: { op: "count" } })).toEqual([
+      { group: null, value: 0 },
+    ]);
+  });
+});
+
 describe("MCP query-notes aggregate — mutual exclusivity with search/near/cursor", () => {
   test("aggregate + search is rejected", async () => {
     seedVault("journal");

@@ -337,9 +337,13 @@ export interface AggregateSpec {
    * `"tag"` to group by tag membership. Under `"tag"`, a note carrying N of
    * the tags in the (filtered) result set contributes to N separate groups
    * — this is a membership rollup, not a partition.
+   *
+   * Optional when `op` is `"count"` (vault#626): omitting `group_by` returns
+   * a single filtered-total row `[{group: null, value: N}]` instead of a
+   * per-group rollup. Required for `"sum"`.
    */
-  group_by: string;
-  /** `"count"` — number of matching notes per group. `"sum"` — sum of `field` per group. */
+  group_by?: string;
+  /** `"count"` — number of matching notes per group (or the filtered total when `group_by` is omitted). `"sum"` — sum of `field` per group. */
   op: "count" | "sum";
   /**
    * Required when `op` is `"sum"`; ignored for `"count"`. Must be an

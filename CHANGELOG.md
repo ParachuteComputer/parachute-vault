@@ -4,6 +4,19 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.8-rc.1] - 2026-08-26
+
+**Filtered total via `?aggregate[op]=count` with no `group_by`.** The one
+commit on `next` after 0.7.7-rc.1 (`9ed846c`, vault#683 / towards #626).
+
+- **Bun door: `?aggregate[op]=count` (MCP `{op:"count"}`) returns
+  `[{group:null,value:N}]` over the same filter surface as the list.** Empty
+  match is the zero row, not `[]`. `sum` still requires `group_by`.
+- REST `search=` + `aggregate` (and `semantic` + `aggregate`) is a 400 on
+  the bun door. Cloud REST has no aggregate parser — parachute-cloud#134 B.4.
+
+Leaves #626 open until the other door ships.
+
 ## [0.7.7] - 2026-08-26
 
 **Stable promotion of 0.7.7-rc.1.** No new code. Suffix-drop only. npm `@rc`
