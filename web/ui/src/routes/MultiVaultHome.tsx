@@ -472,9 +472,10 @@ function CreatedBanner({ result, onDone }: { result: CreateVaultResult; onDone: 
           Vault <code>{result.name}</code> created — access token (shown once)
         </h4>
         <p className="muted">
-          A hub-issued JWT scoped <code>vault:{result.name}:admin</code>. This is the only time
-          it's shown — copy it somewhere safe. You don't need it for the OAuth connect path; for
-          a header-auth token later, mint a scope-narrow one with{" "}
+          A hub-issued JWT scoped <code>vault:{result.name}:admin</code>, shown only this once.{" "}
+          {result.tokenGuidance ??
+            "It is short-lived — don't bank it as a durable credential. You don't need it for the OAuth connect path."}{" "}
+          For a durable header-auth token, mint a scope-narrow one with{" "}
           <code>parachute auth mint-token --scope vault:{result.name}:read</code>.
         </p>
         <div className="token-box">
