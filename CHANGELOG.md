@@ -4,6 +4,13 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.8-rc.2] - 2026-08-29
+
+**Release workflow now publishes rc's directly from `next`** (vault#688,
+`parachute-hub#911`'s sibling) — no more `next`→`main` PR just to fire the
+publish trigger. `main` is unaffected; stable promotion still requires its
+own PR there. This rc exists to exercise that new trigger end-to-end.
+
 ## [0.7.8-rc.1] - 2026-08-26
 
 **Filtered total via `?aggregate[op]=count` with no `group_by`.** The one
