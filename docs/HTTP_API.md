@@ -852,10 +852,14 @@ Query params:
     for larger batches call multiple times.
 
 - **Tag / link / structural filters**
-  - `tag=foo&tag=bar` — repeat to pass multiple.
+  - `tag=foo,bar` — comma-list to pass multiple. Repeating the param
+    (`tag=foo&tag=bar`) does NOT accumulate — the parser takes the first
+    occurrence only, silently.
   - `tag_match=all|any` — default `all` (or `any` when more than one tag
     is supplied without an explicit `tag_match`).
-  - `exclude_tag=foo` — exclude notes carrying this tag.
+  - `exclude_tag=foo` — exclude notes carrying this tag. Comma-list form
+    (`exclude_tag=foo,bar`); repeated params take the first occurrence
+    only.
   - `has_tags=true|false`, `has_links=true|false`.
   - `has_broken_links=true|false` — presence filter on dangling outbound
     links (vault#555): `true` returns only notes with at least one
