@@ -5,7 +5,7 @@ Releases are automated via [`.github/workflows/release.yml`](./.github/workflows
 1. Runs `bun run typecheck` + `bun test ./src/`
 2. Publishes to npm (with provenance attestation, via Trusted Publishing OIDC)
 
-`next` only ever publishes an rc — a stable (non-`-rc.`) version pushed to `next` is skipped with a `::warning::`, not published; stable promotion is still a dedicated PR to `main` (see below). Pushing a git tag still works as an explicit override — useful for a re-release, or a version that predates this workflow's publish-on-merge behavior.
+`next` only ever publishes an rc — a stable (non-`-rc.`) version pushed to `next` **or pushed as a git tag** is skipped with a `::warning::`, not published; stable promotion is still a dedicated PR to `main` (see below). A write token can merge to `next` and can push tags; it cannot merge to `main`. Pushing an **rc** git tag still works as an explicit override — useful for a re-release of an rc, or a version that predates this workflow's publish-on-merge behavior.
 
 Vault has no container image artifact — the `ghcr.io` step that ships with the hub workflow is intentionally omitted here. If a vault image ever becomes useful, add a `publish-image` job mirroring hub's.
 
@@ -81,7 +81,7 @@ There's no "unpublish" path for npm (strict 72-hour unpublish policy that you sh
 ## Troubleshooting
 
 - **Workflow doesn't trigger**: for the merge path, confirm the merge landed on `next` or `main`, and that it touched `package.json` (the `paths` filter — a merge that doesn't bump the version never fires this workflow, by design). For a tag push, confirm the tag matches the workflow's `on.push.tags` pattern (`v[0-9]+.[0-9]+.[0-9]+` or `v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+`).
-- **Workflow ran on `next` but nothing published, and it wasn't already on npm**: check for a `::warning::` in the `plan` job log — a stable (non-`-rc.`) version pushed to `next` is skipped on purpose. Retarget the release PR to `main`.
+- **Workflow ran on `next` (or on a stable tag) but nothing published, and it wasn't already on npm**: check for a `::warning::` in the `plan` job log — a stable (non-`-rc.`) version on `next` or from a tag push is skipped on purpose. Retarget the release PR to `main`.
 - **`version mismatch` error in publish-npm**: tag path only — package.json version differs from the tag. Re-tag the correct commit.
 - **`npm ERR! 403 You do not have permission to publish`**: Trusted Publisher rule on npm doesn't match this workflow. Verify org/repo/workflow filename are exactly `ParachuteComputer` / `parachute-vault` / `release.yml`. If the workflow file was renamed, the rule needs updating on npm.
 - **`npm ERR! 401 Unauthorized` with no OIDC token**: the workflow is missing `permissions: id-token: write` at the job level. Verify the YAML.
