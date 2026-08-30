@@ -5,13 +5,13 @@
 #
 # Same bottleneck hub had: an rc cut needed a version-bump PR into `next`,
 # then a SECOND `next`→`main` PR just to fire this trigger. Adding `next`
-# here removes that hop for rc's. Unlike hub, this workflow's publish
-# decision is inline shell, not a tested decidePublish() — so `next` AND
-# tag-pushes of a non-rc version are skipped below, not published, with a
-# `::warning::` explaining why. A write token can merge to `next` and can
-# push tags; it cannot merge to `main`. `main` is unchanged — still
-# publishes rc OR stable, exactly as before, so stable promotion still
-# needs its own PR to `main` (RELEASING.md). Rc tag-pushes still publish.
+# here removes that hop for rc's. `decidePublish()` in `scripts/release-plan.ts`
+# takes the trigger branch and refuses to publish a stable (non-`-rc.`)
+# unless that trigger is a branch push of `main`. A tag push of a stable is
+# also refused — a write token can push a tag; it cannot merge to `main`.
+# `main` is unchanged — still publishes rc OR stable, exactly as before, so
+# stable promotion still needs its own PR to `main` (RELEASING.md). Rc
+# tag-pushes still override the registry guards.
 #
 # ## Why this changed (2026-07-29)
 #
@@ -94,6 +94,12 @@ concurrency:
 jobs:
   # ---------------------------------------------------------------------------
   # Decide whether there is anything to publish, BEFORE spending a test run.
+  #
+  # The decision lives in `scripts/release-plan.ts` (unit-tested — the
+  # previous inline shell treated a package-level 404 the same as a
+  # version-level 404, which is the surface#220 / hub#930 / app#189
+  # first-publish hole). `--tag-push` on tag triggers, same as hub/app:
+  # without it a deliberate rc re-release is skipped as already-published.
   # ---------------------------------------------------------------------------
   plan:
     name: plan
@@ -111,71 +117,18 @@ jobs:
         name: compare package.json version against npm
         run: |
           set -euo pipefail
-          VERSION=$(bun -e "console.log(require('./package.json').version)")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          # rc vs stable is derived from the version string itself, so
-          # promoting to `latest` stays a deliberate act in a PR.
-          if [[ "$VERSION" =~ -rc\. ]]; then
-            echo "dist_tag=rc" >> "$GITHUB_OUTPUT"
-          else
-            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
-          fi
-
-          # An rc tag push is an explicit "release this rc" — honour it. npm
-          # will refuse a true duplicate, which is the correct failure. A
-          # tag push of a stable is not the same as merging to `main`: a
-          # write token can push a tag, and that used to publish `@latest`.
+          # Keep the tag↔package.json identity check the shell had: a
+          # mistagged vX.Y.Z that doesn't match package.json must fail
+          # closed, not publish whatever happens to be in package.json.
           if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION=$(bun -e "console.log(require('./package.json').version)")
             TAG_VERSION="${GITHUB_REF_NAME#v}"
             if [ "$VERSION" != "$TAG_VERSION" ]; then
               echo "::error::package.json version ($VERSION) doesn't match tag ($TAG_VERSION)"
               exit 1
             fi
-            if [[ ! "$VERSION" =~ -rc\. ]]; then
-              echo "::warning::@openparachute/vault@$VERSION is a stable version from a tag push — skipping. Stable promotions publish from main only (RELEASING.md)."
-              echo "should_publish=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
-            echo "Tag push for $VERSION — publishing."
-            exit 0
           fi
-
-          # `next` only ever cuts rc's — this workflow has no equivalent of
-          # hub's decidePublish() gating a stable publish on an existing
-          # matching rc, so a stable version merged to `next` (by mistake,
-          # or a PR mistargeted mid-promotion) must be caught here instead
-          # of falling through to npm. `main` is untouched: it still
-          # publishes rc OR stable, whatever's in package.json, same as
-          # before this change.
-          # (github.ref_type is guaranteed not "tag" here — that case already
-          # exited above.)
-          if [ "${{ github.ref_name }}" = "next" ] && [[ ! "$VERSION" =~ -rc\. ]]; then
-            echo "::warning::@openparachute/vault@$VERSION is a stable version pushed to next — skipping. Stable promotions publish from main only (RELEASING.md)."
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Branch push: publish only if this exact version isn't on npm yet.
-          # The REGISTRY is the source of truth rather than the tag list —
-          # what matters is whether the artifact exists, not whether anyone
-          # remembered to record it.
-          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
-            "https://registry.npmjs.org/@openparachute%2fvault/$VERSION" || echo "000")
-          if [ "$CODE" = "200" ]; then
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            echo "@openparachute/vault@$VERSION is already published — nothing to do."
-          elif [ "$CODE" = "404" ]; then
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
-            echo "@openparachute/vault@$VERSION is not on npm — will publish."
-          else
-            # Anything else (network blip, registry 5xx) is ambiguous. Refuse
-            # rather than guess: a false "not published" would double-publish,
-            # and a false "published" would silently skip a real release.
-            echo "::error::couldn't determine whether $VERSION is published (HTTP $CODE) — refusing to guess"
-            exit 1
-          fi
+          bun scripts/release-plan.ts . @openparachute/vault ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
 
   test:
     name: test
