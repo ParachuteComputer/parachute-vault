@@ -4,6 +4,16 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.9-rc.1] - 2026-08-30
+
+**Query filters tell the truth.** Two silent-wrong-answer bugs from #659, plus the token-guidance banner. Line is 0.7.9 because npm `@latest` is already 0.7.8 (suffix-drop of 0.7.8-rc.2).
+
+- **Repeated query params accumulate; path prefixes match literally (#694, closes #659).** `parseQueryList` now `getAll()` + comma-flatten, so `?tag=a&tag=b`, `?tag=a,b`, and the mixed form all compose (same for `exclude_tag` / `exclude_path_prefix`). `pathPrefix` / `excludePathPrefix` LIKE-escape `%`/`_` via the existing helper with `ESCAPE '\'` — `path_prefix=_tags/` no longer also matches `atags/…`. MCP inherits through the shared `buildFilterConditions`. Reverses the first-occurrence wording #693 documented yesterday.
+- **CreatedBanner renders hub `token_guidance` (#692, towards #663).** Stops telling operators to bank a 15-minute token.
+- Also on `next` since rc.2: stables publish from `main` only (#690).
+
+Do not suffix-drop 0.7.9 until this rc has lived.
+
 ## [0.7.8-rc.2] - 2026-08-29
 
 **Release workflow now publishes rc's directly from `next`** (vault#688,
