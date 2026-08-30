@@ -2523,6 +2523,79 @@ describe("HTTP /notes", async () => {
     expect(body.map((n) => n.content).sort()).toEqual(["bare", "user"]);
   });
 
+  // vault#659 — repeated query params used to take the first occurrence
+  // only (`searchParams.get()` + comma-split), so `?tag=a&tag=b` silently
+  // filtered by `a` alone. Both forms accumulate now, and they compose.
+  test("GET /notes?tag=a&tag=b accumulates repeated params (vault#659)", async () => {
+    await store.createNote("only-a", { tags: ["ta"] });
+    await store.createNote("only-b", { tags: ["tb"] });
+    await store.createNote("neither", { tags: ["tc"] });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?tag=ta&tag=tb&include_content=true"),
+      store,
+      "",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any[];
+    // >1 tag without an explicit tag_match defaults to "any".
+    expect(body.map((n) => n.content).sort()).toEqual(["only-a", "only-b"]);
+  });
+
+  test("GET /notes?tag=a,b&tag=c mixes comma-list and repeated params (vault#659)", async () => {
+    await store.createNote("only-a", { tags: ["ma"] });
+    await store.createNote("only-b", { tags: ["mb"] });
+    await store.createNote("only-c", { tags: ["mc"] });
+    await store.createNote("neither", { tags: ["md"] });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?tag=ma,mb&tag=mc&include_content=true"),
+      store,
+      "",
+    );
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content).sort()).toEqual(["only-a", "only-b", "only-c"]);
+  });
+
+  test("GET /notes?exclude_path_prefix repeated params accumulate (vault#659)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("tmp", { path: "Scratch/x" });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?exclude_path_prefix=.parachute/&exclude_path_prefix=Scratch/&include_content=true"),
+      store,
+      "",
+    );
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content)).toEqual(["user"]);
+  });
+
+  test("GET /notes?exclude_path_prefix mixes comma-list and repeated params (vault#659)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("tmp", { path: "Scratch/x" });
+    await store.createNote("arch", { path: "Archive/old" });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?exclude_path_prefix=.parachute/,Scratch/&exclude_path_prefix=Archive/&include_content=true"),
+      store,
+      "",
+    );
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content)).toEqual(["user"]);
+  });
+
+  // vault#659 — `_` is LIKE's single-char wildcard; an unescaped prefix
+  // silently pulled in neighbors that merely looked alike.
+  test("GET /notes?path_prefix=_tags/ escapes LIKE metachars (vault#659)", async () => {
+    await store.createNote("under", { path: "_tags/x" });
+    await store.createNote("decoy", { path: "atags/x" });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?path_prefix=_tags/&include_content=true"),
+      store,
+      "",
+    );
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content)).toEqual(["under"]);
+  });
+
   test("GET /notes?include_metadata=false strips metadata from list", async () => {
     await store.createNote("a", { tags: ["m"], metadata: { summary: "hello", status: "ok" } });
     await store.createNote("b", { tags: ["m"], metadata: { summary: "world" } });
