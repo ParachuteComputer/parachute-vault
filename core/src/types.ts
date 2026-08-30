@@ -190,7 +190,8 @@ export interface QueryOpts {
   pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
   /**
    * Exclude notes whose path matches any of these prefixes. Same matching
-   * as `pathPrefix` (`n.path LIKE prefix || '%'`, ASCII case-insensitive).
+   * as `pathPrefix` (`n.path LIKE prefix || '%' ESCAPE '\'`, ASCII
+   * case-insensitive; `%`/`_` in the prefix are escaped to literals).
    * Repeatable. A note with no path is not excluded (it isn't under the
    * prefix). vault#628 — `.parachute/` system-space is the first client.
    */

@@ -20,9 +20,13 @@
  *     freezes it for the snapshot query.
  *   - `excludeTags` — raw exact-name match (engine does NOT expand excludes).
  *   - `path` — case-insensitive exact (engine: `n.path = ? COLLATE NOCASE`).
- *   - `pathPrefix` — prefix (engine: `n.path LIKE prefix || '%'`).
+ *   - `pathPrefix` — prefix (engine: `n.path LIKE prefix || '%' ESCAPE '\'`).
+ *     The engine escapes `%`/`_` in the prefix (vault#659), so the prefix
+ *     matches literally — exactly what `startsWith` does here. Before that
+ *     fix the two paths genuinely diverged: `_tags/` matched `atags/…` in
+ *     SQL and not in the matcher.
  *   - `excludePathPrefix` — NOT those prefixes (engine: `n.path IS NULL OR
- *     n.path NOT LIKE prefix || '%'`). Repeatable. vault#628.
+ *     n.path NOT LIKE prefix || '%' ESCAPE '\'`). Repeatable. vault#628.
  *   - `extension` — lower-cased, default "md" (engine: `LOWER(n.extension)`),
  *     a note with no extension is treated as "md".
  *   - `metadata` operator objects (eq/ne/gt/gte/lt/lte/in/not_in/exists) +
