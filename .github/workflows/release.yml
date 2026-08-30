@@ -1,4 +1,17 @@
-# Release workflow — publishes on merge to main, and on an explicit tag push.
+# Release workflow — publishes on merge to `next` or `main`, and on an
+# explicit tag push.
+#
+# ## Why `next` was added (2026-08-29, parachute-hub#911's sibling)
+#
+# Same bottleneck hub had: an rc cut needed a version-bump PR into `next`,
+# then a SECOND `next`→`main` PR just to fire this trigger. Adding `next`
+# here removes that hop for rc's. Unlike hub, this workflow's publish
+# decision is inline shell, not a tested decidePublish() — so `next` AND
+# tag-pushes of a non-rc version are skipped below, not published, with a
+# `::warning::` explaining why. A write token can merge to `next` and can
+# push tags; it cannot merge to `main`. `main` is unchanged — still
+# publishes rc OR stable, exactly as before, so stable promotion still
+# needs its own PR to `main` (RELEASING.md). Rc tag-pushes still publish.
 #
 # ## Why this changed (2026-07-29)
 #
@@ -29,16 +42,19 @@
 #     exists on npm. Re-running, a revert, or a merge that didn't bump the
 #     version is a no-op — it cannot double-publish.
 #   - **Gated.** The full typecheck + test suite must pass first, unchanged.
-#   - **main only.** Other branches never publish.
+#   - **`next` and `main` only.** Other branches never publish. `next` is
+#     further restricted to rc versions only (see `plan` job). A tag push
+#     of a stable is also skipped — stables publish from `main` only.
 #   - **rc vs stable stays a human decision.** The dist-tag is derived from the
 #     version string, so promoting to `latest` still requires someone to
 #     deliberately drop the `-rc.N` suffix in a PR.
 #   - The tag is still created, as a RECORD of what shipped. Nothing triggers
 #     off it any more, so GITHUB_TOKEN pushing it is fine.
 #
-# The manual tag path still works and is unchanged — push `v0.7.5-rc.4` and it
-# publishes exactly as before. Useful for re-releasing, or for a version that
-# landed before this workflow existed.
+# The manual **rc** tag path still works — push `v0.7.5-rc.4` and it
+# publishes exactly as before. Useful for re-releasing an rc, or for a
+# version that landed before this workflow existed. A tag push of a
+# stable (`vX.Y.Z` with no `-rc.`) is skipped.
 #
 # ## Operator setup (one-time, unchanged)
 #
@@ -57,6 +73,12 @@ on:
   push:
     branches:
       - main
+      - next
+    # paths has no effect on tag pushes (GitHub only evaluates it for
+    # branch pushes), so the manual re-tag/re-release path below is
+    # unaffected by this filter.
+    paths:
+      - 'package.json'
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
@@ -100,16 +122,38 @@ jobs:
             echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
           fi
 
-          # A tag push is an explicit "release this" — honour it. npm will
-          # refuse a true duplicate, which is the correct failure.
+          # An rc tag push is an explicit "release this rc" — honour it. npm
+          # will refuse a true duplicate, which is the correct failure. A
+          # tag push of a stable is not the same as merging to `main`: a
+          # write token can push a tag, and that used to publish `@latest`.
           if [ "${{ github.ref_type }}" = "tag" ]; then
             TAG_VERSION="${GITHUB_REF_NAME#v}"
             if [ "$VERSION" != "$TAG_VERSION" ]; then
               echo "::error::package.json version ($VERSION) doesn't match tag ($TAG_VERSION)"
               exit 1
             fi
+            if [[ ! "$VERSION" =~ -rc\. ]]; then
+              echo "::warning::@openparachute/vault@$VERSION is a stable version from a tag push — skipping. Stable promotions publish from main only (RELEASING.md)."
+              echo "should_publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
             echo "Tag push for $VERSION — publishing."
+            exit 0
+          fi
+
+          # `next` only ever cuts rc's — this workflow has no equivalent of
+          # hub's decidePublish() gating a stable publish on an existing
+          # matching rc, so a stable version merged to `next` (by mistake,
+          # or a PR mistargeted mid-promotion) must be caught here instead
+          # of falling through to npm. `main` is untouched: it still
+          # publishes rc OR stable, whatever's in package.json, same as
+          # before this change.
+          # (github.ref_type is guaranteed not "tag" here — that case already
+          # exited above.)
+          if [ "${{ github.ref_name }}" = "next" ] && [[ ! "$VERSION" =~ -rc\. ]]; then
+            echo "::warning::@openparachute/vault@$VERSION is a stable version pushed to next — skipping. Stable promotions publish from main only (RELEASING.md)."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
