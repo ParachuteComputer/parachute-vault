@@ -1,6 +1,9 @@
 # Nostr principal attribution — `permissions.principal_pubkey`
 
-**Status:** live (vault#698 · hub#937). **Enforced by:** parachute-vault.
+**Status:** live (vault#698 · hub#937 · cloud#277). **Enforced by:**
+parachute-vault (`src/auth.ts`) and parachute-cloud
+(`workers/vault/src/auth.ts`) — BOTH doors, because they share
+`@openparachute/core` verbatim and therefore advertise one filter vocabulary.
 **Emitted by:** parachute-hub's account-MCP → vault hop mint.
 
 ## The problem
@@ -50,6 +53,20 @@ It applies on **every** write path — create, batch create, update, append /
 prepend, `content_edit`, and the `if_missing: "create"` upsert — because the
 value rides the single `WriteContext.via` already threaded through all of them.
 
+**Both doors.** The REST door (`src/routing.ts`) threads the *base* `auth.via`
+into its `WriteCtx` without refinement, and the base value is already
+`nostr:<pubkey>` — so a REST write by a NIP-98-signed principal is attributed
+identically to an MCP one. No REST-specific code was needed.
+
+**Both *products*, too.** `core/src/mcp-manifest.ts` advertises
+`created_via` / `last_updated_via` = `nostr:<hex>` to every client of
+`@openparachute/core`, and the hosted door consumes that core verbatim
+(`parachute-cloud/workers/vault/package.json` →
+`file:../../../parachute-vault/core`). So the hosted door must implement it or
+the manifest promises a filter that returns a silent empty set there —
+parachute-cloud#277 ports `parsePrincipalPubkey` + `refineMcpVia` for exactly
+that reason. **Any future change to this vocabulary has to land on both doors.**
+
 Unlike every other credential class, `nostr:<pubkey>` is **not** refined away
 to `mcp` by the MCP handler: every hub `/mcp` caller is on the `mcp` channel,
 so the channel cannot tell two agents apart and the key can.
@@ -76,5 +93,29 @@ starts working, not about safety.
 ## Pinned by
 
 - `src/attribution-threading.test.ts` — claim parsing, fail-soft cases,
-  coexistence with `scoped_tags`, the ordering guarantee, and every write path.
-- `core/src/attribution.test.ts` — the store-layer column + filter behavior.
+  coexistence with `scoped_tags`, the ordering guarantee, every MCP write path,
+  and REST-door parity.
+- `core/src/attribution.test.ts` — the store-layer column + filter behavior the
+  `nostr:` value reuses unchanged (that suite is value-agnostic; it carries no
+  `nostr:`-specific case).
+
+## Attribution does NOT survive export/import
+
+`core/src/portable-md.ts` carries no `created_by` / `created_via` /
+`last_updated_by` / `last_updated_via` fields, so the whole attribution block —
+signer axis included — is dropped by a portable-markdown round-trip. An
+export/import (the supported way to move a vault between the self-hosted and
+hosted doors) therefore lands every note with NULL attribution, and the signer
+is not recoverable afterwards.
+
+This is pre-existing (vault#298 never added the fields) but becomes
+load-bearing here: attribution is now the *only* record of which agent wrote
+what, and a door switch silently erases it. Treat `nostr:<pubkey>` as
+vault-local provenance, not a portable claim of authorship.
+
+## Compatibility note
+
+A `created_via = "mcp"` filter **stops matching** writes from NIP-98-signed
+agents once the hub side ships. That is the intended effect (the flat `mcp`
+label was the bug), but any saved query or dashboard filtering on `mcp` needs
+updating. Worth a release-note line when this rides a release PR.

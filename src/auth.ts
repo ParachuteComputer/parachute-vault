@@ -535,10 +535,29 @@ export function parsePrincipalPubkey(
   permissions: Record<string, unknown> | undefined,
 ): string | null {
   if (!permissions) return null;
+  if (!("principal_pubkey" in permissions)) return null;
   const raw = permissions.principal_pubkey;
-  if (typeof raw !== "string") return null;
-  return NOSTR_PUBKEY_RE.test(raw) ? raw : null;
+  if (typeof raw === "string" && NOSTR_PUBKEY_RE.test(raw)) return raw;
+  // PRESENT but unreadable. Fail soft (see above) — but never SILENTLY: the
+  // symptom of a dropped claim (`created_via` back to `mcp`) is byte-identical
+  // to the symptom of the hub not having shipped the claim at all, which is
+  // exactly the bug this feature exists to fix. One warn per distinct bad
+  // value makes the two distinguishable in the daemon log. A pubkey is public
+  // by construction, so logging the value leaks nothing.
+  const seen = typeof raw === "string" ? raw : `<${typeof raw}>`;
+  if (!warnedBadPubkeys.has(seen)) {
+    warnedBadPubkeys.add(seen);
+    console.warn(
+      "[attribution] hub JWT permissions.principal_pubkey present but not 64 lowercase hex — " +
+        `ignoring, falling back to the generic credential class (saw: ${JSON.stringify(seen)})`,
+    );
+  }
+  return null;
 }
+
+/** Dedupe key set for the warn above — unbounded growth is bounded in practice
+ *  by the number of DISTINCT malformed values a misconfigured hub emits (one). */
+const warnedBadPubkeys = new Set<string>();
 
 function parseScopedTagsFromPermissions(
   permissions: Record<string, unknown> | undefined,

@@ -1135,9 +1135,14 @@ export async function route(
 
   // Write-attribution context (vault#298). `auth.actor` is the principal;
   // `auth.via` is the credential class (`api` for hub JWTs + legacy keys,
-  // `operator` for the env-var bearer). The REST surface IS the `api` channel,
-  // so no refinement is needed here — the base via stands (the MCP handler is
-  // the one that refines to `mcp`). Threaded only into the write handler.
+  // `operator` for the env-var bearer, `nostr:<pubkey>` when the hub stamped a
+  // NIP-98 signing key — vault#698). The REST surface IS the `api` channel, so
+  // no refinement is needed here — the base via stands (the MCP handler is the
+  // one that refines to `mcp`, via `refineMcpVia`). That gives the REST door
+  // signer attribution for free and symmetric with MCP: `nostr:<pubkey>` is
+  // already the base value, so it lands in `created_via`/`last_updated_via`
+  // unchanged. Pinned by src/attribution-threading.test.ts. Threaded only into
+  // the write handler.
   // Migration-bypass (vault#299): a `vault:migrate`-scoped caller may write
   // notes that violate `strict:true` field constraints (for backfill /
   // migration). Every bypassed write is logged. Orthogonal to read/write/admin

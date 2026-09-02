@@ -31,7 +31,7 @@ import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { authenticateVaultRequest, refineMcpVia } from "./auth.ts";
 import { resetJwksCache, resetRevocationCache } from "./hub-jwt.ts";
 import { generateScopedMcpTools } from "./mcp-tools.ts";
-import { parseNotesQueryOpts } from "./routes.ts";
+import { handleNotes, parseNotesQueryOpts } from "./routes.ts";
 import type { AuthResult } from "./auth.ts";
 
 // ---------------------------------------------------------------------------
@@ -577,6 +577,37 @@ describe("attribution threading — nostr signer lands on every MCP write path",
       .get(created.id) as Record<string, string | null>;
     expect(row.created_via).toBe(`nostr:${PUBKEY_B}`);
     expect(row.last_updated_via).toBe(`nostr:${PUBKEY_B}`);
+  });
+
+  test("REST DOOR PARITY: a REST write carries the signer too (routing.ts passes auth.via unrefined)", async () => {
+    // The MCP door refines via `refineMcpVia`; the REST door threads the BASE
+    // `auth.via` straight into WriteCtx (routing.ts ~L1145). Since the base
+    // value is already `nostr:<pubkey>`, REST gets signer attribution for free
+    // — but nothing pinned it, so a future "normalize REST via to api" change
+    // would silently drop it on that door only.
+    seedVaultNoKey("journal");
+    const store = getVaultStore("journal");
+    const res = await handleNotes(
+      new Request("http://localhost/api/notes", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: "written over REST", path: "Rest/Signed" }),
+      }),
+      store,
+      "",
+      "journal",
+      { allowed: null, raw: null },
+      { actor: "e6619493-hub-user", via: `nostr:${PUBKEY_A}` },
+    );
+    expect(res.status).toBe(201);
+    const row = store.db
+      .prepare(
+        "SELECT created_by, created_via, last_updated_via FROM notes WHERE path = 'Rest/Signed'",
+      )
+      .get() as Record<string, string | null>;
+    expect(row.created_by).toBe("e6619493-hub-user");
+    expect(row.created_via).toBe(`nostr:${PUBKEY_A}`);
+    expect(row.last_updated_via).toBe(`nostr:${PUBKEY_A}`);
   });
 
   test("the signer is FILTERABLE via created_via / last_updated_via", async () => {
