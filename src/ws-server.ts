@@ -37,7 +37,12 @@ import { readVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { authenticateVaultRequest, type AuthResult } from "./auth.ts";
 import { hasScopeForVault } from "./scopes.ts";
-import { expandTokenTagScope, filterNotesByTagScope, scrubNotesTagsByScope } from "./tag-scope.ts";
+import {
+  expandTokenTagScope,
+  filterNotesByTagScope,
+  scopeQueryTags,
+  scrubNotesTagsByScope,
+} from "./tag-scope.ts";
 import { buildLiveMatcher } from "./live-match.ts";
 import {
   subscriptionManager,
@@ -239,10 +244,18 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
     let snapshotNotes;
     try {
       tagScopeAllowed = await expandTokenTagScope(store, auth.scoped_tags);
-      matcher = await buildLiveMatcher(store, validated.queryOpts);
+      // Neutralise out-of-scope tags NAMED IN THE SUBSCRIPTION QUERY
+      // (vault#675) — subscribing to `?tag=<out-of-scope>` and watching for
+      // frames is the same existence oracle as the one-shot query, just
+      // spread over time. Scoped ONCE here, after auth (the upgrade-time
+      // parse in `validateWsSubscribeQuery` runs before the socket has a
+      // token), and the SAME opts feed both the matcher and the snapshot —
+      // so live/snapshot predicate parity holds by construction.
+      const scopedOpts = scopeQueryTags(validated.queryOpts, tagScopeAllowed, auth.scoped_tags);
+      matcher = await buildLiveMatcher(store, scopedOpts);
       // Snapshot = the COMPLETE scoped matching set — strip paging so snapshot ⊇ live.
       const raw = await store.queryNotes({
-        ...validated.queryOpts,
+        ...scopedOpts,
         limit: Number.MAX_SAFE_INTEGER,
         offset: undefined,
       });
