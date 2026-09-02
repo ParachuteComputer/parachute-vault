@@ -67,6 +67,7 @@ import {
   filterHydratedLinksByTagScope,
   filterNotesByTagScope,
   noteWithinTagScope,
+  scopeQueryTags,
   scrubIndexedFieldConflictError,
   scrubNotesTagsByScope,
   scrubNoteTagsByScope,
@@ -901,8 +902,17 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
  * Returns `{ error }` (a 400 Response) on a malformed metadata filter, exactly
  * as the inline code did. `hasSearch` is surfaced from the raw `search` param
  * (this helper does not itself build a search query — the caller routes that).
+ *
+ * `tagScope` (vault#675): out-of-scope `tag=` / `exclude_tag=` inputs are
+ * rewritten so they match nothing, exactly as a nonexistent tag would — see
+ * `scopeQueryTags`. Applied here so every branch that lowers a query string
+ * (structured, `search`, `semantic`, `aggregate`, `near`, cursor) is covered
+ * by one call, the same way this helper already gives subscribe/search
+ * predicate parity. Default `NO_TAG_SCOPE` → no-op, so the WS route's
+ * upgrade-time parse (which runs before the socket authenticates) is
+ * unchanged; `ws-server.ts` applies the scoping once auth is known.
  */
-export function parseNotesQueryOpts(url: URL): {
+export function parseNotesQueryOpts(url: URL, tagScope: TagScopeCtx = NO_TAG_SCOPE): {
   queryOpts?: QueryOpts;
   hasSearch: boolean;
   hasNear: boolean;
@@ -986,7 +996,12 @@ export function parseNotesQueryOpts(url: URL): {
     cursor: cursorParam ?? undefined,
   };
 
-  return { queryOpts, hasSearch, hasNear, hasCursor };
+  return {
+    queryOpts: scopeQueryTags(queryOpts, tagScope.allowed, tagScope.raw),
+    hasSearch,
+    hasNear,
+    hasCursor,
+  };
 }
 
 /**
@@ -1338,7 +1353,7 @@ async function handleNotesInner(
             400,
           );
         }
-        const parsed = parseNotesQueryOpts(url);
+        const parsed = parseNotesQueryOpts(url, tagScope);
         if (parsed.error) return parsed.error;
         try {
           const semanticResult = await store.semanticSearch(nearText, { ...parsed.queryOpts, cursor: undefined });
@@ -1456,7 +1471,7 @@ async function handleNotesInner(
         // were silently dropped — a well-formed result set answering a
         // different question. `search_mode` is still parsed here because it
         // is search-specific (the helper does not know about it).
-        const parsed = parseNotesQueryOpts(url);
+        const parsed = parseNotesQueryOpts(url, tagScope);
         if (parsed.error) return parsed.error;
         const searchModeParsed = parseSearchModeParam(url);
         if (searchModeParsed.error) return searchModeParsed.error;
@@ -1608,7 +1623,7 @@ async function handleNotesInner(
       // Structured-query parsing is shared with the live `/subscribe` route
       // (see `parseNotesQueryOpts`) so both endpoints lower an identical query
       // string to the same `QueryOpts` — predicate parity by construction.
-      const parsed = parseNotesQueryOpts(url);
+      const parsed = parseNotesQueryOpts(url, tagScope);
       if (parsed.error) return parsed.error;
       const queryOpts = parsed.queryOpts!;
       const cursorParam = parseQuery(url, "cursor");

@@ -23,6 +23,7 @@ import {
   expandTokenTagScope,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
+  scopeQueryTagParam,
   scrubIndexedFieldConflictError,
   scrubNoteTagsByScope,
   scrubParentCycleError,
@@ -458,9 +459,37 @@ function applyTagScopeWrappers(
     return result;
   };
 
+  /**
+   * Neutralise out-of-scope tags NAMED IN THE QUERY (vault#675) before core
+   * ever runs. Without this a scoped session could ask `query-notes { tag:
+   * "project-manhattan" }` and read the answer off hit/miss — a co-tagged
+   * note is in scope via its OTHER tag, so it survived the result filter
+   * below and confirmed the guessed name. Rewriting the input (rather than
+   * emptying the output) keeps the response byte-identical to the same call
+   * naming a tag that doesn't exist, in every shape this tool returns —
+   * including the `aggregate` rollup and the `next_cursor` envelope, which
+   * an output-side patch could not reproduce. `exclude_tags` is rewritten on
+   * the same terms (core skips an exclude clause that can't match, so it
+   * excludes nothing — again exactly a nonexistent tag). Aliases mirror
+   * core's `exclude_tags ?? excludeTags ?? exclude_tag` resolution order.
+   */
+  const QUERY_TAG_PARAMS = ["tag", "exclude_tags", "excludeTags", "exclude_tag"] as const;
+  const scopeQueryTagParams = (params: any, allowed: Set<string> | null): any => {
+    if (!params || typeof params !== "object") return params;
+    let next = params;
+    for (const key of QUERY_TAG_PARAMS) {
+      if (params[key] === undefined) continue;
+      const scoped = scopeQueryTagParam(params[key], allowed, rawTags);
+      if (scoped === params[key]) continue;
+      if (next === params) next = { ...params };
+      next[key] = scoped;
+    }
+    return next;
+  };
+
   wrapReadTool(tools, "query-notes", async (orig, params) => {
     const allowed = await getAllowed();
-    const result = await orig(params);
+    const result = await orig(scopeQueryTagParams(params, allowed));
     if (!allowed) return result;
     // `aggregate` mode returns `[{group, value}]` rollup rows — no `.tags`
     // to post-filter (and `noteWithinTagScope` would wrongly drop every
