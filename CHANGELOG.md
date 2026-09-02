@@ -14,6 +14,17 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 Do not suffix-drop 0.7.9 until this rc has lived.
 
+## [0.7.8] - 2026-08-29
+
+**Stable promotion of 0.7.8-rc.2.** No new code. npm `@rc` is 0.7.8-rc.2;
+this is the matching `@latest`.
+
+The 0.7.8 line: filtered total via `?aggregate[op]=count` with no
+`group_by` (vault#683, rc.1) and rc's publishing directly from `next`
+(vault#688, rc.2). Also includes the stables-from-`main`-only publish gate
+(vault#690, landed on `next` after rc.2 — workflow-file only, nothing
+shipped in the npm artifact).
+
 ## [0.7.8-rc.2] - 2026-08-29
 
 **Release workflow now publishes rc's directly from `next`** (vault#688,
