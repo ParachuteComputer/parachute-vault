@@ -41,8 +41,12 @@ import { generateUlid } from "./ulid.js";
  *           `created_by` on the first write and `last_updated_by` on every
  *           write.
  *   via   — VIA WHAT: the interface/channel the write arrived through
- *           (`mcp`, `surface:<name>`, `agent:<id>`, `operator`/`cli`, `api`).
- *           Lands in `created_via` / `last_updated_via` symmetrically.
+ *           (`mcp`, `surface:<name>`, `agent:<id>`, `nostr:<pubkey>`,
+ *           `operator`/`cli`, `api`). `nostr:<pubkey>` (vault#698) is the
+ *           Nostr key that SIGNED the request — more specific than the
+ *           channel, and the only axis distinguishing two agents that share
+ *           one hub user. Lands in `created_via` / `last_updated_via`
+ *           symmetrically.
  *
  * Both are independently optional — an internal/import write may carry
  * neither, and a non-JWT operator write carries an `actor`/`via` pair without
@@ -1096,21 +1100,27 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
     params.push(opts.path);
   }
 
-  // Path prefix
+  // Path prefix. `escapeLikePattern` neutralizes `%` and `_` inside the
+  // caller-supplied prefix so it matches as a literal string: without it,
+  // `path_prefix=_tags/` silently matched `atags/…` too (`_` is LIKE's
+  // single-char wildcard), returning notes the caller never asked for and
+  // never saw a signal about (vault#659). The trailing `%` we append is
+  // still our actual wildcard. `ESCAPE '\'` is required for the escape to
+  // take effect.
   if (opts.pathPrefix) {
-    conditions.push("n.path LIKE ?");
-    params.push(opts.pathPrefix + "%");
+    conditions.push("n.path LIKE ? ESCAPE '\\'");
+    params.push(escapeLikePattern(opts.pathPrefix) + "%");
   }
 
   // Path-prefix exclusion (vault#628). Mirrors `pathPrefix` matching
-  // (`LIKE prefix || '%'`, SQLite LIKE is ASCII-case-insensitive). NULL
-  // paths are kept — they are not under the prefix. Repeatable: a note
-  // matching ANY listed prefix is dropped.
+  // (`LIKE prefix || '%'` with the same metachar escaping, SQLite LIKE is
+  // ASCII-case-insensitive). NULL paths are kept — they are not under the
+  // prefix. Repeatable: a note matching ANY listed prefix is dropped.
   if (opts.excludePathPrefix && opts.excludePathPrefix.length > 0) {
     for (const prefix of opts.excludePathPrefix) {
       if (typeof prefix !== "string" || prefix.length === 0) continue;
-      conditions.push("(n.path IS NULL OR n.path NOT LIKE ?)");
-      params.push(prefix + "%");
+      conditions.push("(n.path IS NULL OR n.path NOT LIKE ? ESCAPE '\\')");
+      params.push(escapeLikePattern(prefix) + "%");
     }
   }
 

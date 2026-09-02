@@ -45,7 +45,9 @@ export interface Note {
    * Write-attribution (vault#298) — two axes of provenance, both nullable.
    * `*By` is the principal (a JWT `sub`, or an operator / `token:<id>` label);
    * `*Via` is the interface the write arrived through (`mcp`, `surface:<name>`,
-   * `agent:<id>`, `operator`/`cli`, `api`). The `created*` pair is set once at
+   * `agent:<id>`, `nostr:<pubkey>`, `operator`/`cli`, `api`). `nostr:<pubkey>`
+   * (vault#698) is the Nostr key that SIGNED the request — the axis that tells
+   * two agents apart when they share one hub user. The `created*` pair is set once at
    * create; the `lastUpdated*` pair tracks the most recent mutating write. NULL
    * = unknown / written before attribution existed (legacy rows) or by a path
    * that carried no context — distinct from any real principal.
@@ -190,7 +192,8 @@ export interface QueryOpts {
   pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
   /**
    * Exclude notes whose path matches any of these prefixes. Same matching
-   * as `pathPrefix` (`n.path LIKE prefix || '%'`, ASCII case-insensitive).
+   * as `pathPrefix` (`n.path LIKE prefix || '%' ESCAPE '\'`, ASCII
+   * case-insensitive; `%`/`_` in the prefix are escaped to literals).
    * Repeatable. A note with no path is not excluded (it isn't under the
    * prefix). vault#628 — `.parachute/` system-space is the first client.
    */

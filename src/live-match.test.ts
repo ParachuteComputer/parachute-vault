@@ -130,6 +130,23 @@ describe("live-match — predicate parity with the query engine", () => {
     expect(ids.size).toBe(2);
   });
 
+  it("pathPrefix with a LIKE metachar matches literally (vault#659)", async () => {
+    // `_` is LIKE's single-char wildcard. Unescaped, `LIKE '_tags/%'` also
+    // matched `atags/x` in SQL while the matcher's `startsWith` did not —
+    // a snapshot/live divergence that also just returned the wrong answer.
+    const under = await store.createNote("under", { path: "_tags/x" });
+    await store.createNote("decoy", { path: "atags/x" });
+    const ids = await assertParity({ pathPrefix: "_tags/" });
+    expect([...ids]).toEqual([under.id]);
+  });
+
+  it("excludePathPrefix with a LIKE metachar excludes literally (vault#659)", async () => {
+    await store.createNote("under", { path: "_tags/x" });
+    const decoy = await store.createNote("decoy", { path: "atags/x" });
+    const ids = await assertParity({ excludePathPrefix: ["_tags/"] });
+    expect([...ids]).toEqual([decoy.id]);
+  });
+
   it("hasTags true/false (M1 — presence parity)", async () => {
     await store.createNote("tagged", { tags: ["x"] });
     await store.createNote("bare", {});

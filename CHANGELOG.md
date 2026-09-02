@@ -4,6 +4,24 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.9-rc.2] - 2026-09-02
+
+**Nostr write attribution, and a release plan that can't 404 its own run.** The two commits on `next` since rc.1 (#696, #698), plus the merge of the 0.7.8 stable promotion back into the line.
+
+- **NIP-98 writes are attributed to the signing pubkey (#698).** The vault reads a `permissions.principal_pubkey` claim (64 lowercase hex, NIP-01 form) off the validated hub JWT and records `created_via` / `last_updated_via` as `nostr:<pubkey>`. `created_by` is deliberately untouched — that is the hub user, and it is correct. Fixes two agents on different Nostr keys but the SAME hub user being byte-identical in a vault's attribution columns. `nostr:<pubkey>` joins the existing open-ended `via` vocabulary (`mcp` · `surface:<name>` · `agent:<id>` · `operator` · `api`) — no schema change, no filter change, no index change — and it is the one credential class the MCP handler does NOT refine away to `mcp`. Parsing fails soft: malformed claims degrade to `api` rather than 401-ing. The claim rides inside `permissions` because that is `@openparachute/scope-guard`'s documented verbatim passthrough.
+- **The release plan can no longer mistake "package doesn't exist" for "version is new" (#696).** The plan job's inline shell curled `registry.npmjs.org/@openparachute%2fvault/$VERSION` and read HTTP 404 as publish-me — but that is also what a never-published package returns, and npm trusted publishing (OIDC) cannot CREATE a package. Replaced by the unit-tested `scripts/release-plan.ts` (port of surface#221 / hub#930 / app#189): it fetches the package document, so empty `publishedVersions` + no dist-tag skips, an unreadable registry still refuses, and an rc tag-push still overrides.
+- **Merges `main` (0.7.8) into the line.** The 0.7.8 stable promotion was a suffix-drop with no code, so the merge carries only its changelog section; `main` and `next` now share a history again.
+
+## [0.7.9-rc.1] - 2026-08-30
+
+**Query filters tell the truth.** Two silent-wrong-answer bugs from #659, plus the token-guidance banner. Line is 0.7.9 because npm `@latest` is already 0.7.8 (suffix-drop of 0.7.8-rc.2).
+
+- **Repeated query params accumulate; path prefixes match literally (#694, closes #659).** `parseQueryList` now `getAll()` + comma-flatten, so `?tag=a&tag=b`, `?tag=a,b`, and the mixed form all compose (same for `exclude_tag` / `exclude_path_prefix`). `pathPrefix` / `excludePathPrefix` LIKE-escape `%`/`_` via the existing helper with `ESCAPE '\'` — `path_prefix=_tags/` no longer also matches `atags/…`. MCP inherits through the shared `buildFilterConditions`. Reverses the first-occurrence wording #693 documented yesterday.
+- **CreatedBanner renders hub `token_guidance` (#692, towards #663).** Stops telling operators to bank a 15-minute token.
+- Also on `next` since rc.2: stables publish from `main` only (#690).
+
+Do not suffix-drop 0.7.9 until this rc has lived.
+
 ## [0.7.8] - 2026-08-29
 
 **Stable promotion of 0.7.8-rc.2.** No new code. npm `@rc` is 0.7.8-rc.2;

@@ -1282,7 +1282,7 @@ function migrateToV22(db: Database): void {
  *
  * `*_by` is the JWT `sub` (or an operator / `token:<id>` label for non-JWT
  * auth); `*_via` is the channel (`mcp`, `surface:<name>`, `agent:<id>`,
- * `operator`/`cli`, `api`). All four NULL on legacy rows — we deliberately do
+ * `nostr:<pubkey>`, `operator`/`cli`, `api`). All four NULL on legacy rows — we deliberately do
  * NOT backfill an author for writes that predate attribution; NULL reads as
  * "unknown / pre-attribution," distinct from any real principal.
  *

@@ -852,10 +852,14 @@ Query params:
     for larger batches call multiple times.
 
 - **Tag / link / structural filters**
-  - `tag=foo&tag=bar` — repeat to pass multiple.
+  - `tag=foo,bar` — comma-list to pass multiple. Repeating the param
+    (`tag=foo&tag=bar`) accumulates, and the two forms compose
+    (`tag=foo,bar&tag=baz` → three tags) — same as `extension` (vault#659).
   - `tag_match=all|any` — default `all` (or `any` when more than one tag
     is supplied without an explicit `tag_match`).
-  - `exclude_tag=foo` — exclude notes carrying this tag.
+  - `exclude_tag=foo` — exclude notes carrying this tag. Comma-list form
+    (`exclude_tag=foo,bar`) and repeated params (`exclude_tag=foo&exclude_tag=bar`)
+    both accumulate.
   - `has_tags=true|false`, `has_links=true|false`.
   - `has_broken_links=true|false` — presence filter on dangling outbound
     links (vault#555): `true` returns only notes with at least one
@@ -867,12 +871,14 @@ Query params:
     link has ever gone unresolved — `true` matches nothing, `false` is a
     no-op — rather than erroring on a table that was never created.
   - `path=foo/bar` — exact path match.
-  - `path_prefix=foo/` — startswith.
+  - `path_prefix=foo/` — startswith. Matched literally: `%` and `_` in the
+    prefix are escaped, so `path_prefix=_tags/` does not also match
+    `atags/…` (vault#659). ASCII case-insensitive.
   - `exclude_path_prefix=.parachute/` — drop notes whose path matches any
     of these prefixes (vault#628). Same LIKE matching as `path_prefix`. A
     note with no path is not excluded. Comma-list form
-    (`exclude_path_prefix=a/,b/`); repeated params take the first
-    occurrence only.
+    (`exclude_path_prefix=a/,b/`) and repeated params
+    (`exclude_path_prefix=a/&exclude_path_prefix=b/`) both accumulate.
   - `extension=md&extension=csv` — filter by file extension (vault#328).
 
 - **Date filters**

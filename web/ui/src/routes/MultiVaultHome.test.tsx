@@ -151,6 +151,33 @@ describe("MultiVaultHome — create", () => {
     expect(mva.createVaultViaHub).toHaveBeenCalledWith("scratch");
     expect(await screen.findByText(/access token \(shown once\)/i)).toBeInTheDocument();
     expect(screen.getByText("jwt.one.shot")).toBeInTheDocument();
+    // No server guidance in this mock → the fallback must not promise a
+    // durable credential (vault#663: the old copy said "copy it somewhere
+    // safe" about a 15-minute token).
+    expect(screen.getByText(/short-lived/i)).toBeInTheDocument();
+    expect(screen.queryByText(/copy it somewhere safe/i)).not.toBeInTheDocument();
+  });
+
+  it("token banner renders the server's token_guidance when present (vault#663)", async () => {
+    const user = userEvent.setup();
+    vi.mocked(mva.createVaultViaHub).mockResolvedValue({
+      name: "scratch",
+      url: "https://hub.example/vault/scratch",
+      version: "0.5.2",
+      created: true,
+      token: "jwt.one.shot",
+      tokenGuidance:
+        'This token grants admin access to the "scratch" vault only, expires in 15 minutes, and is registered with the hub so it can be revoked.',
+    });
+    renderHome();
+    await screen.findByLabelText("New vault name");
+    await user.type(screen.getByLabelText("New vault name"), "scratch");
+    await user.click(screen.getByRole("button", { name: /create vault/i }));
+
+    expect(await screen.findByText(/expires in 15 minutes/)).toBeInTheDocument();
+    // Server guidance replaces the fallback sentence, not the whole banner.
+    expect(screen.queryByText(/short-lived/i)).not.toBeInTheDocument();
+    expect(screen.getByText("jwt.one.shot")).toBeInTheDocument();
   });
 
   it("client-side validation blocks reserved names before any request", async () => {

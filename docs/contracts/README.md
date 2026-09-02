@@ -6,6 +6,7 @@ Contract docs the vault enforces. These moved here verbatim from `parachute-patt
 |---|---|
 | [`tag-data-model.md`](./tag-data-model.md) | The tag data model: one tag = one SQL row (description, indexed fields, opaque relationship vocabulary, `parent_names`); schema inheritance walk semantics with `_default` as implicit universal parent; the transactional tag-rename cascade. |
 | [`tag-scoped-tokens.md`](./tag-scoped-tokens.md) | Tag-allowlist token narrowing: the `permissions.scoped_tags` JWT claim, fail-closed enforcement, hierarchy + string-form scope expansion, subset-of-minter mint attenuation, and the rename/delete lifecycle. |
+| [`nostr-principal-attribution.md`](./nostr-principal-attribution.md) | The `permissions.principal_pubkey` JWT claim the hub's NIP-98 door stamps, and how the vault turns it into `created_via` / `last_updated_via` = `nostr:<pubkey>` so two agents sharing one hub user stay distinguishable. Fail-soft (a label, not an access decision). |
 | [`vault-portable-export.md`](./vault-portable-export.md) | The portable-markdown export/import surface: lossless round-trip guarantees, frontmatter + sidecar-schema shape, and the git-projection / cold-storage / migration recipes built on it. |
 
 The hub-enforced contracts (module protocol, manifest shape, OAuth scopes, design system, and friends) live at [`parachute-hub/docs/contracts/`](https://github.com/ParachuteComputer/parachute-hub/blob/main/docs/contracts/README.md).

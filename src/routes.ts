@@ -352,9 +352,26 @@ function parseLinkCountDirection(url: URL): "both" | "outbound" | "inbound" {
   return "both";
 }
 
+/**
+ * Parse a repeatable, comma-list query param (`tag`, `exclude_tag`,
+ * `exclude_path_prefix`). Two accepted shapes, and they compose:
+ *   - `?tag=a,b` (comma-list)
+ *   - `?tag=a&tag=b` (repeated param)
+ * Both yield `["a", "b"]`. This used to be `searchParams.get()` + split,
+ * which silently kept only the FIRST occurrence — a caller passing
+ * `?tag=a&tag=b` got results filtered by `a` alone, with no signal that
+ * `b` had been dropped (vault#659). Mirrors `parseExtensionFilter` below,
+ * with two deliberate differences: this always returns an array (these
+ * callers take `string[]`), and it does NOT trim — `exclude_path_prefix`
+ * is a path fragment, where surrounding whitespace is data, not noise.
+ * Returns undefined when absent so the queryNotes filter is skipped.
+ */
 function parseQueryList(url: URL, key: string): string[] | undefined {
-  const val = url.searchParams.get(key);
-  return val ? val.split(",") : undefined;
+  const all = url.searchParams.getAll(key);
+  if (all.length === 0) return undefined;
+  // Flatten comma-lists inside each param.
+  const flat = all.flatMap((v) => v.split(",")).filter((s) => s.length > 0);
+  return flat.length > 0 ? flat : undefined;
 }
 
 /**
