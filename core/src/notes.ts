@@ -41,8 +41,12 @@ import { generateUlid } from "./ulid.js";
  *           `created_by` on the first write and `last_updated_by` on every
  *           write.
  *   via   — VIA WHAT: the interface/channel the write arrived through
- *           (`mcp`, `surface:<name>`, `agent:<id>`, `operator`/`cli`, `api`).
- *           Lands in `created_via` / `last_updated_via` symmetrically.
+ *           (`mcp`, `surface:<name>`, `agent:<id>`, `nostr:<pubkey>`,
+ *           `operator`/`cli`, `api`). `nostr:<pubkey>` (vault#698) is the
+ *           Nostr key that SIGNED the request — more specific than the
+ *           channel, and the only axis distinguishing two agents that share
+ *           one hub user. Lands in `created_via` / `last_updated_via`
+ *           symmetrically.
  *
  * Both are independently optional — an internal/import write may carry
  * neither, and a non-JWT operator write carries an `actor`/`via` pair without

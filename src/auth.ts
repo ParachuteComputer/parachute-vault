@@ -161,8 +161,12 @@ export interface AuthResult {
    * write arrived through, derived PRAGMATICALLY from the credential class
    * here, then REFINED by the request path at the call site (the MCP handler
    * stamps `mcp`; the REST router keeps the credential-class default). Values:
-   * `mcp` · `surface:<name>` · `agent:<id>` · `operator` · `api`. This is the
-   * BASE value from auth — the credential class:
+   * `mcp` · `surface:<name>` · `agent:<id>` · `nostr:<pubkey>` · `operator` ·
+   * `api`. This is the BASE value from auth — the credential class:
+   *   - Hub JWT with a `permissions.principal_pubkey` claim → `nostr:<pubkey>`
+   *     (vault#698). The signer is MORE specific than the channel, and unlike
+   *     every other class it distinguishes two agents that share one hub user,
+   *     so downstream does NOT refine it away — see `mcp-tools.ts`.
    *   - Hub JWT  → `"api"` (the generic class; refined to `mcp` etc. downstream
    *     once the channel is known).
    *   - operator bearer → `"operator"`.
@@ -464,6 +468,97 @@ class MalformedScopedTagsError extends Error {}
  *      The only correct fail-closed action for a present-but-unreadable
  *      scope is to reject the whole request — never serve it wide.
  */
+/**
+ * Nostr pubkey shape: 32 bytes, lowercase hex. NIP-01 canonical form.
+ */
+const NOSTR_PUBKEY_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Write-attribution `via` label for a NIP-98-signed principal.
+ *
+ * `nostr:<64-hex>` joins the existing open-ended `via` vocabulary
+ * (`mcp` · `surface:<name>` · `agent:<id>` · `operator` · `api`) — same
+ * `<class>:<id>` shape as `agent:<id>`, so `created_via` / `last_updated_via`
+ * stay plain exact-match strings and every existing filter keeps working.
+ */
+export function nostrVia(pubkey: string): string {
+  return `nostr:${pubkey}`;
+}
+
+/**
+ * Refine the credential-class `via` from `AuthResult` for a write that arrived
+ * on the MCP channel.
+ *
+ * `mcp` wins over the generic classes (`api`, a legacy `token:` REST key) —
+ * the channel is the more specific fact. It does NOT win over a class that
+ * already names a *principal or channel of its own*:
+ *
+ *   - `operator` — the env-var bearer (vault#298).
+ *   - `nostr:<pubkey>` — the NIP-98 signer (vault#698). Every hub `/mcp`
+ *     caller is on the `mcp` channel, so `mcp` cannot distinguish two agents
+ *     sharing a hub user; the key can.
+ */
+export function refineMcpVia(via: string | null | undefined): string {
+  // `undefined` is accepted alongside `null` on purpose: `AuthResult` declares
+  // `via: string | null`, but several in-repo call sites build the object
+  // without the key (attachment tools, test harnesses). The expression this
+  // replaced (`auth.via === "operator" ? … : "mcp"`) tolerated that silently,
+  // so a `string`-only signature here would turn a missing key into a
+  // TypeError at write time. Narrow on `typeof`, not on `!== null`.
+  if (via === "operator") return "operator";
+  if (typeof via === "string" && via.startsWith("nostr:")) return via;
+  return "mcp";
+}
+
+/**
+ * Read the signing pubkey out of a validated hub JWT's `permissions` claim
+ * (vault#698 / hub#937 — Nostr principal attribution).
+ *
+ * Wire contract: `permissions: { principal_pubkey: "<64 lowercase hex>" }`.
+ * The hub stamps it ONLY on tokens minted for a NIP-98-authenticated caller;
+ * password / OAuth / Bearer sessions never carry it.
+ *
+ * Why it rides inside `permissions` rather than a top-level claim:
+ * `@openparachute/scope-guard` returns a FIXED claim surface
+ * (`sub`, `scopes`, `aud`, `jti`, `clientId`, `vaultScope`, `permissions`) and
+ * drops everything else, and `permissions` is its documented verbatim
+ * passthrough. A new top-level claim would be invisible here without a
+ * scope-guard release.
+ *
+ * FAIL-SOFT, deliberately the opposite of `parseScopedTagsFromPermissions`:
+ * this claim only *labels* a write, it never widens or narrows access. A
+ * missing / malformed / wrong-case / non-hex value returns `null` and the
+ * caller falls back to the generic credential class, rather than storing junk
+ * in an attribution column or 401-ing a legitimate write.
+ */
+export function parsePrincipalPubkey(
+  permissions: Record<string, unknown> | undefined,
+): string | null {
+  if (!permissions) return null;
+  if (!("principal_pubkey" in permissions)) return null;
+  const raw = permissions.principal_pubkey;
+  if (typeof raw === "string" && NOSTR_PUBKEY_RE.test(raw)) return raw;
+  // PRESENT but unreadable. Fail soft (see above) — but never SILENTLY: the
+  // symptom of a dropped claim (`created_via` back to `mcp`) is byte-identical
+  // to the symptom of the hub not having shipped the claim at all, which is
+  // exactly the bug this feature exists to fix. One warn per distinct bad
+  // value makes the two distinguishable in the daemon log. A pubkey is public
+  // by construction, so logging the value leaks nothing.
+  const seen = typeof raw === "string" ? raw : `<${typeof raw}>`;
+  if (!warnedBadPubkeys.has(seen)) {
+    warnedBadPubkeys.add(seen);
+    console.warn(
+      "[attribution] hub JWT permissions.principal_pubkey present but not 64 lowercase hex — " +
+        `ignoring, falling back to the generic credential class (saw: ${JSON.stringify(seen)})`,
+    );
+  }
+  return null;
+}
+
+/** Dedupe key set for the warn above — unbounded growth is bounded in practice
+ *  by the number of DISTINCT malformed values a misconfigured hub emits (one). */
+const warnedBadPubkeys = new Set<string>();
+
 function parseScopedTagsFromPermissions(
   permissions: Record<string, unknown> | undefined,
 ): string[] | null {
@@ -575,6 +670,9 @@ async function authenticateHubJwt(
     // Throws MalformedScopedTagsError (caught below → 401) on a present-but-
     // malformed claim so we never widen access on a misread.
     const scoped_tags = parseScopedTagsFromPermissions(claims.permissions);
+    // Write-attribution axis 2 (vault#698): the NIP-98 signing pubkey, when
+    // the hub stamped one. Fail-soft — see `parsePrincipalPubkey`.
+    const principalPubkey = parsePrincipalPubkey(claims.permissions);
     return {
       permission,
       scopes: claims.scopes,
@@ -596,7 +694,13 @@ async function authenticateHubJwt(
       // pragmatic constraint we DON'T manufacture a more specific class; the
       // channel comes from the path instead.
       actor: claims.sub && claims.sub.length > 0 ? claims.sub : null,
-      via: "api",
+      // VIA: `nostr:<pubkey>` when the hub tells us which key signed the
+      // request that produced this token (vault#698 — the NIP-98 `/mcp` door),
+      // otherwise the generic `api` credential class the request path refines.
+      // `actor` is untouched on purpose: it stays the hub USER id, so two
+      // agents sharing a hub user keep one `created_by` and are told apart by
+      // `created_via` / `last_updated_via`.
+      via: principalPubkey !== null ? nostrVia(principalPubkey) : "api",
     };
   } catch (err) {
     if (err instanceof MalformedScopedTagsError) {

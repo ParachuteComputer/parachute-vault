@@ -45,7 +45,9 @@ export interface Note {
    * Write-attribution (vault#298) — two axes of provenance, both nullable.
    * `*By` is the principal (a JWT `sub`, or an operator / `token:<id>` label);
    * `*Via` is the interface the write arrived through (`mcp`, `surface:<name>`,
-   * `agent:<id>`, `operator`/`cli`, `api`). The `created*` pair is set once at
+   * `agent:<id>`, `nostr:<pubkey>`, `operator`/`cli`, `api`). `nostr:<pubkey>`
+   * (vault#698) is the Nostr key that SIGNED the request — the axis that tells
+   * two agents apart when they share one hub user. The `created*` pair is set once at
    * create; the `lastUpdated*` pair tracks the most recent mutating write. NULL
    * = unknown / written before attribution existed (legacy rows) or by a path
    * that carried no context — distinct from any real principal.
