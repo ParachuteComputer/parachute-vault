@@ -7137,6 +7137,167 @@ describe("stateless MCP transport", async () => {
     closeAllStores();
   });
 
+  // vault#669: the MCP door's `description` write had no runtime type check
+  // (an `as string` cast), so a write/admin caller could persist a non-string
+  // and poison the next `initialize` (serverInstruction's `description.trim()`
+  // throws → -32603 INTERNAL, the first frame, unrepairable in-session — the
+  // bun half of cloud#87). The guard rejects non-string/non-null as a
+  // structured -32602 INVALID_PARAMS (`error_type: invalid_description`), the
+  // same shape every other MCP validation leaf takes. `null` still clears.
+  describe("vault-info description type guard (vault#669 / cloud#87)", () => {
+    for (const [label, value] of [
+      ["a number", 123],
+      ["an object", { text: "nope" }],
+      ["an array", ["a", "b"]],
+      ["a boolean", true],
+    ] as const) {
+      test(`tools/call vault-info with ${label} description → -32602 invalid_description, nothing persisted`, async () => {
+        const { handleScopedMcp } = await import("./mcp-http.ts");
+        const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+        const { closeAllStores } = await import("./vault-store.ts");
+
+        const vaultName = `desc-type-${label.replace(/\s+/g, "-")}-${Date.now()}`;
+        writeVaultConfig({
+          name: vaultName,
+          api_keys: [],
+          created_at: new Date().toISOString(),
+          description: "original",
+        });
+
+        const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "vault-info", arguments: { description: value } },
+          }),
+        });
+
+        const res = await handleScopedMcp(req, vaultName, {
+          permission: "full",
+          scopes: ["vault:read", "vault:write", "vault:admin"],
+          legacyDerived: false,
+          scoped_tags: null,
+        } as any);
+
+        expect(res.status).toBe(200);
+        const body = await res.json() as any;
+        // Structured JSON-RPC error (protocol-level), NOT the in-band
+        // isError text: -32602 INVALID_PARAMS carrying error_type/field.
+        expect(body.error).toBeDefined();
+        expect(body.error.code).toBe(-32602);
+        expect(body.error.data.error_type).toBe("invalid_description");
+        expect(body.error.data.field).toBe("description");
+        // Nothing persisted — no poison state introduced.
+        expect(readVaultConfig(vaultName)?.description).toBe("original");
+
+        closeAllStores();
+      });
+    }
+
+    test("a refused non-string description leaves MCP initialize working (poison prevented)", async () => {
+      const { handleScopedMcp } = await import("./mcp-http.ts");
+      const { writeVaultConfig } = await import("./config.ts");
+      const { closeAllStores } = await import("./vault-store.ts");
+
+      const vaultName = `desc-poison-${Date.now()}`;
+      writeVaultConfig({
+        name: vaultName,
+        api_keys: [],
+        created_at: new Date().toISOString(),
+        description: "healthy brief",
+      });
+
+      const admin = {
+        permission: "full" as const,
+        scopes: ["vault:read", "vault:write", "vault:admin"],
+        legacyDerived: false,
+        scoped_tags: null,
+      };
+
+      // Attempt to poison with a number — must be rejected.
+      const poisonReq = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "accept": "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "vault-info", arguments: { description: 123 } },
+        }),
+      });
+      const poisonRes = await handleScopedMcp(poisonReq, vaultName, admin as any);
+      expect((await poisonRes.json() as any).error.code).toBe(-32602);
+
+      // initialize must still succeed — before the guard this answered
+      // -32603 INTERNAL_ERROR (`description.trim is not a function`).
+      const initReq = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "accept": "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "1.0" } },
+        }),
+      });
+      const initRes = await handleScopedMcp(initReq, vaultName, admin as any);
+      expect(initRes.status).toBe(200);
+      const initBody = await initRes.json() as any;
+      expect(initBody.error).toBeUndefined();
+      expect(initBody.result.instructions).toContain("healthy brief");
+
+      closeAllStores();
+    });
+
+    test("null description clears it (still legal on the MCP door)", async () => {
+      const { handleScopedMcp } = await import("./mcp-http.ts");
+      const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+      const { closeAllStores } = await import("./vault-store.ts");
+
+      const vaultName = `desc-null-${Date.now()}`;
+      writeVaultConfig({
+        name: vaultName,
+        api_keys: [],
+        created_at: new Date().toISOString(),
+        description: "to be cleared",
+      });
+
+      const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "accept": "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "vault-info", arguments: { description: null } },
+        }),
+      });
+
+      const res = await handleScopedMcp(req, vaultName, {
+        permission: "full",
+        scopes: ["vault:read", "vault:write", "vault:admin"],
+        legacyDerived: false,
+        scoped_tags: null,
+      } as any);
+
+      expect(res.status).toBe(200);
+      const body = await res.json() as any;
+      expect(body.error).toBeUndefined();
+      expect(body.result.isError).toBeFalsy();
+      // Cleared — readVaultConfig returns null (or undefined) for a cleared
+      // description, never the old string.
+      expect(readVaultConfig(vaultName)?.description ?? null).toBeNull();
+
+      closeAllStores();
+    });
+  });
+
   test("tools/call of create-note with vault:read scope is refused (not silently allowed)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig } = await import("./config.ts");

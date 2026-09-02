@@ -1049,6 +1049,33 @@ describe("mergeTags", async () => {
     expect(result.merged).toEqual({ v1: 1 });
     expect((await store.getNote(note.id))!.tags).toEqual(["voice"]);
   });
+
+  it("bumps updated_at on notes whose tags actually changed (vault#567)", async () => {
+    const affected = await store.createNote("A", { tags: ["v1"] });
+    const both = await store.createNote("B", { tags: ["v1", "voice"] });
+    const untouched = await store.createNote("C", { tags: ["voice"] });
+    const unrelated = await store.createNote("D", { tags: ["other"] });
+    const affectedAt = affected.updatedAt;
+    const bothAt = both.updatedAt;
+    const untouchedAt = untouched.updatedAt;
+    const unrelatedAt = unrelated.updatedAt;
+
+    // Wall-clock ISO timestamps are millisecond-resolution; wait so the
+    // bump cannot collide with the create timestamp.
+    await Bun.sleep(5);
+    await store.mergeTags(["v1"], "voice");
+
+    const affectedAfter = (await store.getNote(affected.id))!;
+    const bothAfter = (await store.getNote(both.id))!;
+    const untouchedAfter = (await store.getNote(untouched.id))!;
+    const unrelatedAfter = (await store.getNote(unrelated.id))!;
+    expect(affectedAfter.updatedAt > affectedAt).toBe(true);
+    expect(bothAfter.updatedAt > bothAt).toBe(true);
+    expect(untouchedAfter.updatedAt).toBe(untouchedAt);
+    expect(unrelatedAfter.updatedAt).toBe(unrelatedAt);
+    expect(affectedAfter.tags).toEqual(["voice"]);
+    expect(bothAfter.tags).toEqual(["voice"]);
+  });
 });
 
 // ---- Vault Stats ----
@@ -8815,6 +8842,24 @@ describe("vault projection (vault#271)", async () => {
     expect(md).toContain("No tag schemas declared");
     expect(md).toContain("No indexed metadata fields");
     expect(md).toContain("Querying");
+  });
+
+  it("markdown brief skips a non-string description instead of throwing (vault#669 recovery)", async () => {
+    const { buildVaultProjection, projectionToMarkdown } = await import(
+      "./vault-projection.ts"
+    );
+
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "poisoned",
+      // A write door that skipped the type guard used to persist a number
+      // and take down initialize via `description.trim is not a function`.
+      description: 123 as unknown as string,
+      projection,
+    });
+
+    expect(md).toContain('Parachute Vault "poisoned"');
+    expect(md).not.toContain("123");
   });
 
   it("markdown brief stays under ~5K tokens for a 50-tags-with-schemas vault", async () => {

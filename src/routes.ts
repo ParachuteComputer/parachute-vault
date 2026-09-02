@@ -3924,7 +3924,7 @@ export async function handleFindPath(
 
 type VaultConfigLike = {
   name: string;
-  description?: string;
+  description?: string | null;
   audio_retention?: "keep" | "until_transcribed" | "never";
   auto_transcribe?: { enabled?: boolean };
 };
@@ -4024,12 +4024,33 @@ export async function handleVault(
     const parsedBody = await parseJsonBody(req);
     if (!parsedBody.ok) return parsedBody.response;
     const body = parsedBody.body as {
-      description?: string;
+      description?: unknown;
       config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown } };
     };
     let dirty = false;
 
     if (body.description !== undefined) {
+      // vault#669: runtime type guard mirroring the audio_retention /
+      // auto_transcribe validators below — the `description?: string`
+      // annotation was a compile-time claim guarding nothing (cast retyped
+      // to `unknown` so the check is mandatory), so a write/admin caller
+      // could persist a non-string and poison the next MCP `initialize`
+      // (cloud#87). Reject non-string/non-null with the same 400 body
+      // shape the sibling validators in this handler emit. `null` stays
+      // legal: it clears the description. Cross-door parity with cloud#263.
+      if (body.description !== null && typeof body.description !== "string") {
+        return json(
+          {
+            error: "invalid_description",
+            error_type: "invalid_description",
+            field: "description",
+            got: body.description,
+            message: "description must be a string or null",
+            hint: "pass a string, or null to clear the description",
+          },
+          400,
+        );
+      }
       vaultConfig.description = body.description;
       dirty = true;
     }
