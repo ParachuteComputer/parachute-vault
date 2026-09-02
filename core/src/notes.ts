@@ -2767,6 +2767,8 @@ export function mergeTags(
     const deleteNoteTagsStmt = db.prepare("DELETE FROM note_tags WHERE tag_name = ?");
     const deleteTagStmt = db.prepare("DELETE FROM tags WHERE name = ?");
     const countStmt = db.prepare("SELECT COUNT(*) as c FROM note_tags WHERE tag_name = ?");
+    const sourceNoteIdsStmt = db.prepare("SELECT note_id FROM note_tags WHERE tag_name = ?");
+    const affectedIds = new Set<string>();
 
     for (const source of uniqueSources) {
       const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(source);
@@ -2775,6 +2777,11 @@ export function mergeTags(
         continue;
       }
       const before = (countStmt.get(source) as { c: number }).c;
+      // Collect BEFORE the delete so we can bump updated_at on every note
+      // whose tags actually change (vault#567).
+      for (const row of sourceNoteIdsStmt.all(source) as { note_id: string }[]) {
+        affectedIds.add(row.note_id);
+      }
       retagStmt.run(target, source);
       deleteNoteTagsStmt.run(source);
       // Dropping the tag row drops its identity (description, fields,
@@ -2782,6 +2789,24 @@ export function mergeTags(
       // for a merge: the source's identity is consumed by the target.
       deleteTagStmt.run(source);
       merged[source] = before;
+    }
+
+    // vault#567: a tags-only `update-note` already bumps `updated_at` so
+    // cursor/sync consumers see the retag. `merge-tags` used to skip the
+    // bump (flood-avoidance), which made the equivalent bulk retag
+    // invisible to since-last-check loops. Bump every note that actually
+    // lost a source tag; notes that never carried a merged-away source
+    // are left untouched. `updated_at_ms` moves with `updated_at`
+    // (vault#586) so the cursor keyset surfaces the change.
+    if (affectedIds.size > 0) {
+      const now = new Date().toISOString();
+      const nowMs = timestampToMs(now) ?? Date.now();
+      const bumpStmt = db.prepare(
+        "UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?",
+      );
+      for (const id of affectedIds) {
+        bumpStmt.run(now, nowMs, id);
+      }
     }
   });
 

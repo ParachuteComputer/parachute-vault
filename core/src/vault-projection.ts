@@ -358,7 +358,14 @@ export function projectionToMarkdown(args: {
 
   const lines: string[] = [];
   lines.push(`You are connected to Parachute Vault "${vaultName}".`);
-  if (description && description.trim().length > 0) {
+  // vault#669 / cloud#87 recovery: a non-string description (poisoned
+  // via an unguarded write door) used to throw here (`description.trim
+  // is not a function`) and take down MCP `initialize` — the first
+  // frame, so the connected AI never reached a tool that could repair
+  // it. Skip a non-string the same way we skip null/empty: render the
+  // base brief. The write doors now reject this shape; this is the
+  // already-poisoned reconnect path.
+  if (typeof description === "string" && description.trim().length > 0) {
     lines.push("");
     lines.push(description.trim());
   }

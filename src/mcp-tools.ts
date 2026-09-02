@@ -863,7 +863,27 @@ function overrideVaultInfo(
           `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
         );
       }
-      config.description = params.description as string;
+      // vault#669: runtime type guard — the `as string` cast below was a
+      // compile-time claim guarding nothing, so a write/admin caller could
+      // persist a non-string `description` (or crash serializeVaultConfig
+      // with `description.split is not a function`) and poison the NEXT
+      // MCP `initialize` (projectionToMarkdown's `description.trim()`).
+      // Reject non-string/non-null here as a structured invalid-params
+      // error: a duck-typed `error_type` throw, which src/mcp-http.ts's
+      // generic branch turns into JSON-RPC -32602 INVALID_PARAMS carrying
+      // structured `data` — the same shape core's own validation leaves
+      // take, no new error family. `null` stays legal: it clears the
+      // description. Cross-door parity with cloud#263 (closes the bun
+      // half of cloud#87).
+      if (params.description !== null && typeof params.description !== "string") {
+        throw Object.assign(new Error("description must be a string or null"), {
+          error_type: "invalid_description",
+          field: "description",
+          got: params.description,
+          hint: "pass a string, or null to clear the description",
+        });
+      }
+      config.description = params.description as string | null;
       writeVaultConfig(config);
     }
 

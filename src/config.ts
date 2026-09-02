@@ -187,7 +187,7 @@ export interface TagSchema {
 
 export interface VaultConfig {
   name: string;
-  description?: string;
+  description?: string | null;
   api_keys: StoredKey[];
   created_at: string;
   tag_schemas?: Record<string, TagSchema>;
@@ -516,7 +516,13 @@ export function defaultBackupConfig(): BackupConfig {
 function serializeVaultConfig(config: VaultConfig): string {
   const lines: string[] = [];
   lines.push(`name: ${config.name}`);
-  if (config.description) {
+  // vault#669: only serialize a real string. A non-string that slipped
+  // past a write door used to throw here (`description.split is not a
+  // function`) and 500 the request; the doors now reject that shape, and
+  // this is the persist-time backstop so a poisoned in-memory config
+  // cannot crash the write path either. Falsy / non-string omits the
+  // field, which is how a `null` description clears.
+  if (typeof config.description === "string" && config.description.length > 0) {
     lines.push(`description: |`);
     for (const line of config.description.split("\n")) {
       lines.push(`  ${line}`);

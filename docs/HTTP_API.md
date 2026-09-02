@@ -1421,13 +1421,15 @@ update used to skip the underlying `UPDATE notes` entirely and leave
 (which orders by `updated_at`) and any `updated_at`-based sync filter. A tag
 **rename** cascade that rewrites note `content` (`#oldtag` → `#newtag`
 references) or a note's `path` bumps the rewritten notes' `updated_at` too,
-for the same reason. **`merge-tags` deliberately does NOT bump `updated_at`
-on the retagged notes** — a merge only relabels `note_tags` rows (it never
-rewrites a note's own `content` or `path`), and bumping every note that
-carried a merged-away tag would flood cursor consumers with a taxonomy-admin
-event that changed no note content; this intentional asymmetry with the
-content-rewriting rename cascade is tracked for reconsideration (vault#555
-follow-up).
+for the same reason. **`merge-tags` bumps `updated_at` on every note whose
+tags it actually repoints (vault#567).** A merge only relabels `note_tags`
+rows (it never rewrites a note's own `content` or `path`), but the retag
+is a real mutation: a tags-only `update-note` already bumps, and a
+cursor/sync consumer that misses the bulk equivalent would silently skip
+notes whose only change was the merge. Notes that did not carry a
+merged-away source tag are left untouched. `rename-tag`'s bulk `note_tags`
+repoint still does not bump on its own — the rename cascade only bumps
+notes whose `content` or `path` it rewrote.
 
 **Batch `force`/`if_updated_at` defaults (MCP `update-note` only, vault#554).**
 REST `PATCH` is single-note; the MCP `update-note` tool additionally accepts
@@ -1965,7 +1967,9 @@ schemas are consumed, not merged field-by-field).
 recorded with count `0`. Duplicate sources are deduped; `target` appearing
 in `sources` is a no-op for that entry.
 
-Returns `{ "merged": { [source]: count }, "target": string }`.
+Returns `{ "merged": { [source]: count }, "target": string }`. Every note
+that carried a merged-away source tag has its `updated_at` bumped
+(vault#567), so cursor/sync consumers re-deliver those notes.
 
 Refused with `409 tag_in_use_by_tokens` if any source tag is referenced by
 a tag-scoped token.
