@@ -6,7 +6,8 @@
  *   - WHO  (`actor`): JWT `sub` on the hub path; `operator` for the env-var
  *     bearer; `token:<id>` for legacy YAML keys.
  *   - VIA  (`via`):  `api` (credential class) on the REST path; `operator` for
- *     the env-var bearer; refined to `mcp` by the MCP handler.
+ *     the env-var bearer; `nostr:<pubkey>` when the hub stamped a NIP-98
+ *     signing key (vault#601); refined to `mcp` by the MCP handler otherwise.
  *
  * The store-layer column behavior + query filters live in
  * core/src/attribution.test.ts. This file pins the AUTH → AuthResult mapping
@@ -27,7 +28,7 @@ import {
   hashKey,
 } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
-import { authenticateVaultRequest } from "./auth.ts";
+import { authenticateVaultRequest, refineMcpVia } from "./auth.ts";
 import { resetJwksCache, resetRevocationCache } from "./hub-jwt.ts";
 import { generateScopedMcpTools } from "./mcp-tools.ts";
 import { parseNotesQueryOpts } from "./routes.ts";
@@ -68,10 +69,21 @@ function startHubFixture(keys: Keypair[]): { origin: string; stop: () => void } 
 }
 async function signJwt(
   kp: Keypair,
-  opts: { iss: string; aud: string; scope: string; sub?: string },
+  opts: {
+    iss: string;
+    aud: string;
+    scope: string;
+    sub?: string;
+    /** Raw `permissions` claim — vault#601 carries `principal_pubkey` here. */
+    permissions?: unknown;
+  },
 ): Promise<string> {
   const iat = Math.floor(Date.now() / 1000);
-  return await new SignJWT({ scope: opts.scope, client_id: "test-client" })
+  return await new SignJWT({
+    scope: opts.scope,
+    client_id: "test-client",
+    ...(opts.permissions !== undefined ? { permissions: opts.permissions } : {}),
+  })
     .setProtectedHeader({ alg: "RS256", kid: kp.kid })
     .setIssuer(opts.iss)
     .setSubject(opts.sub ?? "user-1")
@@ -346,5 +358,252 @@ describe("attribution threading — REST query filters (symmetric with MCP)", ()
     const { queryOpts } = parseNotesQueryOpts(url);
     expect(queryOpts?.createdBy).toBeUndefined();
     expect(queryOpts?.lastUpdatedVia).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// vault#601 — Nostr principal attribution
+//
+// The hub's NIP-98 `/mcp` door mints the vault hop token with
+// `permissions.principal_pubkey = <64-hex>`. `created_by` stays the hub USER
+// id (two agents linked to one user share it), so `created_via` /
+// `last_updated_via` are the ONLY axis that tells them apart.
+// ---------------------------------------------------------------------------
+
+const PUBKEY_A = "a".repeat(64);
+const PUBKEY_B = "e6619493" + "b".repeat(56);
+
+describe("attribution threading — nostr principal (vault#601)", () => {
+  test("hub JWT with permissions.principal_pubkey → via = 'nostr:<pubkey>', actor unchanged", async () => {
+    seedVaultNoKey("journal");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:write",
+      sub: "e6619493-hub-user",
+      permissions: { principal_pubkey: PUBKEY_A },
+    });
+    const result = await authenticateVaultRequest(bearer(token), readVaultConfig("journal")!);
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      // `created_by` axis is untouched — still the hub user.
+      expect(result.actor).toBe("e6619493-hub-user");
+      expect(result.via).toBe(`nostr:${PUBKEY_A}`);
+    }
+  });
+
+  test("a malformed principal_pubkey degrades to 'api' — never 401, never stored", async () => {
+    seedVaultNoKey("journal");
+    // Uppercase hex, wrong length, non-hex, non-string, and an npub — each must
+    // fail SOFT (attribution is a label, not an access decision).
+    const bad: unknown[] = [
+      "A".repeat(64),
+      "ab".repeat(20),
+      `${"z".repeat(64)}`,
+      12345,
+      { hex: PUBKEY_A },
+      "npub1qqqqq",
+      null,
+    ];
+    for (const value of bad) {
+      const token = await signJwt(kp, {
+        iss: fixture.origin,
+        aud: "vault.journal",
+        scope: "vault:journal:write",
+        sub: "hub-user",
+        permissions: { principal_pubkey: value },
+      });
+      const result = await authenticateVaultRequest(bearer(token), readVaultConfig("journal")!);
+      expect("error" in result).toBe(false);
+      if (!("error" in result)) expect(result.via).toBe("api");
+    }
+  });
+
+  test("principal_pubkey coexists with scoped_tags in the same permissions claim", async () => {
+    seedVaultNoKey("journal");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:write",
+      sub: "hub-user",
+      permissions: { principal_pubkey: PUBKEY_A, scoped_tags: ["daily"] },
+    });
+    const result = await authenticateVaultRequest(bearer(token), readVaultConfig("journal")!);
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.via).toBe(`nostr:${PUBKEY_A}`);
+      expect(result.scoped_tags).toEqual(["daily"]);
+    }
+  });
+
+  test("ORDERING GUARANTEE: a permissions claim with ONLY principal_pubkey is ignorable — scoped_tags stays unscoped", async () => {
+    // This is the "vault ships first" safety argument, pinned as a test: the
+    // ONLY pre-existing reader of `permissions` is
+    // `parseScopedTagsFromPermissions`, and it returns null (unscoped) when
+    // `scoped_tags` is absent. So a hub that emits the new claim against an
+    // OLD vault changes nothing.
+    seedVaultNoKey("journal");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:write",
+      sub: "hub-user",
+      permissions: { principal_pubkey: PUBKEY_A },
+    });
+    const result = await authenticateVaultRequest(bearer(token), readVaultConfig("journal")!);
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) expect(result.scoped_tags).toBeNull();
+  });
+
+  test("refineMcpVia keeps a nostr signer, refines the generic classes, keeps operator", () => {
+    expect(refineMcpVia(`nostr:${PUBKEY_A}`)).toBe(`nostr:${PUBKEY_A}`);
+    expect(refineMcpVia("operator")).toBe("operator");
+    expect(refineMcpVia("api")).toBe("mcp");
+    expect(refineMcpVia("token:abc123")).toBe("mcp");
+    expect(refineMcpVia(null)).toBe("mcp");
+  });
+});
+
+describe("attribution threading — nostr signer lands on every MCP write path", () => {
+  function nostrAuth(hubUserId: string, vaultName: string, pubkey: string): AuthResult {
+    return {
+      permission: "full",
+      scopes: [`vault:${vaultName}:write`, `vault:${vaultName}:read`],
+      legacyDerived: false,
+      scoped_tags: null,
+      vault_name: null,
+      caller_jti: null,
+      actor: hubUserId,
+      via: `nostr:${pubkey}`,
+    };
+  }
+
+  test("create-note: both *_via columns carry the signer, created_by stays the hub user", async () => {
+    seedVaultNoKey("journal");
+    const tools = generateScopedMcpTools(
+      "journal",
+      nostrAuth("e6619493-hub-user", "journal", PUBKEY_A),
+      null,
+    );
+    const create = tools.find((t) => t.name === "create-note")!;
+    const created = (await create.execute({ content: "signed by A" })) as { id: string };
+
+    const store = getVaultStore("journal");
+    const row = store.db
+      .prepare(
+        "SELECT created_by, created_via, last_updated_by, last_updated_via FROM notes WHERE id = ?",
+      )
+      .get(created.id) as Record<string, string | null>;
+    expect(row.created_by).toBe("e6619493-hub-user");
+    expect(row.last_updated_by).toBe("e6619493-hub-user");
+    expect(row.created_via).toBe(`nostr:${PUBKEY_A}`);
+    expect(row.last_updated_via).toBe(`nostr:${PUBKEY_A}`);
+  });
+
+  test("create-note BATCH: every item in the batch carries the signer", async () => {
+    seedVaultNoKey("journal");
+    const tools = generateScopedMcpTools("journal", nostrAuth("hub-user", "journal", PUBKEY_A), null);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({
+      notes: [
+        { content: "one", path: "Batch/One" },
+        { content: "two", path: "Batch/Two" },
+      ],
+    });
+    const store = getVaultStore("journal");
+    const rows = store.db
+      .prepare("SELECT created_via, last_updated_via FROM notes WHERE path LIKE 'Batch/%'")
+      .all() as Array<Record<string, string | null>>;
+    expect(rows.length).toBe(2);
+    for (const row of rows) {
+      expect(row.created_via).toBe(`nostr:${PUBKEY_A}`);
+      expect(row.last_updated_via).toBe(`nostr:${PUBKEY_A}`);
+    }
+  });
+
+  test("THE REPORTED BUG: agent B appending to agent A's note is distinguishable", async () => {
+    // Observed 2026-09-02: GrokJi's append showed lastUpdatedBy = e6619493-…,
+    // byte-identical to ClaudeJi's, because both link to the same hub user and
+    // both writes stamped via="mcp".
+    seedVaultNoKey("journal");
+    const HUB_USER = "e6619493-shared-hub-user";
+    const store = getVaultStore("journal");
+
+    const toolsA = generateScopedMcpTools("journal", nostrAuth(HUB_USER, "journal", PUBKEY_A), null);
+    const created = (await toolsA.find((t) => t.name === "create-note")!.execute({
+      content: "written by A",
+      path: "Shared/Note",
+    })) as { id: string };
+
+    const toolsB = generateScopedMcpTools("journal", nostrAuth(HUB_USER, "journal", PUBKEY_B), null);
+    await toolsB
+      .find((t) => t.name === "update-note")!
+      .execute({ id: created.id, append: "\n\nappended by B" });
+
+    const after = await store.getNote(created.id);
+    // Same hub user on both axes — that is correct and unchanged.
+    expect(after?.createdBy).toBe(HUB_USER);
+    expect(after?.lastUpdatedBy).toBe(HUB_USER);
+    // …but the two agents are now distinguishable.
+    expect(after?.createdVia).toBe(`nostr:${PUBKEY_A}`);
+    expect(after?.lastUpdatedVia).toBe(`nostr:${PUBKEY_B}`);
+    expect(after?.content).toContain("appended by B");
+  });
+
+  test("update-note (full replace) bumps last_updated_via to the new signer", async () => {
+    seedVaultNoKey("journal");
+    const store = getVaultStore("journal");
+    const seed = await store.createNote("seed", { actor: "hub-user", via: `nostr:${PUBKEY_A}` });
+    const toolsB = generateScopedMcpTools("journal", nostrAuth("hub-user", "journal", PUBKEY_B), null);
+    await toolsB
+      .find((t) => t.name === "update-note")!
+      .execute({ id: seed.id, content: "replaced by B", force: true });
+    const after = await store.getNote(seed.id);
+    expect(after?.createdVia).toBe(`nostr:${PUBKEY_A}`); // set-once
+    expect(after?.lastUpdatedVia).toBe(`nostr:${PUBKEY_B}`);
+  });
+
+  test("update-note if_missing:'create' (upsert-create) stamps the signer on both pairs", async () => {
+    seedVaultNoKey("journal");
+    const tools = generateScopedMcpTools("journal", nostrAuth("hub-user", "journal", PUBKEY_B), null);
+    const created = (await tools.find((t) => t.name === "update-note")!.execute({
+      id: "Upsert/Born",
+      content: "born via upsert",
+      if_missing: "create",
+    })) as { id: string };
+    const store = getVaultStore("journal");
+    const row = store.db
+      .prepare("SELECT created_via, last_updated_via FROM notes WHERE id = ?")
+      .get(created.id) as Record<string, string | null>;
+    expect(row.created_via).toBe(`nostr:${PUBKEY_B}`);
+    expect(row.last_updated_via).toBe(`nostr:${PUBKEY_B}`);
+  });
+
+  test("the signer is FILTERABLE via created_via / last_updated_via", async () => {
+    seedVaultNoKey("journal");
+    const store = getVaultStore("journal");
+    const toolsA = generateScopedMcpTools("journal", nostrAuth("hub-user", "journal", PUBKEY_A), null);
+    const toolsB = generateScopedMcpTools("journal", nostrAuth("hub-user", "journal", PUBKEY_B), null);
+    const byA = (await toolsA.find((t) => t.name === "create-note")!.execute({
+      content: "A wrote this",
+      path: "Filter/A",
+    })) as { id: string };
+    await toolsB.find((t) => t.name === "create-note")!.execute({
+      content: "B wrote this",
+      path: "Filter/B",
+    });
+    // B then edits A's note — created_via stays A, last_updated_via becomes B.
+    await toolsB
+      .find((t) => t.name === "update-note")!
+      .execute({ id: byA.id, append: " (edited)" });
+
+    const createdByA = await store.queryNotes({ createdVia: `nostr:${PUBKEY_A}` });
+    expect(createdByA.map((n) => n.path)).toEqual(["Filter/A"]);
+
+    const touchedByB = await store.queryNotes({ lastUpdatedVia: `nostr:${PUBKEY_B}` });
+    expect(touchedByB.map((n) => n.path).sort()).toEqual(["Filter/A", "Filter/B"]);
+
+    // And the old flat label matches nothing now that the signer is recorded.
+    expect(await store.queryNotes({ createdVia: "mcp" })).toEqual([]);
   });
 });

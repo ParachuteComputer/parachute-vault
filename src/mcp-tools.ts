@@ -18,6 +18,7 @@ import { readVaultConfig, writeVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { hasScopeForVault, hasMigrateScopeForVault, parseScopes, validateMintedScopes, logStrictBypass } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
+import { refineMcpVia } from "./auth.ts";
 import {
   expandTokenTagScope,
   filterHydratedLinksByTagScope,
@@ -226,14 +227,19 @@ export function generateScopedMcpTools(
 
   // Write-attribution (vault#298). Every write through an MCP session arrives
   // on the `mcp` channel — so we REFINE the auth's base `via` (the generic
-  // credential class) to `mcp` here, where the path/channel is known. The
-  // operator bearer keeps `operator` (its credential class IS its channel and
-  // is more informative than `mcp` for cross-container hub→vault writes); any
-  // other credential's via becomes `mcp`. `actor` (the principal) passes
-  // through unchanged.
-  const writeContext = auth
-    ? { actor: auth.actor, via: auth.via === "operator" ? "operator" : "mcp" }
-    : undefined;
+  // credential class) to `mcp` here, where the path/channel is known. `actor`
+  // (the principal) passes through unchanged.
+  //
+  // Two classes are kept INSTEAD of `mcp`, because each is strictly more
+  // informative than the channel:
+  //   - `operator` — the env-var bearer's credential class IS its channel, and
+  //     it names cross-container hub→vault writes (vault#298).
+  //   - `nostr:<pubkey>` — the NIP-98 signer (vault#601). Every agent coming
+  //     through the hub's `/mcp` door arrives on the `mcp` channel, so `mcp`
+  //     cannot tell two agents apart; the signing key can. `created_by` is
+  //     still the shared hub user, so this is the ONLY attribution axis that
+  //     distinguishes them — flattening it here would reintroduce the bug.
+  const writeContext = auth ? { actor: auth.actor, via: refineMcpVia(auth.via) } : undefined;
 
   // Migration-bypass (vault#299): a `vault:migrate`-scoped MCP session skips
   // strict-schema enforcement and logs every bypassed write. Orthogonal to
