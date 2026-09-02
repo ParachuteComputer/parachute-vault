@@ -7,7 +7,7 @@
  *     bearer; `token:<id>` for legacy YAML keys.
  *   - VIA  (`via`):  `api` (credential class) on the REST path; `operator` for
  *     the env-var bearer; `nostr:<pubkey>` when the hub stamped a NIP-98
- *     signing key (vault#601); refined to `mcp` by the MCP handler otherwise.
+ *     signing key (vault#698); refined to `mcp` by the MCP handler otherwise.
  *
  * The store-layer column behavior + query filters live in
  * core/src/attribution.test.ts. This file pins the AUTH → AuthResult mapping
@@ -74,7 +74,7 @@ async function signJwt(
     aud: string;
     scope: string;
     sub?: string;
-    /** Raw `permissions` claim — vault#601 carries `principal_pubkey` here. */
+    /** Raw `permissions` claim — vault#698 carries `principal_pubkey` here. */
     permissions?: unknown;
   },
 ): Promise<string> {
@@ -362,7 +362,7 @@ describe("attribution threading — REST query filters (symmetric with MCP)", ()
 });
 
 // ---------------------------------------------------------------------------
-// vault#601 — Nostr principal attribution
+// vault#698 — Nostr principal attribution
 //
 // The hub's NIP-98 `/mcp` door mints the vault hop token with
 // `permissions.principal_pubkey = <64-hex>`. `created_by` stays the hub USER
@@ -373,7 +373,7 @@ describe("attribution threading — REST query filters (symmetric with MCP)", ()
 const PUBKEY_A = "a".repeat(64);
 const PUBKEY_B = "e6619493" + "b".repeat(56);
 
-describe("attribution threading — nostr principal (vault#601)", () => {
+describe("attribution threading — nostr principal (vault#698)", () => {
   test("hub JWT with permissions.principal_pubkey → via = 'nostr:<pubkey>', actor unchanged", async () => {
     seedVaultNoKey("journal");
     const token = await signJwt(kp, {

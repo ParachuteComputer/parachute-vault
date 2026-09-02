@@ -164,7 +164,7 @@ export interface AuthResult {
    * `mcp` · `surface:<name>` · `agent:<id>` · `nostr:<pubkey>` · `operator` ·
    * `api`. This is the BASE value from auth — the credential class:
    *   - Hub JWT with a `permissions.principal_pubkey` claim → `nostr:<pubkey>`
-   *     (vault#601). The signer is MORE specific than the channel, and unlike
+   *     (vault#698). The signer is MORE specific than the channel, and unlike
    *     every other class it distinguishes two agents that share one hub user,
    *     so downstream does NOT refine it away — see `mcp-tools.ts`.
    *   - Hub JWT  → `"api"` (the generic class; refined to `mcp` etc. downstream
@@ -494,19 +494,25 @@ export function nostrVia(pubkey: string): string {
  * already names a *principal or channel of its own*:
  *
  *   - `operator` — the env-var bearer (vault#298).
- *   - `nostr:<pubkey>` — the NIP-98 signer (vault#601). Every hub `/mcp`
+ *   - `nostr:<pubkey>` — the NIP-98 signer (vault#698). Every hub `/mcp`
  *     caller is on the `mcp` channel, so `mcp` cannot distinguish two agents
  *     sharing a hub user; the key can.
  */
-export function refineMcpVia(via: string | null): string {
+export function refineMcpVia(via: string | null | undefined): string {
+  // `undefined` is accepted alongside `null` on purpose: `AuthResult` declares
+  // `via: string | null`, but several in-repo call sites build the object
+  // without the key (attachment tools, test harnesses). The expression this
+  // replaced (`auth.via === "operator" ? … : "mcp"`) tolerated that silently,
+  // so a `string`-only signature here would turn a missing key into a
+  // TypeError at write time. Narrow on `typeof`, not on `!== null`.
   if (via === "operator") return "operator";
-  if (via !== null && via.startsWith("nostr:")) return via;
+  if (typeof via === "string" && via.startsWith("nostr:")) return via;
   return "mcp";
 }
 
 /**
  * Read the signing pubkey out of a validated hub JWT's `permissions` claim
- * (vault#601 / hub#936 — Nostr principal attribution).
+ * (vault#698 / hub#937 — Nostr principal attribution).
  *
  * Wire contract: `permissions: { principal_pubkey: "<64 lowercase hex>" }`.
  * The hub stamps it ONLY on tokens minted for a NIP-98-authenticated caller;
@@ -645,7 +651,7 @@ async function authenticateHubJwt(
     // Throws MalformedScopedTagsError (caught below → 401) on a present-but-
     // malformed claim so we never widen access on a misread.
     const scoped_tags = parseScopedTagsFromPermissions(claims.permissions);
-    // Write-attribution axis 2 (vault#601): the NIP-98 signing pubkey, when
+    // Write-attribution axis 2 (vault#698): the NIP-98 signing pubkey, when
     // the hub stamped one. Fail-soft — see `parsePrincipalPubkey`.
     const principalPubkey = parsePrincipalPubkey(claims.permissions);
     return {
@@ -670,7 +676,7 @@ async function authenticateHubJwt(
       // channel comes from the path instead.
       actor: claims.sub && claims.sub.length > 0 ? claims.sub : null,
       // VIA: `nostr:<pubkey>` when the hub tells us which key signed the
-      // request that produced this token (vault#601 — the NIP-98 `/mcp` door),
+      // request that produced this token (vault#698 — the NIP-98 `/mcp` door),
       // otherwise the generic `api` credential class the request path refines.
       // `actor` is untouched on purpose: it stays the hub USER id, so two
       // agents sharing a hub user keep one `created_by` and are told apart by

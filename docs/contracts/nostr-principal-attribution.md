@@ -1,6 +1,6 @@
 # Nostr principal attribution — `permissions.principal_pubkey`
 
-**Status:** live (vault#601 · hub#936). **Enforced by:** parachute-vault.
+**Status:** live (vault#698 · hub#937). **Enforced by:** parachute-vault.
 **Emitted by:** parachute-hub's account-MCP → vault hop mint.
 
 ## The problem

@@ -234,7 +234,7 @@ export function generateScopedMcpTools(
   // informative than the channel:
   //   - `operator` — the env-var bearer's credential class IS its channel, and
   //     it names cross-container hub→vault writes (vault#298).
-  //   - `nostr:<pubkey>` — the NIP-98 signer (vault#601). Every agent coming
+  //   - `nostr:<pubkey>` — the NIP-98 signer (vault#698). Every agent coming
   //     through the hub's `/mcp` door arrives on the `mcp` channel, so `mcp`
   //     cannot tell two agents apart; the signing key can. `created_by` is
   //     still the shared hub user, so this is the ONLY attribution axis that
