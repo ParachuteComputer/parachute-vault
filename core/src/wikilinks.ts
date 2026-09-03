@@ -515,8 +515,15 @@ export function syncWikilinks(
  * already migrated. `PRAGMA table_info` on a nonexistent table returns zero
  * rows rather than throwing, so this is safe to call unconditionally,
  * including from read paths that don't want to create the table lazily.
+ *
+ * Also the body of `migrateToV28` (vault#567 item 2): boot runs this once
+ * via `initSchema` so a pre-#555 2-column table is healed before the first
+ * wikilink touch. Gated the existing way — no table → return; column
+ * present → return; only the 2-column shape rebuilds. Does NOT create the
+ * table on vaults that never queued an unresolved link (lazy creation
+ * stays). The per-touch calls below become a no-op after v28.
  */
-function ensureRelationshipColumn(db: Database): void {
+export function ensureRelationshipColumn(db: Database): void {
   const cols = db.prepare("PRAGMA table_info(unresolved_wikilinks)").all() as { name: string }[];
   if (cols.length === 0) return; // table doesn't exist — nothing to heal
   if (cols.some((c) => c.name === "relationship")) return; // already migrated

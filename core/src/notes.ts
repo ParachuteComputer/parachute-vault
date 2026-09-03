@@ -1053,8 +1053,9 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   // Presence: has_broken_links (vault#555) — a dangling outbound wikilink or
   // structured `links` target that never resolved. The `unresolved_wikilinks`
   // table is created lazily (see wikilinks.ts:ensureUnresolvedTable) only when
-  // a link actually goes unresolved — a vault where nothing ever has won't
-  // have the table at all. Check existence first rather than reference it
+  // a link actually goes unresolved — migrateToV28 heals a pre-#555 2-column
+  // table at boot but does NOT create the table on a vault that never queued
+  // one. Check existence first rather than reference it
   // unconditionally: a read-only query filter shouldn't have the side effect
   // of creating a table, and a bare `EXISTS`/`NOT EXISTS` against a missing
   // table would throw "no such table" instead of the correct empty answer.
