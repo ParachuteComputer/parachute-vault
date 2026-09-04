@@ -893,6 +893,13 @@ Query params:
     `has_ambiguous_links=true` and gains the link); delete them all and it
     demotes to an ordinary broken link. Safe on a vault where no link has
     ever been ambiguous — `true` matches nothing, `false` is a no-op.
+    **Tag-scoped tokens** get the answer computed on the notes they can see:
+    each collision's candidates are re-counted against the token's scope and
+    only counts as ambiguous when two or more remain, so a collision between
+    a visible and an invisible note is not reported (and, symmetrically, is
+    not excluded from `has_ambiguous_links=false`). Like every scoped read,
+    the page is narrowed after it is drawn, so a scoped page can come back
+    shorter than `limit` while more results remain.
   - `path=foo/bar` — exact path match.
   - `path_prefix=foo/` — startswith. Matched literally: `%` and `_` in the
     prefix are escaped, so `path_prefix=_tags/` does not also match
@@ -1398,7 +1405,10 @@ Folding options:
   above.
 - `include_ambiguous_links=true` — append ambiguous outbound links as
   `ambiguous_links: [{target, relationship, candidate_count}]` (vault#581).
-  See `has_ambiguous_links` above.
+  See `has_ambiguous_links` above. `candidate_count` is the number of
+  candidates VISIBLE to the caller — for a tag-scoped token that is the count
+  within its own scope, and a row with fewer than two visible candidates is
+  omitted entirely.
 - `include_attachments=true` — append attachments as an `attachments` field.
 - `include_metadata=...` — same allowlist as the list endpoint.
 - `expand=true&depth=N` — inline `[[wikilink]]` targets.

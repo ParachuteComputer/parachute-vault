@@ -212,6 +212,24 @@ export function generateScopedMcpTools(
         )
     : undefined;
 
+  // Tag-scope guard for the ambiguous-links surface (vault#581 auth review):
+  // `candidate_count` is derived vault-wide, so without this a `work`-scoped
+  // reader learns from `candidate_count: 2` on its own `[[Dup]]` that a
+  // second `Dup` exists in a scope it cannot see — and `has_ambiguous_links:
+  // true` turns that into a standing, sweepable census of cross-scope naming
+  // collisions. Identical closure/shape to `nearTraversable` above (by note
+  // id, tags looked up sync + core-native); core narrows each row's
+  // candidates through it. Unscoped sessions install no predicate, so the
+  // persisted counts and the SQL filter answer directly, unchanged.
+  const ambiguityVisible = scoped
+    ? (noteId: string) =>
+        noteWithinTagScope(
+          { id: noteId, tags: getNoteTags(store.db, noteId) } as Note,
+          allowedHolder.value,
+          rawTags,
+        )
+    : undefined;
+
   // Tag-scope guard for `create-note` `if_exists` (vault#555 auth-review
   // must-fix): the core `if_exists` upsert resolves the target path VAULT-WIDE
   // and returns/updates/replaces the found note, so a scoped caller could
@@ -275,6 +293,7 @@ export function generateScopedMcpTools(
     ...(nearTraversable ? { nearTraversable } : {}),
     ...(ifExistsVisible ? { ifExistsVisible } : {}),
     ...(aggregateVisibility ? { aggregateVisibility } : {}),
+    ...(ambiguityVisible ? { ambiguityVisible } : {}),
     ...(writeContext ? { writeContext } : {}),
     ...(strictBypass ? { strictBypass } : {}),
     ...(onStrictBypass ? { onStrictBypass } : {}),

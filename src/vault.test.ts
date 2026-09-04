@@ -1803,6 +1803,85 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
+  // vault#581 auth-review MUST-FIX, MCP door. Same contract as the REST
+  // twins in the "HTTP tag-scope confidentiality" block: a scoped reader's
+  // ambiguous-links answer is exactly what an unscoped reader would get on a
+  // vault containing only the notes it can see.
+  async function ambiguityVault(prefix: string, secondDupTags: string[]) {
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore } = await import("./vault-store.ts");
+    const vaultName = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("work dup", { path: "wdup/Dup", tags: ["work"] });
+    await store.createNote("other dup", { path: "odup/Dup", tags: secondDupTags });
+    const src = await store.createNote("src [[Dup]]", { path: "work-src", tags: ["work"] });
+    return { vaultName, src };
+  }
+
+  test("MCP include_ambiguous_links does NOT reveal an out-of-scope colliding note", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-amb", ["personal"]);
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: src.id, include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain("odup/Dup");
+
+    closeAllStores();
+  });
+
+  test("MCP has_ambiguous_links does not let a scoped session sweep for cross-scope collisions", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-amb-sweep", ["personal"]);
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const truthy = await query.execute({ has_ambiguous_links: true }) as any[];
+    expect(truthy.map((n: any) => n.id)).not.toContain(src.id);
+    expect(truthy).toEqual([]);
+    // ...and the same fact must not leak by ABSENCE from the false query.
+    const falsy = await query.execute({ has_ambiguous_links: false }) as any[];
+    expect(falsy.map((n: any) => n.id)).toContain(src.id);
+
+    closeAllStores();
+  });
+
+  test("MCP POSITIVE CONTROL: both colliding notes in scope → real ambiguity, count 2", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-amb-pos", ["work"]);
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: src.id, include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+    expect(((await query.execute({ has_ambiguous_links: true })) as any[]).map((n: any) => n.id))
+      .toEqual([src.id]);
+
+    closeAllStores();
+  });
+
+  test("UNSCOPED MCP still sees the cross-scope collision in full (regression)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-amb-unscoped", ["personal"]);
+
+    const tools = generateScopedMcpTools(vaultName);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: src.id, include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+    expect(((await query.execute({ has_ambiguous_links: true })) as any[]).map((n: any) => n.id))
+      .toEqual([src.id]);
+
+    closeAllStores();
+  });
+
   test("MCP include_links strips out-of-scope NEIGHBOR summaries", async () => {
     const { generateScopedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");
@@ -4839,6 +4918,145 @@ describe("HTTP tag-scope confidentiality (security review)", async () => {
     const targets = (body.unresolved as any[]).map((r) => r.target_path);
     expect(targets).toContain("NoSuchWork");
     expect(targets).toContain("NoSuchPersonal");
+  });
+
+  // vault#581 auth-review MUST-FIX: `candidate_count` is derived VAULT-WIDE,
+  // so the ambiguous-links surface must not tell a scoped reader that a note
+  // it cannot see exists. The contract: a scoped reader's answer is exactly
+  // what an unscoped reader would get on a vault containing only the notes it
+  // can see. Each assertion MUST fail without the visible-candidate recompute.
+
+  /** One #work source `[[Dup]]`, one in-scope Dup, one out-of-scope Dup. */
+  async function crossScopeDupFixture(secondDupTags: string[]) {
+    await store.createNote("work dup", { path: "wdup/Dup", tags: ["work"] });
+    await store.createNote("other dup", { path: "odup/Dup", tags: secondDupTags });
+    return await store.createNote("src [[Dup]]", { path: "work-src", tags: ["work"] });
+  }
+
+  test("include_ambiguous_links does NOT reveal an out-of-scope colliding note", async () => {
+    // The reviewer's exact probe. Only ONE Dup is visible to `work`, so in
+    // this reader's sub-vault `[[Dup]]` is not ambiguous at all.
+    const src = await crossScopeDupFixture(["personal"]);
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_ambiguous_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any;
+    expect(body.ambiguous_links).toEqual([]);
+    expect(JSON.stringify(body)).not.toContain("odup/Dup");
+  });
+
+  test("has_ambiguous_links=true does not let a scoped token sweep for cross-scope collisions", async () => {
+    const src = await crossScopeDupFixture(["personal"]);
+    const res = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=true"),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.id)).not.toContain(src.id);
+    expect(body).toEqual([]);
+  });
+
+  test("has_ambiguous_links=false does not leak the same fact by ABSENCE", async () => {
+    // The note is not ambiguous in this reader's sub-vault, so a `false`
+    // query must RETURN it. Excluding it would leak the collision just as
+    // loudly as including it in the `true` query.
+    const src = await crossScopeDupFixture(["personal"]);
+    const res = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=false"),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.id)).toContain(src.id);
+  });
+
+  test("aggregate over has_ambiguous_links does not leak the collision as a count", async () => {
+    await crossScopeDupFixture(["personal"]);
+    const res = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=true&aggregate[op]=count"),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    // Ungrouped count comes back as `[{group: null, value: N}]`; N must be 0
+    // — a 1 here would announce the invisible collision just as loudly.
+    expect(await res.json()).toEqual([{ group: null, value: 0 }]);
+  });
+
+  test("POSITIVE CONTROL: both colliding notes in scope → real ambiguity, count 2", async () => {
+    // Same shape, both Dups #work. The scoped reader must get the FULL,
+    // unredacted answer — otherwise the tests above would pass on a fix that
+    // simply disabled the feature for scoped tokens.
+    const src = await crossScopeDupFixture(["work"]);
+    const single = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_ambiguous_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect((await single.json() as any).ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+
+    const swept = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=true"),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect((await swept.json() as any[]).map((n) => n.id)).toEqual([src.id]);
+  });
+
+  test("UNSCOPED still sees the cross-scope collision in full (regression)", async () => {
+    const src = await crossScopeDupFixture(["personal"]);
+    const single = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_ambiguous_links=true`),
+      store,
+      "",
+      "v",
+      NO_SCOPE,
+    );
+    expect((await single.json() as any).ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+
+    const swept = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=true"),
+      store,
+      "",
+      "v",
+      NO_SCOPE,
+    );
+    expect((await swept.json() as any[]).map((n) => n.id)).toEqual([src.id]);
+  });
+
+  test("a partly-visible collision reports only the VISIBLE candidate count", async () => {
+    // Three Dups: two #work (visible), one #personal (not). The reader's
+    // sub-vault genuinely has an ambiguity — of degree 2, not 3.
+    await store.createNote("w1", { path: "w1/Trio", tags: ["work"] });
+    await store.createNote("w2", { path: "w2/Trio", tags: ["work"] });
+    await store.createNote("p1", { path: "p1/Trio", tags: ["personal"] });
+    const src = await store.createNote("src [[Trio]]", { path: "trio-src", tags: ["work"] });
+
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_ambiguous_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect((await res.json() as any).ambiguous_links)
+      .toEqual([{ target: "Trio", relationship: "wikilink", candidate_count: 2 }]);
   });
 
   // vault#555 auth-review CRITICAL: `if_exists` must NOT become a tag-scope

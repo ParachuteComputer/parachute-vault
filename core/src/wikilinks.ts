@@ -909,8 +909,42 @@ export function clearAmbiguousLinkTarget(
  * query for the whole page (mirrors {@link getUnresolvedLinksForNotes}), not
  * one per note. Every requested id gets an entry (possibly `[]`); when the
  * table has never been created every id maps to `[]` without a query attempt.
+ *
+ * `visible` (vault#581 auth review) is an OPTIONAL per-candidate-note
+ * predicate, injected by the server layer for a TAG-SCOPED reader. Core
+ * stays scope-unaware — it only invokes the closure — exactly like
+ * `nearTraversable` / `expandVisibility` / `aggregateVisibility` on the MCP
+ * tool layer.
+ *
+ * Why it's needed: `candidate_count` is derived VAULT-WIDE by
+ * {@link resolveWikilinkDetailed}, so the stored `2` on a `[[Dup]]` whose
+ * candidates are one `#work` and one `#personal` note tells a `work`-scoped
+ * reader that a second `Dup` exists somewhere it cannot see. Unlike
+ * `broken_links` — which is safe by construction, since "unresolved" can
+ * only mean *matched nothing* and therefore can't fingerprint anything —
+ * an ambiguous row exists ONLY because ≥2 notes matched, and the count
+ * quantifies exactly that.
+ *
+ * So when `visible` is supplied, the persisted count is NOT trusted: each
+ * row's target is re-resolved and its candidates narrowed to the ones the
+ * reader can see. A row is reported only when ≥2 VISIBLE candidates remain,
+ * and `candidate_count` is the visible count. That is precisely the answer
+ * an unscoped reader would get on a vault containing only the visible notes
+ * — the same "answer on the visible sub-vault" rule vault#674 (`.tags`
+ * scrubbing) and vault#675 (out-of-scope query tags match nothing) chose,
+ * rather than refusing the request. It also incidentally hides a row that
+ * has gone stale (its target resolves cleanly again but no sweep has
+ * touched it yet), since that too collapses to <2 candidates.
+ *
+ * Cost: one re-resolution per persisted row, and only for scoped readers.
+ * Ambiguous rows are rare by nature (each is a genuine naming collision),
+ * and a page with none does no extra work at all.
  */
-export function getAmbiguousLinksForNotes(db: Database, noteIds: string[]): Map<string, AmbiguousLink[]> {
+export function getAmbiguousLinksForNotes(
+  db: Database,
+  noteIds: string[],
+  visible?: (noteId: string) => boolean,
+): Map<string, AmbiguousLink[]> {
   const result = new Map<string, AmbiguousLink[]>(noteIds.map((id) => [id, []]));
   if (noteIds.length === 0) return result;
 
@@ -928,18 +962,78 @@ export function getAmbiguousLinksForNotes(db: Database, noteIds: string[]): Map<
   }
 
   for (const row of rows) {
+    const relationship = row.relationship || WIKILINK_REL;
+    let candidateCount = row.candidate_count;
+    if (visible) {
+      const detail = relationship === WIKILINK_REL
+        ? resolveWikilinkDetailed(db, row.target_path)
+        : resolveLinkTargetDetailed(db, row.target_path);
+      candidateCount = detail.candidates.filter((c) => visible(c.note_id)).length;
+      if (candidateCount < 2) continue; // not ambiguous in the reader's sub-vault
+    }
     result.get(row.source_id)?.push({
       target: row.target_path,
-      relationship: row.relationship || WIKILINK_REL,
-      candidate_count: row.candidate_count,
+      relationship,
+      candidate_count: candidateCount,
     });
   }
   return result;
 }
 
 /** Single-note convenience wrapper around {@link getAmbiguousLinksForNotes}. */
-export function getAmbiguousLinksForNote(db: Database, noteId: string): AmbiguousLink[] {
-  return getAmbiguousLinksForNotes(db, [noteId]).get(noteId) ?? [];
+export function getAmbiguousLinksForNote(
+  db: Database,
+  noteId: string,
+  visible?: (noteId: string) => boolean,
+): AmbiguousLink[] {
+  return getAmbiguousLinksForNotes(db, [noteId], visible).get(noteId) ?? [];
+}
+
+/**
+ * Narrow a page of notes by the vault#581 `has_ambiguous_links` filter as a
+ * TAG-SCOPED reader should see it. Core's SQL filter counts a persisted row
+ * regardless of whether the reader can see the notes that collided, so on
+ * its own it is an oracle: a scoped caller could sweep its whole in-scope
+ * corpus and enumerate cross-scope naming collisions.
+ *
+ * The server layer therefore asks core for a SUPERSET and applies the real
+ * predicate here:
+ *   - `wanted === true` — the SQL filter is kept (every truly-ambiguous note
+ *     also has a row, so `EXISTS` is a superset) and this drops the notes
+ *     whose rows collapse to <2 visible candidates.
+ *   - `wanted === false` — the SQL filter is LIFTED (it would have excluded
+ *     notes that are not ambiguous in the reader's sub-vault, and a
+ *     post-filter cannot add rows back), and this keeps only notes with no
+ *     surviving row.
+ *
+ * Page-shortening is the same effect `filterNotesByTagScope` already has on
+ * every scoped read — the page is narrowed after core drew it, so a scoped
+ * page can come back shorter than `limit` while more results remain.
+ * No-op when `wanted` is undefined or no predicate is injected (unscoped).
+ */
+export function narrowByVisibleAmbiguity<T extends { id: string }>(
+  db: Database,
+  notes: T[],
+  wanted: boolean | undefined,
+  visible: ((noteId: string) => boolean) | undefined,
+): T[] {
+  if (wanted === undefined || !visible || notes.length === 0) return notes;
+  const byNote = getAmbiguousLinksForNotes(db, notes.map((n) => n.id), visible);
+  return notes.filter((n) => ((byNote.get(n.id)?.length ?? 0) > 0) === wanted);
+}
+
+/**
+ * The `hasAmbiguousLinks` value to push into SQL for a reader that will be
+ * narrowed by {@link narrowByVisibleAmbiguity} afterwards. `true` stays (it
+ * is a superset); `false` is lifted to `undefined` (it is not). Identity for
+ * unscoped readers. Shared by both doors so REST and MCP cannot drift on
+ * which polarity is safe to push down.
+ */
+export function sqlHasAmbiguousLinks(
+  wanted: boolean | undefined,
+  scoped: boolean,
+): boolean | undefined {
+  return scoped && wanted === false ? undefined : wanted;
 }
 
 /**
