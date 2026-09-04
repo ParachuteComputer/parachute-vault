@@ -3,6 +3,7 @@ import type { Note } from "./types.js";
 import * as linkOps from "./links.js";
 import { getNote, findNotesByTitle, extractH1Title } from "./notes.js";
 import { chunkForInClause } from "./sql-in.js";
+import { pathTitle } from "./paths.js";
 import { transaction } from "./txn.js";
 import type { QueryWarning } from "./query-warnings.js";
 
@@ -105,6 +106,117 @@ function stripCode(content: string): string {
   // Replace inline code (` ... `)
   result = result.replace(/`[^`\n]+`/g, (m) => " ".repeat(m.length));
   return result;
+}
+
+/**
+ * Rewrite the TARGET portion of `[[wikilinks]]` in `content`, in place.
+ *
+ * `rename` is called with each bracket's parsed target (trimmed, exactly as
+ * {@link parseWikilinks} would report it) and returns the replacement target
+ * string, or `null`/`undefined` to leave that bracket alone. Everything else
+ * about the bracket survives verbatim — the `!` embed marker, a `|display`
+ * alias, a `#Heading` anchor, a `#^block-ref`, and any surrounding text.
+ *
+ * Brackets inside fenced/inline code are skipped, because {@link stripCode}
+ * is applied before matching — same as the parser. That is deliberate: a
+ * `[[link]]` in a code fence is not a link (it is never parsed, never
+ * resolved, never given a `links` row), so a rename must not silently edit
+ * someone's sample text. The pre-vault#708 cascade rewrote those too, via a
+ * blind content-wide regex.
+ */
+export function rewriteWikilinkTargets(
+  content: string,
+  rename: (target: string) => string | null | undefined,
+): string {
+  const stripped = stripCode(content);
+  const regex = /(!)?\[\[([^\[\]\n]+?)\]\]/g;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(stripped)) !== null) {
+    const inner = match[2]!;
+    // Target part = everything before the first `#` (anchor/block-ref) or
+    // `|` (display alias), whichever comes first. Matches how
+    // `parseWikilinks` splits, for every ordering of the two.
+    let boundary = inner.length;
+    const hashIdx = inner.indexOf("#");
+    const pipeIdx = inner.indexOf("|");
+    if (hashIdx !== -1) boundary = Math.min(boundary, hashIdx);
+    if (pipeIdx !== -1) boundary = Math.min(boundary, pipeIdx);
+    const targetPart = inner.slice(0, boundary);
+    const target = targetPart.trim();
+    if (!target) continue;
+
+    const next = rename(target);
+    if (!next || next === targetPart) continue;
+
+    // `stripCode` preserves offsets, so the match indices address `content`.
+    const start = match.index;
+    const end = start + match[0].length;
+    const innerStart = start + (match[1] ? 3 : 2);
+    out += content.slice(last, innerStart) + next + content.slice(innerStart + boundary, end);
+    last = end;
+  }
+
+  return last === 0 ? content : out + content.slice(last);
+}
+
+/**
+ * How a wikilink target names a note PATH — the shapes
+ * {@link resolveWikilink} can match a path by, in its resolution order.
+ * `null` means the target is not a path-derived name for `path` at all (e.g.
+ * it resolved through the H1-title fallback, which a repath doesn't affect).
+ *
+ * Used by the rename cascade (vault#708) to rewrite a bracket into the SAME
+ * shape it already had rather than forcing every reference to a full path.
+ */
+export type WikilinkPathForm =
+  | { form: "path" }
+  | { form: "title" }
+  | { form: "path-ext"; ext: string };
+
+export function wikilinkPathForm(target: string, path: string): WikilinkPathForm | null {
+  const lower = target.toLowerCase();
+  const title = pathTitle(path);
+  // Order mirrors `resolveWikilink`: a literal path wins over the
+  // explicit-extension reading of the same string (`Recipe.v2`).
+  if (lower === path.toLowerCase()) return { form: "path" };
+  if (lower === title.toLowerCase()) return { form: "title" };
+  // Only the FULL-path `.ext` form exists: `resolveWikilink`'s
+  // explicit-extension rule matches on `(path, extension)`, so a
+  // basename+ext bracket (`[[Data.csv]]` for `move/Data`) never resolved in
+  // the first place and is not this cascade's to repair.
+  const extMatch = target.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch && extMatch[1]!.toLowerCase() === path.toLowerCase()) {
+    return { form: "path-ext", ext: extMatch[2]! };
+  }
+  return null;
+}
+
+/**
+ * The candidate replacement texts for a bracket of `form` after the note
+ * moved to `newPath`, most-preferred first. The caller picks the first one
+ * that resolves back to the renamed note (see `Store.cascadeRename`):
+ * a basename bracket stays a basename bracket unless the new basename would
+ * now be ambiguous (or collide across extensions), in which case it widens
+ * to the full path.
+ */
+export function wikilinkRenameCandidates(
+  form: WikilinkPathForm,
+  newPath: string,
+  noteExtension: string | null | undefined,
+): string[] {
+  const newTitle = pathTitle(newPath);
+  const ext = noteExtension || "md";
+  switch (form.form) {
+    case "path":
+      return [newPath, `${newPath}.${ext}`];
+    case "title":
+      return [newTitle, newPath, `${newPath}.${ext}`];
+    case "path-ext":
+      return [`${newPath}.${form.ext}`];
+  }
 }
 
 // ---------------------------------------------------------------------------
