@@ -143,6 +143,17 @@ function structuredError(
   return Object.assign(new Error(message), fields);
 }
 
+function requireNoteReference(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw structuredError("`id` is required", {
+      error_type: "missing_required_field",
+      field: "id",
+      hint: "pass the note's id or path (or its unique H1 title)",
+    });
+  }
+  return value;
+}
+
 /**
  * Resolve a note identifier — tries ID first, then case-insensitive
  * path match, then (additive fallback) an H1-title match. Works
@@ -1730,7 +1741,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // branch using this same item's payload. Otherwise mirror the
             // existing `requireNote` behavior (throw "Note not found").
             // vault#309.
-            const resolved = resolveNote(db, item.id as string);
+            const idOrPath = requireNoteReference(item.id);
+            const resolved = resolveNote(db, idOrPath);
             if (!resolved) {
               if (item.if_missing === "create") {
                 // Treat the update payload as a create payload. Minimum:
@@ -1765,7 +1777,6 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                 //     processed and used by Gitcoin's sync; the
                 //     misleading wording is fixed here so a future
                 //     reader doesn't trust it and break the workflow.
-                const idOrPath = item.id as string;
                 // Heuristic: if `path` isn't set AND the `id` looks like a
                 // path (contains "/" or doesn't match a typical opaque-id
                 // shape), use it as the path too. Otherwise treat it as a
@@ -2193,7 +2204,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "delete-note",
       execute: async (params) => {
-        const note = requireNote(db, params.id as string);
+        const note = requireNote(db, requireNoteReference(params.id));
         await store.deleteNote(note.id);
         return { deleted: true, id: note.id };
       },
@@ -3032,4 +3043,3 @@ export class BatchTooLargeError extends Error {
     this.got = got;
   }
 }
-
