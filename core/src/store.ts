@@ -16,6 +16,11 @@ import {
   resolveOrQueueLink,
   clearQueuedLink,
   clearQueuedLinkTarget,
+  clearAmbiguousLink,
+  clearAmbiguousLinkTarget,
+  refreshAmbiguousLinks,
+  noteResolutionKeys,
+  pathResolutionKeys,
   requeueInboundWikilinksForDelete,
 } from "./wikilinks.js";
 import { chunkForInClause } from "./sql-in.js";
@@ -257,6 +262,9 @@ export class BunSqliteStore implements Store {
       // resolved target.
       linkOps.deleteLinksBySourceRelationship(this.db, note.id, fieldName);
       clearQueuedLink(this.db, note.id, fieldName);
+      // vault#581 twin: a recorded ambiguity for the OLD value must go too,
+      // or the field would keep reporting a collision it no longer has.
+      clearAmbiguousLink(this.db, note.id, fieldName);
 
       if (typeof nextValue === "string" && nextValue.trim() !== "") {
         // Resolves now, or queues a lazy forward-ref on a miss — same
@@ -374,7 +382,10 @@ export class BunSqliteStore implements Store {
     // still-present-but-unresolved element stays queued (re-queued
     // idempotently above).
     for (const value of priorSet) {
-      if (!nextSet.has(value)) clearQueuedLinkTarget(this.db, noteId, fieldName, value);
+      if (!nextSet.has(value)) {
+        clearQueuedLinkTarget(this.db, noteId, fieldName, value);
+        clearAmbiguousLinkTarget(this.db, noteId, fieldName, value); // vault#581 twin
+      }
     }
   }
 
@@ -519,6 +530,10 @@ export class BunSqliteStore implements Store {
 
     if (note.path) {
       resolveUnresolvedWikilinks(this.db, note.path, note.id);
+      // vault#581 — this note becoming a NEW candidate can only make an
+      // existing ambiguity wider, but the recorded `candidate_count` has to
+      // stay honest. Bounded to rows whose target could name this note.
+      refreshAmbiguousLinks(this.db, noteResolutionKeys(note));
     }
 
     // Reference-field auto-link (vault#typed-reference-field) — no prior
@@ -615,6 +630,13 @@ export class BunSqliteStore implements Store {
         this.cascadeRename(oldPath, note.path);
       }
       resolveUnresolvedWikilinks(this.db, note.path, id);
+      // vault#581 — a rename is one of the two ways an ambiguity stops being
+      // ambiguous (the other is a delete). Sweep the OLD path's keys as well
+      // as the new ones: it's the target the collision was recorded under.
+      refreshAmbiguousLinks(this.db, [
+        ...pathResolutionKeys(oldPath, note.extension),
+        ...noteResolutionKeys(note),
+      ]);
     }
 
     // Reference-field auto-link sync (vault#typed-reference-field). Only
@@ -706,7 +728,13 @@ export class BunSqliteStore implements Store {
     // comment for why this must run pre-delete and what it deliberately
     // excludes (typed `links`, not just wikilinks).
     requeueInboundWikilinksForDelete(this.db, id);
+    // vault#581 — the deleted note's resolution keys, captured BEFORE the row
+    // goes away and swept AFTER, so a `[[Dup]]` that was ambiguous only
+    // because of THIS note resolves (or, if it was the last candidate,
+    // demotes to an ordinary broken link).
+    const ambiguityKeys = noteResolutionKeys(existing);
     noteOps.deleteNote(this.db, id);
+    refreshAmbiguousLinks(this.db, ambiguityKeys);
     if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
     // Dispatch even when `existing` was null — the caller asked for a
     // deletion, and downstream consumers (e.g. the mirror) reconcile via
