@@ -1111,8 +1111,17 @@ Query params:
     or ranked-search shape to compose with; combining any of them is
     `400 invalid_query` (`field: "aggregate"`). Bun REST used to silently
     ignore `aggregate[...]` under `search=` and return note rows; the bun
-    door now rejects. Cloud REST still has no `aggregate` parser — those
-    params are ignored and note rows come back (parachute-cloud#134 B.4).
+    door now rejects.
+  - **Cloud-door coverage (vault#626).** Cloud's **MCP** `query-notes`
+    serves `aggregate` already — that surface is core-driven, so it
+    inherits the rollup with no cloud-side code. Cloud's **REST** door has
+    no `aggregate` parser: it used to drop `aggregate[...]` silently and
+    answer with note rows, and now answers `400` with
+    `error_type: "unsupported_param"`, `field: "aggregate"` rather than
+    handing a rollup parser the wrong envelope (parachute-cloud#134 B.4).
+    The ungrouped filtered total reaches BOTH cloud surfaces when cloud
+    promotes the vault-core commit it pins in `scripts/vault-source.env` —
+    the pin currently predates the core change.
   - **Tag-scope respected.** A tag-scoped token's rollup is computed only
     over notes it can see — exactly like a normal query — AND, under
     `group_by: "tag"`, group NAMES themselves are scrubbed to the token's
