@@ -6220,6 +6220,87 @@ describe("HTTP GET /notes — has_broken_links / include_broken_links (vault#555
   });
 });
 
+// vault#581 — has_ambiguous_links / include_ambiguous_links on GET /notes.
+// The queryable twin of the has_broken_links block above: before #581 an
+// ambiguous target existed only in the transient write-time warning, so REST
+// callers auditing a vault could not find one after the fact.
+describe("HTTP GET /notes — has_ambiguous_links / include_ambiguous_links (vault#581)", async () => {
+  test("has_ambiguous_links=true filters to notes whose wikilink matched two notes", async () => {
+    await store.createNote("first", { path: "ra1/Dup" });
+    await store.createNote("second", { path: "ra2/Dup" });
+    await store.createNote("[[Dup]]", { path: "rest-ambiguous" });
+    await store.createNote("clean", { path: "rest-amb-clean" });
+    const res = await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.path)).toEqual(["rest-ambiguous"]);
+  });
+
+  test("has_ambiguous_links=false excludes them", async () => {
+    await store.createNote("first", { path: "rb1/Twin" });
+    await store.createNote("second", { path: "rb2/Twin" });
+    await store.createNote("[[Twin]]", { path: "rest-ambiguous2" });
+    await store.createNote("clean", { path: "rest-amb-clean2" });
+    const res = await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=false&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.path).sort()).toEqual(["rb1/Twin", "rb2/Twin", "rest-amb-clean2"]);
+  });
+
+  test("an ambiguous link is not reported as a broken one (the filters are disjoint)", async () => {
+    await store.createNote("first", { path: "rc1/Both" });
+    await store.createNote("second", { path: "rc2/Both" });
+    await store.createNote("[[Both]]", { path: "rest-amb-disjoint" });
+    const broken = await (await handleNotes(mkReq("GET", "/notes?has_broken_links=true"), store, "")).json() as any[];
+    expect(broken.map((n) => n.path)).toEqual([]);
+    const ambiguous = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true"), store, "")).json() as any[];
+    expect(ambiguous.map((n) => n.path)).toEqual(["rest-amb-disjoint"]);
+  });
+
+  test("include_ambiguous_links on a single note surfaces {target, relationship, candidate_count}", async () => {
+    await store.createNote("first", { path: "rd1/Fork" });
+    await store.createNote("second", { path: "rd2/Fork" });
+    await store.createNote("[[Fork]]", { path: "rest-single-ambiguous" });
+    const res = await handleNotes(mkReq("GET", "/notes?id=rest-single-ambiguous&include_ambiguous_links=true"), store, "");
+    const body = await res.json() as any;
+    expect(body.ambiguous_links).toEqual([{ target: "Fork", relationship: "wikilink", candidate_count: 2 }]);
+  });
+
+  test("include_ambiguous_links in list mode is batched per note", async () => {
+    await store.createNote("first", { path: "re1/Echo" });
+    await store.createNote("second", { path: "re2/Echo" });
+    await store.createNote("[[Echo]]", { path: "rest-amb-list-a" });
+    await store.createNote("clean", { path: "rest-amb-list-b" });
+    const res = await handleNotes(mkReq("GET", "/notes?include_ambiguous_links=true&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    const byPath = new Map(body.map((n: any) => [n.path, n.ambiguous_links]));
+    expect(byPath.get("rest-amb-list-a")).toEqual([{ target: "Echo", relationship: "wikilink", candidate_count: 2 }]);
+    expect(byPath.get("rest-amb-list-b")).toEqual([]);
+  });
+
+  test("both filters are safe on a vault where no link has ever been ambiguous", async () => {
+    await store.createNote("plain", { path: "rest-amb-never" });
+    const truthy = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true"), store, "")).json() as any[];
+    expect(truthy).toEqual([]);
+    const falsy = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=false&include_content=true"), store, "")).json() as any[];
+    expect(falsy.map((n) => n.path)).toEqual(["rest-amb-never"]);
+    const single = await (await handleNotes(mkReq("GET", "/notes?id=rest-amb-never&include_ambiguous_links=true"), store, "")).json() as any;
+    expect(single.ambiguous_links).toEqual([]);
+  });
+
+  test("deleting one colliding candidate heals the ambiguity through the REST filter", async () => {
+    const keep = await store.createNote("first", { path: "rf1/Heal" });
+    const drop = await store.createNote("second", { path: "rf2/Heal" });
+    await store.createNote("[[Heal]]", { path: "rest-amb-heal" });
+    let body = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true"), store, "")).json() as any[];
+    expect(body.map((n) => n.path)).toEqual(["rest-amb-heal"]);
+
+    await store.deleteNote(drop.id);
+    body = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true"), store, "")).json() as any[];
+    expect(body).toEqual([]);
+    const linked = await (await handleNotes(mkReq("GET", "/notes?id=rest-amb-heal&include_links=true"), store, "")).json() as any;
+    expect(linked.links.map((l: any) => l.targetId)).toEqual([keep.id]);
+  });
+});
+
 // vault#309 — HTTP PATCH /notes/:id with if_missing: "create" mirrors
 // the MCP update-note path. Sync loops (Gitcoin Brain et al) use this
 // for idempotent upsert without a separate query-first round trip.

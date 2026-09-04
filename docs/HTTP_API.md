@@ -169,6 +169,7 @@ with a structured envelope:
   score?: number;  // vault#551 — search results ONLY; higher = more relevant, see "Full-text search" below
   existed?: boolean;  // vault#555 — POST /notes ONLY, and only when that item's if_exists was ignore/update/replace; see "if_exists" above
   broken_links?: { target: string; relationship: string }[];  // vault#555 — only when include_broken_links=true was passed
+  ambiguous_links?: { target: string; relationship: string; candidate_count: number }[];  // vault#581 — only when include_ambiguous_links=true was passed
 }
 ```
 
@@ -191,6 +192,7 @@ and a computed `displayTitle`.
   displayTitle: string | null;  // title axis (ratified 2026-07-17) — first non-empty content line, heading markers stripped, ~120 chars max; null when content is empty. Never stored — computed fresh from content at read time.
   score?: number;    // vault#551 — search results ONLY, carried onto the lean shape too (search's default response IS NoteIndex[])
   broken_links?: { target: string; relationship: string }[];  // vault#555 — only when include_broken_links=true was passed
+  ambiguous_links?: { target: string; relationship: string; candidate_count: number }[];  // vault#581 — only when include_ambiguous_links=true was passed
 }
 ```
 
@@ -837,6 +839,12 @@ Query params:
     note) into a `broken_links: [{target, relationship}]` field, `[]` when
     none (vault#555). One batched query for the whole page, same shape as
     `include_links`.
+  - `include_ambiguous_links=true` — fold each note's AMBIGUOUS outbound
+    links (a `[[wikilink]]` or structured `links` target that matched TWO OR
+    MORE notes, so no link was created) into an
+    `ambiguous_links: [{target, relationship, candidate_count}]` field, `[]`
+    when none (vault#581). Same one-batched-query-per-page shape as
+    `include_broken_links`.
   - `include_attachments=true` — fold each note's attachments into the
     result rows.
   - `include_metadata=...` — comma-separated allowlist of metadata keys;
@@ -870,6 +878,21 @@ Query params:
     of `has_broken_links=true` on the next call. Safe on a vault where no
     link has ever gone unresolved — `true` matches nothing, `false` is a
     no-op — rather than erroring on a table that was never created.
+  - `has_ambiguous_links=true|false` — presence filter on AMBIGUOUS outbound
+    links (vault#581): `true` returns only notes with at least one
+    `[[wikilink]]` or structured `links` target that matched two or more
+    notes — so no link was created and none was guessed at; `false` returns
+    only notes with none. **Disjoint from `has_broken_links`**: a dangling
+    target matched NOTHING, an ambiguous one matched too much, and a note is
+    never reported under both for the same target. Backed by the
+    `ambiguous_wikilinks` table — the same record the `ambiguous_link`
+    warning on `POST`/`PATCH /notes` draws from, so the collision stays
+    findable after the write instead of living only in that response. It
+    self-heals: delete or rename one of the colliding notes and the
+    reference resolves for real (the note drops out of
+    `has_ambiguous_links=true` and gains the link); delete them all and it
+    demotes to an ordinary broken link. Safe on a vault where no link has
+    ever been ambiguous — `true` matches nothing, `false` is a no-op.
   - `path=foo/bar` — exact path match.
   - `path_prefix=foo/` — startswith. Matched literally: `%` and `_` in the
     prefix are escaped, so `path_prefix=_tags/` does not also match
@@ -1373,6 +1396,9 @@ Folding options:
 - `include_broken_links=true` — append dangling outbound links as
   `broken_links: [{target, relationship}]` (vault#555). See `has_broken_links`
   above.
+- `include_ambiguous_links=true` — append ambiguous outbound links as
+  `ambiguous_links: [{target, relationship, candidate_count}]` (vault#581).
+  See `has_ambiguous_links` above.
 - `include_attachments=true` — append attachments as an `attachments` field.
 - `include_metadata=...` — same allowlist as the list endpoint.
 - `expand=true&depth=N` — inline `[[wikilink]]` targets.
@@ -1780,6 +1806,9 @@ unchanged value is left untouched. A target that doesn't resolve yet is
 queued and backfills automatically the moment a matching note is created —
 same contract as an unresolved structured link, visible today via
 `has_broken_links`/`include_broken_links` on `query-notes`/`GET /api/notes`.
+A value that matches TWO OR MORE notes is ambiguous rather than unresolved —
+no link, no queue — and is surfaced by
+`has_ambiguous_links`/`include_ambiguous_links` instead (vault#581).
 Declare `indexed: true` alongside `type: "reference"` to also get a B-tree
 index over the raw value for operator queries (`eq`/`in`/...); a plain
 metadata-equality filter works either way. Scalar values only in this

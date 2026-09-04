@@ -23,6 +23,8 @@ import {
   resolveStructuredLinkNote,
   getUnresolvedLinksForNote,
   getUnresolvedLinksForNotes,
+  getAmbiguousLinksForNote,
+  getAmbiguousLinksForNotes,
   getContentWikilinkWarnings,
 } from "./wikilinks.js";
 import * as tagSchemaOps from "./tag-schemas.js";
@@ -673,6 +675,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           if (params.include_broken_links) {
             result.broken_links = getUnresolvedLinksForNote(db, note.id);
           }
+          if (params.include_ambiguous_links) {
+            result.ambiguous_links = getAmbiguousLinksForNote(db, note.id);
+          }
           if (params.include_attachments) {
             result.attachments = await store.getAttachments(note.id);
           }
@@ -817,6 +822,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
             hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            hasAmbiguousLinks: params.has_ambiguous_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
             excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
@@ -940,6 +946,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
             hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            hasAmbiguousLinks: params.has_ambiguous_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
             excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
@@ -1023,6 +1030,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               hasTags: params.has_tags as boolean | undefined,
               hasLinks: params.has_links as boolean | undefined,
               hasBrokenLinks: params.has_broken_links as boolean | undefined,
+              hasAmbiguousLinks: params.has_ambiguous_links as boolean | undefined,
               path: params.path as string | undefined,
               pathPrefix: params.path_prefix as string | undefined,
               excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
@@ -1092,6 +1100,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
             hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            hasAmbiguousLinks: params.has_ambiguous_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
             excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
@@ -1219,7 +1228,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         }
 
         // --- Hydrate links/attachments/broken-links per note if requested ---
-        if (params.include_links || params.include_attachments || params.include_broken_links) {
+        if (params.include_links || params.include_attachments || params.include_broken_links || params.include_ambiguous_links) {
           // Links hydrate for the WHOLE page in a constant number of
           // queries (see getLinksHydratedForNotes) — the per-note variant
           // cost (1 link query + 1 summary query + N tag queries) × page
@@ -1231,11 +1240,16 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const brokenLinksByNote = params.include_broken_links
             ? getUnresolvedLinksForNotes(db, (output as any[]).map((n: any) => n.id))
             : null;
+          // Same one-batched-query-for-the-page shape for the ambiguity twin (vault#581).
+          const ambiguousLinksByNote = params.include_ambiguous_links
+            ? getAmbiguousLinksForNotes(db, (output as any[]).map((n: any) => n.id))
+            : null;
           const enrichedOut: any[] = [];
           for (const n of output as any[]) {
             const enriched: any = { ...n };
             if (linksByNote) enriched.links = linksByNote.get(n.id) ?? [];
             if (brokenLinksByNote) enriched.broken_links = brokenLinksByNote.get(n.id) ?? [];
+            if (ambiguousLinksByNote) enriched.ambiguous_links = ambiguousLinksByNote.get(n.id) ?? [];
             if (params.include_attachments) enriched.attachments = await store.getAttachments(n.id);
             enrichedOut.push(enriched);
           }

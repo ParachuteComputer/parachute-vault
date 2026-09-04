@@ -4262,6 +4262,244 @@ describe("MCP tools", async () => {
     expect(byId.get("mq-list-c")).toEqual([]);
   });
 
+  // ---- has_ambiguous_links / include_ambiguous_links (vault#581) ----
+  //
+  // Symmetric with the has_broken_links block above. Before #581 an
+  // ambiguous target was visible ONLY in the transient write-time
+  // `ambiguous_link` warning — nothing was persisted, so `has_broken_links`
+  // did not match the note (it was classified CLEAN by
+  // `has_broken_links: false`) and a later audit could not find it.
+
+  it("query-notes has_ambiguous_links=true surfaces only notes whose wikilink matched two notes", async () => {
+    await store.createNote("first", { id: "mq-amb-c1", path: "one/Dup" });
+    await store.createNote("second", { id: "mq-amb-c2", path: "two/Dup" });
+    await store.createNote("see [[Dup]]", { id: "mq-amb-src", path: "mq-amb-src" });
+    await store.createNote("no links here", { id: "mq-amb-clean", path: "mq-amb-clean" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_ambiguous_links: true, include_content: true }) as any[];
+    expect(result.map((n) => n.path)).toEqual(["mq-amb-src"]);
+  });
+
+  it("query-notes has_ambiguous_links=false excludes notes with an ambiguous link", async () => {
+    await store.createNote("first", { path: "a/Twin" });
+    await store.createNote("second", { path: "b/Twin" });
+    await store.createNote("see [[Twin]]", { id: "mq-amb-src2", path: "mq-amb-src2" });
+    await store.createNote("clean", { id: "mq-amb-clean2", path: "mq-amb-clean2" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_ambiguous_links: false, include_content: true }) as any[];
+    expect(result.map((n) => n.path).sort()).toEqual(["a/Twin", "b/Twin", "mq-amb-clean2"]);
+  });
+
+  it("an ambiguous link is NOT counted as a broken link (the two filters are disjoint)", async () => {
+    await store.createNote("first", { path: "x/Both" });
+    await store.createNote("second", { path: "y/Both" });
+    await store.createNote("see [[Both]]", { id: "mq-amb-disjoint", path: "mq-amb-disjoint" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_broken_links: true }) as any[]).map((n: any) => n.id)).toEqual([]);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).map((n: any) => n.id)).toEqual(["mq-amb-disjoint"]);
+  });
+
+  it("query-notes has_ambiguous_links is safe on a vault where no link has ever been ambiguous", async () => {
+    // Fresh store, beforeEach — the ambiguous_wikilinks table has never been
+    // created. true should match nothing (not throw); false should be a
+    // no-op (matches everything). Mirrors the has_broken_links pin above.
+    await store.createNote("plain note", { id: "mq-amb-none", path: "mq-amb-none" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const truthy = await query.execute({ has_ambiguous_links: true, include_content: true }) as any[];
+    expect(truthy).toEqual([]);
+    const falsy = await query.execute({ has_ambiguous_links: false, include_content: true }) as any[];
+    expect(falsy.map((n) => n.path)).toEqual(["mq-amb-none"]);
+  });
+
+  it("query-notes include_ambiguous_links surfaces {target, relationship, candidate_count} for a single note", async () => {
+    await store.createNote("first", { path: "p/Ghost" });
+    await store.createNote("second", { path: "q/Ghost" });
+    await store.createNote("see [[Ghost]]", { id: "mq-amb-single", path: "mq-amb-single" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "mq-amb-single", include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links).toEqual([{ target: "Ghost", relationship: "wikilink", candidate_count: 2 }]);
+  });
+
+  it("query-notes include_ambiguous_links surfaces a structured link's ambiguous_link entry too", async () => {
+    await store.createNote("first", { path: "s1/Fork" });
+    await store.createNote("second", { path: "s2/Fork" });
+    const created = await generateMcpTools(store).find((t) => t.name === "create-note")!.execute({
+      content: "body",
+      path: "mq-amb-structured",
+      links: [{ target: "Fork", relationship: "depends-on" }],
+    }) as any;
+    expect(created.warnings?.[0]?.code).toBe("ambiguous_link");
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: created.id, include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links).toEqual([{ target: "Fork", relationship: "depends-on", candidate_count: 2 }]);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).map((n: any) => n.id)).toEqual([created.id]);
+  });
+
+  it("query-notes include_ambiguous_links is [] for a note with no ambiguous links", async () => {
+    await store.createNote("clean", { id: "mq-amb-clean-single", path: "mq-amb-clean-single" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "mq-amb-clean-single", include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links).toEqual([]);
+  });
+
+  it("query-notes include_ambiguous_links works in list mode, batched across the page", async () => {
+    await store.createNote("first", { path: "l1/Echo" });
+    await store.createNote("second", { path: "l2/Echo" });
+    await store.createNote("see [[Echo]]", { id: "mq-amb-list-a", path: "mq-amb-list-a" });
+    await store.createNote("also [[Echo]]", { id: "mq-amb-list-b", path: "mq-amb-list-b" });
+    await store.createNote("clean", { id: "mq-amb-list-c", path: "mq-amb-list-c" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ include_ambiguous_links: true, include_content: true }) as any[];
+    const byId = new Map(result.map((n: any) => [n.id, n.ambiguous_links]));
+    expect(byId.get("mq-amb-list-a")).toEqual([{ target: "Echo", relationship: "wikilink", candidate_count: 2 }]);
+    expect(byId.get("mq-amb-list-b")).toEqual([{ target: "Echo", relationship: "wikilink", candidate_count: 2 }]);
+    expect(byId.get("mq-amb-list-c")).toEqual([]);
+  });
+
+  // ---- self-healing: ambiguity must resolve when it stops being ambiguous ----
+
+  it("deleting one colliding candidate resolves the ambiguity — link created, note drops out of has_ambiguous_links", async () => {
+    const keep = await store.createNote("first", { path: "keep/Heal" });
+    const drop = await store.createNote("second", { path: "drop/Heal" });
+    const src = await store.createNote("see [[Heal]]", { id: "mq-amb-heal", path: "mq-amb-heal" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(1);
+
+    await store.deleteNote(drop.id);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([keep.id]);
+  });
+
+  it("renaming one colliding candidate out of the way resolves a structured link's ambiguity", async () => {
+    // Structured links (and typed `reference` fields) are the clean rename
+    // case: unlike a content [[wikilink]], nothing rewrites the stored
+    // target string, so the sweep is the only thing that can heal it.
+    const keep = await store.createNote("first", { path: "keep/Fork" });
+    const moved = await store.createNote("second", { path: "move/Fork" });
+    const created = await generateMcpTools(store).find((t) => t.name === "create-note")!.execute({
+      content: "body", path: "mq-amb-rename", links: [{ target: "Fork", relationship: "depends-on" }],
+    }) as any;
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).map((n: any) => n.id)).toEqual([created.id]);
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+    const links = await query.execute({ id: created.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => [l.targetId, l.relationship])).toEqual([[keep.id, "depends-on"]]);
+  });
+
+  it("renaming a colliding candidate also clears a content wikilink's ambiguity (via cascadeRename)", async () => {
+    // Pinning the pre-existing interaction, not proposing it: `cascadeRename`
+    // rewrites `[[Rename]]` to `[[Elsewhere]]` in every note when
+    // `move/Rename` becomes `move/Elsewhere` — matching on the BASENAME,
+    // without checking whether that bracket actually pointed at the renamed
+    // note. So the source's re-parse (not the vault#581 sweep) is what clears
+    // the row here, and the resulting link follows the rewritten text. Either
+    // way the note must not stay stuck in `has_ambiguous_links: true`.
+    await store.createNote("first", { path: "keep/Rename" });
+    const moved = await store.createNote("second", { path: "move/Rename" });
+    const src = await store.createNote("see [[Rename]]", { id: "mq-amb-rename2", path: "mq-amb-rename2" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(1);
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([moved.id]);
+  });
+
+  it("deleting BOTH colliding candidates turns the ambiguous link into a broken one", async () => {
+    const a = await store.createNote("first", { path: "d1/Gone" });
+    const b = await store.createNote("second", { path: "d2/Gone" });
+    await store.createNote("see [[Gone]]", { id: "mq-amb-to-broken", path: "mq-amb-to-broken" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    await store.deleteNote(a.id);
+    await store.deleteNote(b.id);
+
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+    expect((await query.execute({ has_broken_links: true }) as any[]).map((n: any) => n.id)).toEqual(["mq-amb-to-broken"]);
+    const single = await query.execute({ id: "mq-amb-to-broken", include_broken_links: true }) as any;
+    expect(single.broken_links).toEqual([{ target: "Gone", relationship: "wikilink" }]);
+  });
+
+  it("editing the wikilink out of the content clears the persisted ambiguity", async () => {
+    await store.createNote("first", { path: "e1/Vanish" });
+    await store.createNote("second", { path: "e2/Vanish" });
+    const src = await store.createNote("see [[Vanish]]", { id: "mq-amb-edit", path: "mq-amb-edit" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(1);
+
+    await store.updateNote(src.id, { content: "no links now" });
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+  });
+
+  it("deleting the SOURCE note cascades its ambiguous rows away", async () => {
+    await store.createNote("first", { path: "c1/Casc" });
+    await store.createNote("second", { path: "c2/Casc" });
+    const src = await store.createNote("see [[Casc]]", { id: "mq-amb-cascade", path: "mq-amb-cascade" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(1);
+    await store.deleteNote(src.id);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+  });
+
+  it("a THIRD colliding note bumps the persisted candidate_count", async () => {
+    await store.createNote("first", { path: "t1/Trio" });
+    await store.createNote("second", { path: "t2/Trio" });
+    await store.createNote("see [[Trio]]", { id: "mq-amb-count", path: "mq-amb-count" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    let single = await query.execute({ id: "mq-amb-count", include_ambiguous_links: true }) as any;
+    expect(single.ambiguous_links).toEqual([{ target: "Trio", relationship: "wikilink", candidate_count: 2 }]);
+
+    await store.createNote("third", { path: "t3/Trio" });
+    single = await query.execute({ id: "mq-amb-count", include_ambiguous_links: true }) as any;
+    expect(single.ambiguous_links).toEqual([{ target: "Trio", relationship: "wikilink", candidate_count: 3 }]);
+  });
+
+  it("has_ambiguous_links is bound into the cursor query-hash", async () => {
+    await store.createNote("first", { path: "cur1/Hash" });
+    await store.createNote("second", { path: "cur2/Hash" });
+    await store.createNote("see [[Hash]]", { id: "mq-amb-cursor", path: "mq-amb-cursor" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const page = await query.execute({ cursor: "", limit: 1, has_ambiguous_links: true }) as any;
+    expect(page.notes.map((n: any) => n.id)).toEqual(["mq-amb-cursor"]);
+    // Flipping the filter must invalidate the cursor rather than silently
+    // continuing the prior filter's watermark.
+    expect(query.execute({ cursor: page.next_cursor, limit: 1, has_ambiguous_links: false }))
+      .rejects.toThrow(/cursor was minted for a different query/);
+  });
+
   it("query-notes metadata operator query routes through the indexed column", async () => {
     const { declareField } = await import("./indexed-fields.js");
     declareField(db, "priority", "INTEGER", "project");

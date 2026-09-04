@@ -1077,6 +1077,28 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
     }
   }
 
+  // Presence: has_ambiguous_links (vault#581) — an outbound `[[wikilink]]` or
+  // structured `links`/`reference` target that matched ≥2 notes, so no link
+  // was created. Same lazily-created-table dance as `has_broken_links` above
+  // (`ambiguous_wikilinks` is only created once a link actually goes
+  // ambiguous), and for the same reasons: a read-only filter must not create
+  // the table, and a bare EXISTS against a missing one throws instead of
+  // answering "none".
+  if (opts.hasAmbiguousLinks !== undefined) {
+    const ambiguousTableExists = db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ambiguous_wikilinks'",
+    ).get() !== null;
+    if (!ambiguousTableExists) {
+      if (opts.hasAmbiguousLinks) conditions.push("0 = 1");
+    } else {
+      conditions.push(
+        opts.hasAmbiguousLinks
+          ? `EXISTS (SELECT 1 FROM ambiguous_wikilinks ual WHERE ual.source_id = n.id)`
+          : `NOT EXISTS (SELECT 1 FROM ambiguous_wikilinks ual WHERE ual.source_id = n.id)`,
+      );
+    }
+  }
+
   // ID set filter — used by `near` to push neighborhood scoping into SQL so
   // that LIMIT applies to the neighborhood, not the whole notes table.
   if (opts.ids !== undefined) {
@@ -1695,6 +1717,7 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
     hasTags: opts.hasTags,
     hasLinks: opts.hasLinks,
     hasBrokenLinks: opts.hasBrokenLinks,
+    hasAmbiguousLinks: opts.hasAmbiguousLinks,
     path: opts.path,
     pathPrefix: opts.pathPrefix,
     excludePathPrefix: opts.excludePathPrefix,

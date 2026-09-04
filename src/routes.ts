@@ -30,6 +30,8 @@ import {
   resolveStructuredLinkNote,
   getUnresolvedLinksForNote,
   getUnresolvedLinksForNotes,
+  getAmbiguousLinksForNote,
+  getAmbiguousLinksForNotes,
   getContentWikilinkWarnings,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
@@ -970,6 +972,9 @@ export function parseNotesQueryOpts(url: URL, tagScope: TagScopeCtx = NO_TAG_SCO
     // Presence filter on dangling outbound wikilinks/structured links
     // (vault#555) — see core/src/types.ts QueryOpts.hasBrokenLinks.
     hasBrokenLinks: parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+    // Presence filter on AMBIGUOUS outbound links — a target that matched ≥2
+    // notes (vault#581) — see core/src/types.ts QueryOpts.hasAmbiguousLinks.
+    hasAmbiguousLinks: parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
     path: parseQuery(url, "path") ?? undefined,
     pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
     excludePathPrefix: parseQueryList(url, "exclude_path_prefix"),
@@ -1281,6 +1286,12 @@ async function handleNotesInner(
           // neighbor identity/content to leak — just the string this note's
           // own [[wikilink]]/structured link already named.
           result.broken_links = getUnresolvedLinksForNote(db, note.id);
+        }
+        if (parseBool(parseQuery(url, "include_ambiguous_links"), false)) {
+          // Same no-tag-scope-needed reasoning as broken_links above: an
+          // ambiguous `target` never became a link, so no neighbor identity
+          // is exposed — only the string this note's own reference named.
+          result.ambiguous_links = getAmbiguousLinksForNote(db, note.id);
         }
         if (parseBool(parseQuery(url, "include_attachments"), false)) {
           result.attachments = await store.getAttachments(note.id);
@@ -1860,6 +1871,7 @@ async function handleNotesInner(
       if (contentRange.error) return contentRange.error;
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
       const includeBrokenLinks = parseBool(parseQuery(url, "include_broken_links"), false);
+      const includeAmbiguousLinks = parseBool(parseQuery(url, "include_ambiguous_links"), false);
       const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
       const includeLinkCount = parseBool(parseQuery(url, "include_link_count"), false);
       const inclMeta = parseIncludeMetadata(url);
@@ -1960,7 +1972,7 @@ async function handleNotesInner(
         );
       }
 
-      if (includeLinks || includeBrokenLinks || includeAttachments) {
+      if (includeLinks || includeBrokenLinks || includeAmbiguousLinks || includeAttachments) {
         // Whole-page link hydration in a constant number of queries — the
         // per-note variant cost (1 link query + 1 summary query + N tag
         // queries) × page size. 2026-06-10 perf measurements.
@@ -1972,6 +1984,10 @@ async function handleNotesInner(
         // note, so there's no neighbor identity to leak.
         const brokenLinksByNote = includeBrokenLinks
           ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id))
+          : null;
+        // Same again for the ambiguity twin (vault#581), same non-leak logic.
+        const ambiguousLinksByNote = includeAmbiguousLinks
+          ? getAmbiguousLinksForNotes(db, output.map((n: any) => n.id))
           : null;
         const enrichedOut: any[] = [];
         for (const n of output) {
@@ -1985,6 +2001,7 @@ async function handleNotesInner(
             );
           }
           if (brokenLinksByNote) enriched.broken_links = brokenLinksByNote.get(n.id) ?? [];
+          if (ambiguousLinksByNote) enriched.ambiguous_links = ambiguousLinksByNote.get(n.id) ?? [];
           if (includeAttachments) enriched.attachments = await store.getAttachments(n.id);
           enrichedOut.push(enriched);
         }
