@@ -12,6 +12,11 @@ import {
 } from "./indexed-fields.js";
 import {
   syncWikilinks,
+  parseWikilinks,
+  resolveWikilinkDetailed,
+  rewriteWikilinkTargets,
+  wikilinkPathForm,
+  wikilinkRenameCandidates,
   resolveUnresolvedWikilinks,
   resolveOrQueueLink,
   clearQueuedLink,
@@ -24,7 +29,6 @@ import {
   requeueInboundWikilinksForDelete,
 } from "./wikilinks.js";
 import { chunkForInClause } from "./sql-in.js";
-import { pathTitle } from "./paths.js";
 import { timestampToMs } from "./cursor.js";
 import { transaction } from "./txn.js";
 import { HookRegistry } from "./hooks.js";
@@ -616,6 +620,15 @@ export class BunSqliteStore implements Store {
       }
     }
 
+    // vault#708 — the rename cascade has to know which brackets resolved to
+    // THIS note, and resolution is only observable BEFORE the path moves.
+    // So the plan (source note -> the exact bracket texts that pointed here)
+    // is computed against the pre-write index; `cascadeRename` applies it
+    // after, when the new path is known.
+    const cascadePlan = oldPath && updates.path !== undefined && oldPath !== updates.path
+      ? this.planCascadeRename(id, oldPath)
+      : undefined;
+
     const note = noteOps.updateNote(this.db, id, updates);
 
     // Wikilink sync runs against the *resulting* content. For append/prepend
@@ -626,8 +639,8 @@ export class BunSqliteStore implements Store {
     }
 
     if (updates.path !== undefined && note.path) {
-      if (oldPath && oldPath !== note.path) {
-        this.cascadeRename(oldPath, note.path);
+      if (cascadePlan && oldPath && oldPath !== note.path) {
+        this.cascadeRename(cascadePlan, note, oldPath);
       }
       resolveUnresolvedWikilinks(this.db, note.path, id);
       // vault#581 — a rename is one of the two ways an ambiguity stops being
@@ -658,36 +671,114 @@ export class BunSqliteStore implements Store {
   }
 
   /**
-   * When a note is renamed, update [[wikilinks]] in other notes that referenced the old path.
-   * Matches both full path and basename references.
+   * Plan the rename cascade (vault#708) — for a note about to move off
+   * `oldPath`, the exact `[[bracket]]` texts in each source note that
+   * RESOLVED TO THIS NOTE, keyed by source id.
+   *
+   * MUST run before the path write: resolution is a property of the index,
+   * and once the row moves, `[[Rename]]` no longer means what it meant.
+   *
+   * The source set comes from the `links` rows pointing at this note
+   * (`relationship = 'wikilink'`) — an index-driven prefilter that already
+   * excludes the two classes the old basename-matching cascade corrupted:
+   *   - AMBIGUOUS brackets (`[[Rename]]` with `keep/Rename` AND `move/Rename`
+   *     present) never get a `links` row at all — they live in
+   *     `ambiguous_wikilinks` (vault#581/#707) and are healed by
+   *     `refreshAmbiguousLinks` after the rename, not by a text rewrite.
+   *   - brackets that resolved to a DIFFERENT same-basename note, whose
+   *     `links` row points elsewhere.
+   * The note itself is added to the set because a self-referencing bracket
+   * is deliberately never given a `links` row (`syncWikilinks` skips
+   * self-links) yet the old cascade rewrote it — parity.
+   *
+   * `links` rows only say "this note links here", not WHICH bracket did it
+   * (`syncWikilinks` dedupes by resolved target id and stores no bracket
+   * text), so every candidate source is re-parsed and each bracket
+   * re-resolved. That is also what keeps a source's OTHER same-named
+   * brackets untouched.
    */
-  private cascadeRename(oldPath: string, newPath: string): void {
-    const oldTitle = pathTitle(oldPath);
-    const newTitle = pathTitle(newPath);
+  private planCascadeRename(id: string, oldPath: string): Map<string, string[]> {
+    const rows = this.db.prepare(
+      "SELECT source_id FROM links WHERE target_id = ? AND relationship = 'wikilink'",
+    ).all(id) as { source_id: string }[];
+    const sourceIds = new Set<string>(rows.map((r) => r.source_id));
+    sourceIds.add(id);
 
-    const candidates = this.db.prepare(`
-      SELECT id, content FROM notes
-      WHERE content LIKE ? OR content LIKE ?
-    `).all(`%[[${oldPath}%`, `%[[${oldTitle}%`) as { id: string; content: string }[];
-
-    for (const row of candidates) {
-      let updated = row.content;
-
-      updated = updated.replace(
-        new RegExp(`\\[\\[${escapeRegex(oldPath)}([#|\\]])`, "g"),
-        `[[${newPath}$1`,
-      );
-
-      if (oldTitle !== newTitle && oldTitle !== oldPath) {
-        updated = updated.replace(
-          new RegExp(`\\[\\[${escapeRegex(oldTitle)}([#|\\]])`, "g"),
-          `[[${newTitle}$1`,
-        );
+    const plan = new Map<string, string[]>();
+    for (const sourceId of sourceIds) {
+      const row = this.db.prepare("SELECT content FROM notes WHERE id = ?")
+        .get(sourceId) as { content: string } | null;
+      if (!row?.content) continue;
+      const targets: string[] = [];
+      const seen = new Set<string>();
+      for (const wl of parseWikilinks(row.content)) {
+        const key = wl.target.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        // Only path-derived forms of the old path can be invalidated by a
+        // repath; an H1-title-fallback bracket keeps resolving and must not
+        // be touched.
+        if (!wikilinkPathForm(wl.target, oldPath)) continue;
+        const detail = resolveWikilinkDetailed(this.db, wl.target);
+        if (detail.resolved && detail.note_id === id) targets.push(wl.target);
       }
+      if (targets.length > 0) plan.set(sourceId, targets);
+    }
+    return plan;
+  }
 
+  /**
+   * Apply a {@link planCascadeRename} plan after the path write: rewrite only
+   * the brackets that resolved to the renamed note, preserving each one's
+   * shape (basename stays a basename, full path stays a full path, an
+   * explicit `.ext` keeps its `.ext`). A basename widens to the full path
+   * only when the NEW basename would no longer resolve back to this note —
+   * i.e. the move created a fresh collision.
+   *
+   * Each rewritten source is re-parsed via `syncWikilinks`, so `links`,
+   * `unresolved_wikilinks` and `ambiguous_wikilinks` stay consistent with
+   * the new text.
+   */
+  private cascadeRename(plan: Map<string, string[]>, note: Note, oldPath: string): void {
+    if (plan.size === 0 || !note.path) return;
+    const newPath = note.path;
+
+    // One resolution per distinct bracket text, shared across sources.
+    const replacement = new Map<string, string>();
+
+    for (const [sourceId, targets] of plan) {
+      const row = this.db.prepare("SELECT content FROM notes WHERE id = ?")
+        .get(sourceId) as { content: string } | null;
+      if (!row?.content) continue;
+
+      const mapping = new Map<string, string>();
+      for (const target of targets) {
+        const key = target.toLowerCase();
+        let next = replacement.get(key);
+        if (next === undefined) {
+          const form = wikilinkPathForm(target, oldPath);
+          if (!form) continue;
+          const candidates = wikilinkRenameCandidates(form, newPath, note.extension);
+          // First candidate that actually resolves back to this note wins;
+          // if none does (e.g. every shape is now ambiguous), keep the
+          // preferred shape rather than inventing a third one.
+          next = candidates.find((c) => {
+            const detail = resolveWikilinkDetailed(this.db, c);
+            return detail.resolved && detail.note_id === note.id;
+          }) ?? candidates[0]!;
+          replacement.set(key, next);
+        }
+        if (next !== target) mapping.set(key, next);
+      }
+      if (mapping.size === 0) continue;
+
+      const updated = rewriteWikilinkTargets(
+        row.content,
+        (target) => mapping.get(target.toLowerCase()) ?? null,
+      );
       if (updated !== row.content) {
-        noteOps.updateNote(this.db, row.id, { content: updated });
-        syncWikilinks(this.db, row.id, updated);
+        noteOps.updateNote(this.db, sourceId, { content: updated });
+        syncWikilinks(this.db, sourceId, updated);
       }
     }
   }
@@ -1629,7 +1720,3 @@ export class BunSqliteStore implements Store {
 export const SqliteStore = BunSqliteStore;
 /** @deprecated Renamed to `BunSqliteStore`. */
 export type SqliteStore = BunSqliteStore;
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}

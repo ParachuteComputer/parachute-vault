@@ -4408,14 +4408,14 @@ describe("MCP tools", async () => {
   });
 
   it("renaming a colliding candidate also clears a content wikilink's ambiguity (via cascadeRename)", async () => {
-    // Pinning the pre-existing interaction, not proposing it: `cascadeRename`
-    // rewrites `[[Rename]]` to `[[Elsewhere]]` in every note when
-    // `move/Rename` becomes `move/Elsewhere` — matching on the BASENAME,
-    // without checking whether that bracket actually pointed at the renamed
-    // note. So the source's re-parse (not the vault#581 sweep) is what clears
-    // the row here, and the resulting link follows the rewritten text. Either
-    // way the note must not stay stuck in `has_ambiguous_links: true`.
-    await store.createNote("first", { path: "keep/Rename" });
+    // vault#708 — an AMBIGUOUS `[[Rename]]` never pointed at the renamed
+    // note (it pointed at nothing: two candidates, no `links` row), so the
+    // cascade must leave the text alone and let the vault#581 sweep heal it.
+    // With `move/Rename` moved away, `keep/Rename` is the only candidate
+    // left, so the bracket resolves to KEEP. Before vault#708 the cascade
+    // rewrote the text to `[[Elsewhere]]` on a basename match and the link
+    // followed the note that moved away — the bug this pin used to record.
+    const keep = await store.createNote("first", { path: "keep/Rename" });
     const moved = await store.createNote("second", { path: "move/Rename" });
     const src = await store.createNote("see [[Rename]]", { id: "mq-amb-rename2", path: "mq-amb-rename2" });
 
@@ -4425,6 +4425,98 @@ describe("MCP tools", async () => {
 
     await store.updateNote(moved.id, { path: "move/Elsewhere" });
     expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+    expect((await store.getNote(src.id))!.content).toBe("see [[Rename]]");
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([keep.id]);
+  });
+
+  // ---- vault#708: the rename cascade follows resolution, not basenames ----
+
+  it("cascadeRename leaves an unambiguous full-path bracket aimed at the OTHER same-named note alone", async () => {
+    const keep = await store.createNote("first", { path: "keep/Rename" });
+    const moved = await store.createNote("second", { path: "move/Rename" });
+    const src = await store.createNote("see [[keep/Rename]]", { id: "c708-other", path: "c708-other" });
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+
+    expect((await store.getNote(src.id))!.content).toBe("see [[keep/Rename]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([keep.id]);
+  });
+
+  it("cascadeRename follows an unambiguous BASENAME bracket and keeps it a basename", async () => {
+    const moved = await store.createNote("only one", { path: "move/Rename" });
+    const src = await store.createNote("see [[Rename]]", { id: "c708-basename", path: "c708-basename" });
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+
+    expect((await store.getNote(src.id))!.content).toBe("see [[Elsewhere]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([moved.id]);
+  });
+
+  it("cascadeRename widens a basename bracket to the full path when the NEW basename is ambiguous", async () => {
+    const moved = await store.createNote("first", { path: "a/Foo" });
+    await store.createNote("collides with the new name", { path: "b/Bar" });
+    const src = await store.createNote("see [[Foo]]", { id: "c708-widen", path: "c708-widen" });
+
+    await store.updateNote(moved.id, { path: "a/Bar" });
+
+    // `[[Bar]]` would now match two notes, so the bracket widens rather than
+    // becoming ambiguous.
+    expect((await store.getNote(src.id))!.content).toBe("see [[a/Bar]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([moved.id]);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+  });
+
+  it("cascadeRename rewrites alias / anchor / block-ref / embed / full-path / .ext forms, and skips code fences", async () => {
+    const moved = await store.createNote("only one", { path: "move/Rename" });
+    const src = await store.createNote(
+      "a [[Rename|shown]] b [[Rename#Heading]] c [[Rename#^blk]] d [[move/Rename]] e [[move/Rename.md]] f ![[Rename]]\n\n```\ng [[Rename]]\n```\n",
+      { id: "c708-forms", path: "c708-forms" },
+    );
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+
+    expect((await store.getNote(src.id))!.content).toBe(
+      "a [[Elsewhere|shown]] b [[Elsewhere#Heading]] c [[Elsewhere#^blk]] d [[move/Elsewhere]] e [[move/Elsewhere.md]] f ![[Elsewhere]]\n\n```\ng [[Rename]]\n```\n",
+    );
+  });
+
+  it("cascadeRename rewrites an explicit-extension bracket on a non-md note", async () => {
+    const moved = await store.createNote("csv", { path: "move/Data", extension: "csv" });
+    const src = await store.createNote("see [[move/Data.csv]]", { id: "c708-ext", path: "c708-ext" });
+
+    await store.updateNote(moved.id, { path: "move/Info" });
+
+    expect((await store.getNote(src.id))!.content).toBe("see [[move/Info.csv]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([moved.id]);
+  });
+
+  it("cascadeRename rewrites the renamed note's OWN self-referencing bracket", async () => {
+    // Self-links are deliberately never given a `links` row, so the note
+    // itself has to be seeded into the cascade's source set.
+    const moved = await store.createNote("about [[move/Rename]] itself", { path: "move/Rename" });
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+    expect((await store.getNote(moved.id))!.content).toBe("about [[move/Elsewhere]] itself");
+  });
+
+  it("cascadeRename leaves a bracket that resolved through the H1-title fallback alone", async () => {
+    // A title-fallback link doesn't depend on the path, so a repath must not
+    // touch it — and it keeps resolving afterwards.
+    const moved = await store.createNote("# Distinct Title\n\nbody", { path: "move/Rename" });
+    const src = await store.createNote("see [[Distinct Title]]", { id: "c708-title", path: "c708-title" });
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+
+    expect((await store.getNote(src.id))!.content).toBe("see [[Distinct Title]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
     const links = await query.execute({ id: src.id, include_links: true }) as any;
     expect(links.links.map((l: any) => l.targetId)).toEqual([moved.id]);
   });
