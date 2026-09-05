@@ -1882,6 +1882,112 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
+  // ---------------------------------------------------------------------
+  // vault#239 / vault#707 review sub-case — the DELETE self-heal is
+  // scope-blind. `refreshAmbiguousLinks` demotes an ambiguous row to
+  // `unresolved_wikilinks` once its last candidate is deleted, so a
+  // `work`-scoped reader's own note flips from "no broken links" to
+  // "has a broken link" purely because notes it can never see were
+  // deleted — a timing oracle for exactly the cross-scope naming
+  // collision vault#707's `candidate_count` narrowing was added to hide.
+  //
+  // The stable, sub-vault-correct answer (vault#707's rule: a scoped
+  // reader gets what an unscoped reader would get on a vault containing
+  // only the notes it can see) is BROKEN in BOTH states: `[[Dup]]`
+  // matches zero VISIBLE notes before the deletes and zero after.
+  async function hiddenOnlyDupVault(prefix: string) {
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore } = await import("./vault-store.ts");
+    const vaultName = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    const h1 = await store.createNote("hidden dup one", { path: "p1/Dup", tags: ["personal"] });
+    const h2 = await store.createNote("hidden dup two", { path: "p2/Dup", tags: ["personal"] });
+    const src = await store.createNote("src [[Dup]]", { path: "work-src", tags: ["work"] });
+    return { vaultName, store, src, hidden: [h1, h2] };
+  }
+
+  test("MCP: a [[Dup]] whose only candidates are out of scope reads as BROKEN for the scoped reader", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await hiddenOnlyDupVault("tagscope-brk");
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: src.id, include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    // ...and the presence filter agrees on both polarities.
+    expect(((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id))
+      .toContain(src.id);
+    expect(((await query.execute({ has_broken_links: false })) as any[]).map((n: any) => n.id))
+      .not.toContain(src.id);
+
+    closeAllStores();
+  });
+
+  test("MCP: deleting the last OUT-OF-SCOPE candidate does not change the scoped reader's broken-link view (vault#239)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, store, src, hidden } = await hiddenOnlyDupVault("tagscope-brk-heal");
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const snapshot = async () => ({
+      broken: (await query.execute({ id: src.id, include_broken_links: true }) as any).broken_links,
+      truthy: ((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id),
+      falsy: ((await query.execute({ has_broken_links: false })) as any[]).map((n: any) => n.id),
+    });
+
+    const before = await snapshot();
+    for (const h of hidden) await store.deleteNote(h.id);
+    const after = await snapshot();
+
+    expect(after).toEqual(before);
+    expect(after.broken).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+
+    closeAllStores();
+  });
+
+  test("MCP NEGATIVE CONTROL: one IN-SCOPE candidate → not broken for the scoped reader", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-brk-neg", ["personal"]);
+
+    // `wdup/Dup` is in scope, `odup/Dup` is not — the reference resolves in
+    // the reader's sub-vault, so it must NOT be reported broken.
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ id: src.id, include_broken_links: true }) as any).broken_links)
+      .toEqual([]);
+    expect(((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id))
+      .not.toContain(src.id);
+
+    closeAllStores();
+  });
+
+  test("UNSCOPED MCP is unchanged: ambiguous before the deletes, broken after (regression)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, store, src, hidden } = await hiddenOnlyDupVault("tagscope-brk-unscoped");
+
+    const tools = generateScopedMcpTools(vaultName);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const inc = { id: src.id, include_broken_links: true, include_ambiguous_links: true };
+
+    const before = await query.execute(inc) as any;
+    expect(before.broken_links).toEqual([]);
+    expect(before.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+
+    for (const h of hidden) await store.deleteNote(h.id);
+
+    const after = await query.execute(inc) as any;
+    expect(after.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(after.ambiguous_links).toEqual([]);
+
+    closeAllStores();
+  });
+
   test("MCP include_links strips out-of-scope NEIGHBOR summaries", async () => {
     const { generateScopedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");
@@ -5057,6 +5163,125 @@ describe("HTTP tag-scope confidentiality (security review)", async () => {
     );
     expect((await res.json() as any).ambiguous_links)
       .toEqual([{ target: "Trio", relationship: "wikilink", candidate_count: 2 }]);
+  });
+
+  // vault#239 / vault#707 review sub-case — the DELETE self-heal is
+  // scope-blind. `refreshAmbiguousLinks` demotes an ambiguous row into
+  // `unresolved_wikilinks` once its last candidate is deleted, so a scoped
+  // reader's own note flips from "no broken links" to "has a broken link"
+  // purely because notes it can never see were deleted. That is a timing
+  // oracle for exactly the cross-scope naming collision the block above
+  // hides. The stable, sub-vault-correct answer is BROKEN in BOTH states:
+  // `[[Dup]]` matches zero VISIBLE notes before the deletes and zero after.
+
+  /** One #work source `[[Dup]]`, with every Dup candidate out of scope. */
+  async function hiddenOnlyDupFixture() {
+    const h1 = await store.createNote("hidden dup one", { path: "p1/Dup", tags: ["personal"] });
+    const h2 = await store.createNote("hidden dup two", { path: "p2/Dup", tags: ["personal"] });
+    const src = await store.createNote("src [[Dup]]", { path: "work-src", tags: ["work"] });
+    return { src, hidden: [h1, h2] };
+  }
+
+  test("include_broken_links reports a reference whose only candidates are out of scope", async () => {
+    const { src } = await hiddenOnlyDupFixture();
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_broken_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any;
+    expect(body.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(JSON.stringify(body)).not.toContain("p1/Dup");
+  });
+
+  test("deleting the last OUT-OF-SCOPE candidate does not change the scoped broken-link view (vault#239)", async () => {
+    const { src, hidden } = await hiddenOnlyDupFixture();
+    const scope = await scopeCtx(["work"]);
+    const snapshot = async () => ({
+      broken: (await (await handleNotes(
+        mkReq("GET", `/notes?id=${src.id}&include_broken_links=true`), store, "", "v", scope,
+      )).json() as any).broken_links,
+      truthy: ((await (await handleNotes(
+        mkReq("GET", "/notes?has_broken_links=true"), store, "", "v", scope,
+      )).json()) as any[]).map((n) => n.id),
+      falsy: ((await (await handleNotes(
+        mkReq("GET", "/notes?has_broken_links=false"), store, "", "v", scope,
+      )).json()) as any[]).map((n) => n.id),
+    });
+
+    const before = await snapshot();
+    for (const h of hidden) await store.deleteNote(h.id);
+    const after = await snapshot();
+
+    expect(after).toEqual(before);
+    expect(after.broken).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(after.truthy).toContain(src.id);
+    expect(after.falsy).not.toContain(src.id);
+  });
+
+  test("aggregate over has_broken_links does not leak the collision as a count either", async () => {
+    const { hidden } = await hiddenOnlyDupFixture();
+    const scope = await scopeCtx(["work"]);
+    const rollup = async () => (await (await handleNotes(
+      mkReq("GET", "/notes?has_broken_links=true&aggregate[op]=count"), store, "", "v", scope,
+    )).json()) as any[];
+
+    const before = await rollup();
+    for (const h of hidden) await store.deleteNote(h.id);
+    expect(await rollup()).toEqual(before);
+  });
+
+  test("/unresolved-wikilinks does not gain a row when an out-of-scope candidate is deleted", async () => {
+    const { hidden } = await hiddenOnlyDupFixture();
+    const scope = await scopeCtx(["work"]);
+    const list = async () => {
+      const body = await (handleUnresolvedWikilinks(
+        mkReq("GET", "/unresolved-wikilinks"), store, scope,
+      )).json() as any;
+      return { targets: (body.unresolved as any[]).map((r) => r.target_path).sort(), count: body.count };
+    };
+
+    const before = await list();
+    expect(before.targets).toContain("Dup");
+    for (const h of hidden) await store.deleteNote(h.id);
+    expect(await list()).toEqual(before);
+  });
+
+  test("NEGATIVE CONTROL: one IN-SCOPE candidate is not reported broken", async () => {
+    // `wdup/Dup` is visible, `odup/Dup` is not — the reference resolves in
+    // the reader's sub-vault, so it must NOT be reported broken. Guards
+    // against a fix that simply reports every ambiguous row as broken.
+    const src = await crossScopeDupFixture(["personal"]);
+    const scope = await scopeCtx(["work"]);
+    const body = await (await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_broken_links=true`), store, "", "v", scope,
+    )).json() as any;
+    expect(body.broken_links).toEqual([]);
+    const swept = (await (await handleNotes(
+      mkReq("GET", "/notes?has_broken_links=true"), store, "", "v", scope,
+    )).json()) as any[];
+    expect(swept.map((n) => n.id)).not.toContain(src.id);
+  });
+
+  test("UNSCOPED REST is unchanged: ambiguous before the deletes, broken after (regression)", async () => {
+    const { src, hidden } = await hiddenOnlyDupFixture();
+    const read = async () => (await (await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_broken_links=true&include_ambiguous_links=true`),
+      store, "", "v", NO_SCOPE,
+    )).json()) as any;
+
+    const before = await read();
+    expect(before.broken_links).toEqual([]);
+    expect(before.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+
+    for (const h of hidden) await store.deleteNote(h.id);
+
+    const after = await read();
+    expect(after.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(after.ambiguous_links).toEqual([]);
   });
 
   // vault#555 auth-review CRITICAL: `if_exists` must NOT become a tag-scope

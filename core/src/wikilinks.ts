@@ -448,6 +448,50 @@ export function listUnresolvedWikilinks(db: Database, limit = 50): { unresolved:
   return { unresolved, count: total };
 }
 
+/**
+ * The `ambiguous_wikilinks` rows that are BROKEN in a tag-scoped reader's own
+ * sub-vault — every candidate invisible to it — shaped as
+ * {@link UnresolvedWikilink} so `/unresolved-wikilinks` can report them
+ * alongside the genuinely-unresolved ones (vault#239).
+ *
+ * Without this the admin listing is the third face of the same delete-time
+ * oracle `getUnresolvedLinksForNotes` closes on the note surfaces: the row
+ * only appears there once the last invisible candidate is deleted and
+ * `refreshAmbiguousLinks` demotes it. Callers are expected to apply their own
+ * source-note tag-scope filter afterwards, exactly as they do for the base
+ * listing. Scanned under the same `limit` slice as
+ * {@link listUnresolvedWikilinks}; `[]` when the table has never been created
+ * (and never called at all for an unscoped reader, whose answer is the
+ * persisted tables as-is).
+ */
+export function listZeroVisibleAmbiguousAsUnresolved(
+  db: Database,
+  visible: (noteId: string) => boolean,
+  limit = 50,
+): UnresolvedWikilink[] {
+  let rows: { source_id: string; target_path: string; relationship: string }[];
+  try {
+    rows = db.prepare(
+      "SELECT source_id, target_path, relationship FROM ambiguous_wikilinks ORDER BY source_id LIMIT ?",
+    ).all(limit) as typeof rows;
+  } catch {
+    return []; // Table doesn't exist — nothing has ever been ambiguous here.
+  }
+  const out: UnresolvedWikilink[] = [];
+  for (const r of rows) {
+    const relationship = r.relationship || WIKILINK_REL;
+    if (visibleResolutionCount(db, r.target_path, relationship, visible) > 0) continue;
+    const note = db.prepare("SELECT path FROM notes WHERE id = ?").get(r.source_id) as { path: string | null } | null;
+    out.push({
+      source_id: r.source_id,
+      source_path: note?.path ?? undefined,
+      target_path: r.target_path,
+      relationship,
+    });
+  }
+  return out;
+}
+
 /** One note's dangling outbound link, as surfaced on a note read (vault#555). */
 export interface BrokenLink {
   target: string;
@@ -459,11 +503,32 @@ export interface BrokenLink {
  * `include_broken_links` surfacing on `query-notes` / `GET /notes`. ONE
  * query for the whole page (mirrors `getLinksHydratedForNotes`'s batching),
  * not one per note. Returns a map with an entry (possibly `[]`) for every
- * requested id whenever the table exists; when the table has never been
- * created (no note in this vault has ever had a broken link) every id maps
- * to `[]` without a query attempt.
+ * requested id.
+ *
+ * `visible` (vault#239) is an OPTIONAL per-candidate-note predicate, injected
+ * by the server layer for a TAG-SCOPED reader — the SAME closure the
+ * ambiguity surface uses, because "which of this target's candidates can the
+ * reader see" is one question with two answers. Core stays scope-unaware; it
+ * only invokes the closure.
+ *
+ * When it is supplied, the persisted `ambiguous_wikilinks` rows are folded in
+ * too, as broken, whenever NONE of their candidates is visible: such a target
+ * matches nothing in the reader's sub-vault, which is what "broken" means.
+ * Without that, `refreshAmbiguousLinks`' delete-time demotion into
+ * `unresolved_wikilinks` is the only thing that ever makes the note broken —
+ * so the answer moves when notes the reader cannot see are deleted, which is
+ * an oracle for exactly the cross-scope naming collision
+ * {@link getAmbiguousLinksForNotes} narrows away.
+ *
+ * Cost: one extra query plus one re-resolution per ambiguous row, and only
+ * for scoped readers — the same profile the ambiguity surface accepts, on a
+ * table that is rare by nature. An unscoped reader does no extra work.
  */
-export function getUnresolvedLinksForNotes(db: Database, noteIds: string[]): Map<string, BrokenLink[]> {
+export function getUnresolvedLinksForNotes(
+  db: Database,
+  noteIds: string[],
+  visible?: (noteId: string) => boolean,
+): Map<string, BrokenLink[]> {
   const result = new Map<string, BrokenLink[]>(noteIds.map((id) => [id, []]));
   if (noteIds.length === 0) return result;
 
@@ -477,19 +542,89 @@ export function getUnresolvedLinksForNotes(db: Database, noteIds: string[]): Map
       ).all(...chunk) as typeof rows);
     }
   } catch {
-    // Table doesn't exist — every id already maps to [] above.
-    return result;
+    // Table doesn't exist — no note in this vault has ever had a link go
+    // unresolved. NOT an early return: a tag-scoped reader can still have
+    // broken references whose rows live in `ambiguous_wikilinks` (vault#239),
+    // and this is the common case for them — a vault where every collision
+    // was ambiguous vault-wide never creates `unresolved_wikilinks` at all.
+    rows.length = 0;
   }
 
+  const seen = new Set<string>();
   for (const row of rows) {
-    result.get(row.source_id)?.push({ target: row.target_path, relationship: row.relationship || WIKILINK_REL });
+    const relationship = row.relationship || WIKILINK_REL;
+    seen.add(`${row.source_id}\u0000${relationship}\u0000${row.target_path.toLowerCase()}`);
+    result.get(row.source_id)?.push({ target: row.target_path, relationship });
+  }
+
+  // vault#239 — a target whose candidates are ALL invisible to this reader
+  // is broken in the reader's sub-vault, whichever table its row happens to
+  // live in right now. Without this the note only becomes "broken" once the
+  // last invisible candidate is DELETED and `refreshAmbiguousLinks` demotes
+  // the row into `unresolved_wikilinks` — a timing oracle for exactly the
+  // cross-scope naming collision `getAmbiguousLinksForNotes` narrows away.
+  // No-op (and no extra query) for an unscoped reader.
+  if (visible) {
+    for (const row of readAmbiguousRows(db, noteIds)) {
+      const relationship = row.relationship || WIKILINK_REL;
+      if (visibleResolutionCount(db, row.target_path, relationship, visible) > 0) continue;
+      const key = `${row.source_id}\u0000${relationship}\u0000${row.target_path.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.get(row.source_id)?.push({ target: row.target_path, relationship });
+    }
   }
   return result;
 }
 
 /** Single-note convenience wrapper around {@link getUnresolvedLinksForNotes}. */
-export function getUnresolvedLinksForNote(db: Database, noteId: string): BrokenLink[] {
-  return getUnresolvedLinksForNotes(db, [noteId]).get(noteId) ?? [];
+export function getUnresolvedLinksForNote(
+  db: Database,
+  noteId: string,
+  visible?: (noteId: string) => boolean,
+): BrokenLink[] {
+  return getUnresolvedLinksForNotes(db, [noteId], visible).get(noteId) ?? [];
+}
+
+/**
+ * Narrow a page of notes by the `has_broken_links` filter as a TAG-SCOPED
+ * reader should see it — the vault#239 twin of
+ * {@link narrowByVisibleAmbiguity}, and the reason
+ * {@link sqlHasBrokenLinks} lifts the SQL filter entirely under scope: the
+ * `unresolved_wikilinks` EXISTS test is neither a superset NOR a subset of
+ * the right answer (it MISSES a note whose only candidates are invisible,
+ * and it INCLUDES nothing it shouldn't), so neither polarity can be pushed
+ * down and both are re-decided here on the reader's own sub-vault.
+ *
+ * Page-shortening is the same effect `filterNotesByTagScope` already has on
+ * every scoped read. No-op when `wanted` is undefined or no predicate is
+ * injected (unscoped).
+ */
+export function narrowByVisibleBrokenness<T extends { id: string }>(
+  db: Database,
+  notes: T[],
+  wanted: boolean | undefined,
+  visible: ((noteId: string) => boolean) | undefined,
+): T[] {
+  if (wanted === undefined || !visible || notes.length === 0) return notes;
+  const byNote = getUnresolvedLinksForNotes(db, notes.map((n) => n.id), visible);
+  return notes.filter((n) => ((byNote.get(n.id)?.length ?? 0) > 0) === wanted);
+}
+
+/**
+ * The `hasBrokenLinks` value to push into SQL for a reader that will be
+ * narrowed by {@link narrowByVisibleBrokenness} afterwards. Unlike
+ * {@link sqlHasAmbiguousLinks} — where `true` survives because every
+ * truly-ambiguous note also has a persisted row — BOTH polarities are lifted
+ * under scope, because a note can be broken in the reader's sub-vault while
+ * having no `unresolved_wikilinks` row at all (vault#239). Identity for
+ * unscoped readers. Shared by both doors so REST and MCP cannot drift.
+ */
+export function sqlHasBrokenLinks(
+  wanted: boolean | undefined,
+  scoped: boolean,
+): boolean | undefined {
+  return scoped ? undefined : wanted;
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1187,62 @@ export function clearAmbiguousLinkTarget(
  * Ambiguous rows are rare by nature (each is a genuine naming collision),
  * and a page with none does no extra work at all.
  */
+interface AmbiguousRow {
+  source_id: string;
+  target_path: string;
+  relationship: string;
+  candidate_count: number;
+}
+
+/**
+ * Read the persisted `ambiguous_wikilinks` rows for a set of source notes,
+ * batched under the bound-param cap. `[]` when the table has never been
+ * created. Shared by the ambiguity surface and the vault#239 brokenness
+ * surface so the two read the same rows the same way.
+ */
+function readAmbiguousRows(db: Database, noteIds: string[]): AmbiguousRow[] {
+  const rows: AmbiguousRow[] = [];
+  try {
+    for (const chunk of chunkForInClause(noteIds)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      rows.push(...db.prepare(
+        `SELECT source_id, target_path, relationship, candidate_count FROM ambiguous_wikilinks WHERE source_id IN (${placeholders})`,
+      ).all(...chunk) as AmbiguousRow[]);
+    }
+  } catch {
+    return []; // Table doesn't exist — nothing has ever been ambiguous here.
+  }
+  return rows;
+}
+
+/**
+ * How many notes this target resolves to IN THE READER'S OWN SUB-VAULT — the
+ * single place both scoped link surfaces decide what a reference means for a
+ * tag-scoped reader, so they cannot drift:
+ *
+ *   - `>= 2` → ambiguous for this reader ({@link getAmbiguousLinksForNotes})
+ *   - `0`    → broken for this reader ({@link getUnresolvedLinksForNotes})
+ *   - `1`    → resolves cleanly; neither surface reports it
+ *
+ * A row that has gone stale (its target resolves to exactly one note again,
+ * but no sweep has touched it yet) resolves through the SAME resolver its
+ * write path used, so `resolved` has to be honoured explicitly — a resolved
+ * `WikilinkResolution` carries an EMPTY `candidates` array, which would
+ * otherwise read as "0 visible", i.e. broken.
+ */
+function visibleResolutionCount(
+  db: Database,
+  targetPath: string,
+  relationship: string,
+  visible: (noteId: string) => boolean,
+): number {
+  const detail = relationship === WIKILINK_REL
+    ? resolveWikilinkDetailed(db, targetPath)
+    : resolveLinkTargetDetailed(db, targetPath);
+  if (detail.resolved) return detail.note_id && visible(detail.note_id) ? 1 : 0;
+  return detail.candidates.filter((c) => visible(c.note_id)).length;
+}
+
 export function getAmbiguousLinksForNotes(
   db: Database,
   noteIds: string[],
@@ -1060,27 +1251,13 @@ export function getAmbiguousLinksForNotes(
   const result = new Map<string, AmbiguousLink[]>(noteIds.map((id) => [id, []]));
   if (noteIds.length === 0) return result;
 
-  const rows: { source_id: string; target_path: string; relationship: string; candidate_count: number }[] = [];
-  try {
-    for (const chunk of chunkForInClause(noteIds)) {
-      const placeholders = chunk.map(() => "?").join(", ");
-      rows.push(...db.prepare(
-        `SELECT source_id, target_path, relationship, candidate_count FROM ambiguous_wikilinks WHERE source_id IN (${placeholders})`,
-      ).all(...chunk) as typeof rows);
-    }
-  } catch {
-    // Table doesn't exist — every id already maps to [] above.
-    return result;
-  }
+  const rows = readAmbiguousRows(db, noteIds);
 
   for (const row of rows) {
     const relationship = row.relationship || WIKILINK_REL;
     let candidateCount = row.candidate_count;
     if (visible) {
-      const detail = relationship === WIKILINK_REL
-        ? resolveWikilinkDetailed(db, row.target_path)
-        : resolveLinkTargetDetailed(db, row.target_path);
-      candidateCount = detail.candidates.filter((c) => visible(c.note_id)).length;
+      candidateCount = visibleResolutionCount(db, row.target_path, relationship, visible);
       if (candidateCount < 2) continue; // not ambiguous in the reader's sub-vault
     }
     result.get(row.source_id)?.push({

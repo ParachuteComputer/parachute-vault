@@ -31,6 +31,9 @@ import {
   resolveStructuredLinkNote,
   getUnresolvedLinksForNote,
   getUnresolvedLinksForNotes,
+  listZeroVisibleAmbiguousAsUnresolved,
+  narrowByVisibleBrokenness,
+  sqlHasBrokenLinks,
   getAmbiguousLinksForNote,
   getAmbiguousLinksForNotes,
   narrowByVisibleAmbiguity,
@@ -928,6 +931,10 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
  * Needed because `candidate_count` is derived vault-wide: without it a
  * `work`-scoped reader learns from `candidate_count: 2` on its own `[[Dup]]`
  * that a second `Dup` exists in a scope it cannot see.
+ *
+ * vault#239 reuses the SAME predicate for the BROKEN-links surface — "which
+ * of this target's candidates can the reader see" is one question, and the
+ * ambiguous (>=2 visible) and broken (0 visible) answers are two faces of it.
  */
 function ambiguityVisibilityFor(
   db: Database,
@@ -999,7 +1006,16 @@ export function parseNotesQueryOpts(url: URL, tagScope: TagScopeCtx = NO_TAG_SCO
     hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
     // Presence filter on dangling outbound wikilinks/structured links
     // (vault#555) — see core/src/types.ts QueryOpts.hasBrokenLinks.
-    hasBrokenLinks: parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+    // vault#239: for a TAG-SCOPED reader NEITHER polarity is safe to push
+    // into SQL — a note can be broken in that reader's sub-vault while
+    // carrying no `unresolved_wikilinks` row at all (its target's only
+    // candidates are invisible, so the row sits in `ambiguous_wikilinks`
+    // instead). Both are lifted here and re-decided per note by
+    // `narrowByVisibleBrokenness`. Identity for an unscoped reader.
+    hasBrokenLinks: sqlHasBrokenLinks(
+      parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+      tagScope.raw !== null,
+    ),
     // Presence filter on AMBIGUOUS outbound links — a target that matched ≥2
     // notes (vault#581) — see core/src/types.ts QueryOpts.hasAmbiguousLinks.
     // vault#581 auth review: for a TAG-SCOPED reader only the `true` polarity
@@ -1319,8 +1335,11 @@ async function handleNotesInner(
           // No tag-scope filtering needed (unlike include_links above): a
           // broken-link `target` never resolved to a note, so there's no
           // neighbor identity/content to leak — just the string this note's
-          // own [[wikilink]]/structured link already named.
-          result.broken_links = getUnresolvedLinksForNote(db, note.id);
+          // own [[wikilink]]/structured link already named. The predicate is
+          // not a filter but an ADDITION (vault#239): it makes a reference
+          // whose only candidates are invisible read as broken here, instead
+          // of only once the last of them is deleted.
+          result.broken_links = getUnresolvedLinksForNote(db, note.id, ambiguityVisibilityFor(db, tagScope));
         }
         if (parseBool(parseQuery(url, "include_ambiguous_links"), false)) {
           // Same no-tag-scope-needed reasoning as broken_links above: an
@@ -1757,6 +1776,14 @@ async function handleNotesInner(
               parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
               ambiguityVisibilityFor(db, tagScope),
             );
+            // vault#239: the `has_broken_links` rollup is the same oracle for
+            // the same reason — re-decide brokenness on the sub-vault too.
+            visible = narrowByVisibleBrokenness(
+              db,
+              visible,
+              parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+              ambiguityVisibilityFor(db, tagScope),
+            );
             // Always run the rollup, even on an empty visible set: ungrouped
             // count (vault#626) must return `[{group:null,value:0}]`, not `[]`.
             rows = await store.aggregateNotes({ ids: visible.map((n) => n.id), aggregate: aggregateParsed.aggregate });
@@ -1921,6 +1948,15 @@ async function handleNotesInner(
         parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
         ambiguityVisibilityFor(db, tagScope),
       );
+      // vault#239 — same rule for `has_broken_links`: the SQL filter was
+      // lifted for a scoped reader, so the real predicate is applied here on
+      // that reader's own sub-vault. No-op unscoped. Mirrors the MCP door.
+      results = narrowByVisibleBrokenness(
+        db,
+        results,
+        parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+        ambiguityVisibilityFor(db, tagScope),
+      );
 
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
       const contentRange = parseContentRangeQuery(url, includeContent);
@@ -2039,7 +2075,7 @@ async function handleNotesInner(
         // filtering needed — a broken-link `target` never resolved to a
         // note, so there's no neighbor identity to leak.
         const brokenLinksByNote = includeBrokenLinks
-          ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id))
+          ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id), ambiguityVisibilityFor(db, tagScope))
           : null;
         // Same again for the ambiguity twin (vault#581), same non-leak logic.
         const ambiguousLinksByNote = includeAmbiguousLinks
@@ -4220,11 +4256,28 @@ export function handleUnresolvedWikilinks(
   // and the wikilink target strings those notes contain. Filter the page and
   // recompute `count` from the filtered set so the aggregate total of
   // out-of-scope rows doesn't leak either.
-  const filtered = result.unresolved.filter((row) => {
+  const inScope = (row: { source_id: string }): boolean => {
     const note = getNote(db, row.source_id);
     return note !== null && noteWithinTagScope(note, tagScope.allowed, tagScope.raw);
-  });
-  return Response.json({ unresolved: filtered, count: filtered.length });
+  };
+  const filtered = result.unresolved.filter(inScope);
+
+  // vault#239: a reference whose only candidates are OUT OF SCOPE is broken
+  // in this reader's sub-vault, but its row lives in `ambiguous_wikilinks`
+  // until the last of those candidates is deleted. Reporting it only after
+  // that deletion makes this listing a timing oracle for a cross-scope naming
+  // collision — the same one `getAmbiguousLinksForNotes` narrows away on the
+  // note surfaces. Fold those rows in so the answer is stable across the
+  // delete. Deduped against the base listing by (source, relationship,
+  // target); the two tables are disjoint by construction, so this only
+  // guards against a stale row.
+  const seen = new Set(filtered.map((r) => `${r.source_id}\u0000${r.relationship}\u0000${r.target_path.toLowerCase()}`));
+  const collapsed = listZeroVisibleAmbiguousAsUnresolved(db, ambiguityVisibilityFor(db, tagScope)!, limit)
+    .filter((row) => inScope(row)
+      && !seen.has(`${row.source_id}\u0000${row.relationship}\u0000${row.target_path.toLowerCase()}`));
+
+  const merged = [...filtered, ...collapsed].slice(0, limit);
+  return Response.json({ unresolved: merged, count: merged.length });
 }
 
 // ---------------------------------------------------------------------------

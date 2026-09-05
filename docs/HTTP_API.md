@@ -878,6 +878,16 @@ Query params:
     of `has_broken_links=true` on the next call. Safe on a vault where no
     link has ever gone unresolved — `true` matches nothing, `false` is a
     no-op — rather than erroring on a table that was never created.
+    **Tag-scoped tokens** get the answer computed on the notes they can see
+    (vault#239): a target whose candidates are ALL outside the token's scope
+    matches nothing in that token's sub-vault, so it counts as broken for it
+    even though the vault-wide record calls it ambiguous. Without that, the
+    note would only become "broken" once the last invisible candidate was
+    deleted — an oracle for a naming collision the token cannot see. Both
+    polarities are decided after the page is drawn (the filter is not pushed
+    into SQL for a scoped token), so a scoped page can come back shorter than
+    `limit` while more results remain, and the filter does not participate in
+    a scoped cursor's query hash.
   - `has_ambiguous_links=true|false` — presence filter on AMBIGUOUS outbound
     links (vault#581): `true` returns only notes with at least one
     `[[wikilink]]` or structured `links` target that matched two or more
@@ -891,7 +901,8 @@ Query params:
     self-heals: delete or rename one of the colliding notes and the
     reference resolves for real (the note drops out of
     `has_ambiguous_links=true` and gains the link); delete them all and it
-    demotes to an ordinary broken link. Safe on a vault where no link has
+    demotes to an ordinary broken link. (For a tag-scoped token that demotion
+    has already happened at read time — see `has_broken_links` above.) Safe on a vault where no link has
     ever been ambiguous — `true` matches nothing, `false` is a no-op.
     **Tag-scoped tokens** get the answer computed on the notes they can see:
     each collision's candidates are re-counted against the token's scope and
@@ -1402,7 +1413,8 @@ Folding options:
   outbound; vault#555 fix) as a `links` field.
 - `include_broken_links=true` — append dangling outbound links as
   `broken_links: [{target, relationship}]` (vault#555). See `has_broken_links`
-  above.
+  above — including the tag-scoped rule, where a target whose candidates are
+  all out of scope is listed here rather than under `ambiguous_links`.
 - `include_ambiguous_links=true` — append ambiguous outbound links as
   `ambiguous_links: [{target, relationship, candidate_count}]` (vault#581).
   See `has_ambiguous_links` above. `candidate_count` is the number of
@@ -2218,6 +2230,13 @@ carries `source_id`, `source_path`, `target_path`, and `relationship`
 (`"wikilink"` for content-parsed `[[targets]]`; the caller's own
 relationship string for a structured-link forward-ref queued by
 `create-note`/`update-note`/`POST /notes`/`PATCH /notes/{id}`).
+
+A **tag-scoped token** sees only rows whose SOURCE note is in its scope, and
+`count` is recomputed from that filtered set. It also sees the rows that are
+broken in ITS sub-vault but ambiguous vault-wide — a target whose candidates
+are all out of scope (vault#239) — for the same reason `has_broken_links`
+does: otherwise the row would appear here only once the last invisible
+candidate was deleted.
 
 #### `GET /vault/{name}/api/health` — `vault:read`
 Per-vault liveness ping. `{status: "ok", vault: "<name>"}`.

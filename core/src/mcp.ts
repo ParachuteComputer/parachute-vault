@@ -23,6 +23,8 @@ import {
   resolveStructuredLinkNote,
   getUnresolvedLinksForNote,
   getUnresolvedLinksForNotes,
+  narrowByVisibleBrokenness,
+  sqlHasBrokenLinks,
   getAmbiguousLinksForNote,
   getAmbiguousLinksForNotes,
   narrowByVisibleAmbiguity,
@@ -643,6 +645,18 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         const requestedHasAmbiguous = params.has_ambiguous_links as boolean | undefined;
         const sqlHasAmbiguous = sqlHasAmbiguousLinks(requestedHasAmbiguous, Boolean(ambiguityVisible));
 
+        // --- Broken-links scope split (vault#239) ---
+        // Same shape as the ambiguity split above, one polarity stricter:
+        // NEITHER `true` nor `false` is safe to push into SQL for a scoped
+        // reader, because a note can be broken in that reader's sub-vault
+        // while carrying no `unresolved_wikilinks` row at all (its target's
+        // only candidates are invisible, so the row sits in
+        // `ambiguous_wikilinks`). `sqlHasBrokenLinks` lifts both and
+        // `narrowByVisibleBrokenness` re-decides per note. Identical for an
+        // unscoped reader, where the SQL filter alone is the whole answer.
+        const requestedHasBroken = params.has_broken_links as boolean | undefined;
+        const sqlHasBroken = sqlHasBrokenLinks(requestedHasBroken, Boolean(ambiguityVisible));
+
         // --- Link expansion config (shared across single + list paths) ---
         const expandLinks = params.expand_links === true;
         const expandMode = (params.expand_mode as ExpandMode) ?? "full";
@@ -714,7 +728,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             result.links = linkOps.getLinksHydrated(db, note.id);
           }
           if (params.include_broken_links) {
-            result.broken_links = getUnresolvedLinksForNote(db, note.id);
+            result.broken_links = getUnresolvedLinksForNote(db, note.id, ambiguityVisible);
           }
           if (params.include_ambiguous_links) {
             result.ambiguous_links = getAmbiguousLinksForNote(db, note.id, ambiguityVisible);
@@ -862,7 +876,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             excludeTags: aggExcludeTags,
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
-            hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            hasBrokenLinks: sqlHasBroken,
             hasAmbiguousLinks: sqlHasAmbiguous,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
@@ -893,10 +907,17 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // same oracle as the note-level filter (a non-zero count still
           // reveals the collision), so narrow the visible id set by the
           // reader's own view of each row before aggregating.
-          const aggVisibleIds = narrowByVisibleAmbiguity(
+          // vault#239: the `has_broken_links` rollup is the same oracle for
+          // the same reason — re-decide brokenness on the sub-vault too.
+          const aggVisibleIds = narrowByVisibleBrokenness(
             db,
-            aggAllMatches.filter(aggregateVisibility),
-            requestedHasAmbiguous,
+            narrowByVisibleAmbiguity(
+              db,
+              aggAllMatches.filter(aggregateVisibility),
+              requestedHasAmbiguous,
+              ambiguityVisible,
+            ),
+            requestedHasBroken,
             ambiguityVisible,
           ).map((n) => n.id);
           // Always run the rollup, even on an empty visible set: ungrouped
@@ -995,7 +1016,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             excludeTags,
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
-            hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            hasBrokenLinks: sqlHasBroken,
             hasAmbiguousLinks: sqlHasAmbiguous,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
@@ -1079,7 +1100,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               excludeTags,
               hasTags: params.has_tags as boolean | undefined,
               hasLinks: params.has_links as boolean | undefined,
-              hasBrokenLinks: params.has_broken_links as boolean | undefined,
+              hasBrokenLinks: sqlHasBroken,
               hasAmbiguousLinks: sqlHasAmbiguous,
               path: params.path as string | undefined,
               pathPrefix: params.path_prefix as string | undefined,
@@ -1149,7 +1170,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             excludeTags,
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
-            hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            hasBrokenLinks: sqlHasBroken,
             hasAmbiguousLinks: sqlHasAmbiguous,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
@@ -1213,6 +1234,10 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // for. See `narrowByVisibleAmbiguity` for the superset contract and
         // the page-shortening effect.
         results = narrowByVisibleAmbiguity(db, results, requestedHasAmbiguous, ambiguityVisible);
+        // vault#239 — same rule for `has_broken_links`: the SQL filter was
+        // lifted for a scoped reader, so the real predicate is applied here
+        // on that reader's own sub-vault. No-op unscoped.
+        results = narrowByVisibleBrokenness(db, results, requestedHasBroken, ambiguityVisible);
 
         // --- Format output ---
         const includeContent = params.include_content === true; // default false for list
@@ -1295,7 +1320,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             : null;
           // Same one-batched-query-for-the-page shape as links (vault#555).
           const brokenLinksByNote = params.include_broken_links
-            ? getUnresolvedLinksForNotes(db, (output as any[]).map((n: any) => n.id))
+            ? getUnresolvedLinksForNotes(db, (output as any[]).map((n: any) => n.id), ambiguityVisible)
             : null;
           // Same one-batched-query-for-the-page shape for the ambiguity twin (vault#581).
           const ambiguousLinksByNote = params.include_ambiguous_links
