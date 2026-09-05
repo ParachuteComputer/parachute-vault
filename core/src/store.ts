@@ -30,7 +30,7 @@ import {
 } from "./wikilinks.js";
 import { chunkForInClause } from "./sql-in.js";
 import { timestampToMs } from "./cursor.js";
-import { transaction } from "./txn.js";
+import { afterCommit, transaction } from "./txn.js";
 import { HookRegistry } from "./hooks.js";
 import {
   loadTagHierarchy,
@@ -629,43 +629,51 @@ export class BunSqliteStore implements Store {
       ? this.planCascadeRename(id, oldPath)
       : undefined;
 
-    const note = noteOps.updateNote(this.db, id, updates);
+    // Keep the note-row write and every derived index/cascade write in one
+    // atomic unit. Any later failure must leave the note and its indexes at
+    // the pre-update state rather than committing only the first SQL write.
+    const note = this.transaction(() => {
+      const note = noteOps.updateNote(this.db, id, updates);
 
-    // Wikilink sync runs against the *resulting* content. For append/prepend
-    // we don't have the new value pre-write — read it back off the returned
-    // note so a `[[Foo]]` introduced via append still creates the link.
-    if (updates.content !== undefined || updates.append !== undefined || updates.prepend !== undefined) {
-      syncWikilinks(this.db, id, note.content);
-    }
-
-    if (updates.path !== undefined && note.path) {
-      if (cascadePlan && oldPath && oldPath !== note.path) {
-        this.cascadeRename(cascadePlan, note, oldPath);
+      // Wikilink sync runs against the *resulting* content. For append/prepend
+      // we don't have the new value pre-write — read it back off the returned
+      // note so a `[[Foo]]` introduced via append still creates the link.
+      if (updates.content !== undefined || updates.append !== undefined || updates.prepend !== undefined) {
+        syncWikilinks(this.db, id, note.content);
       }
-      resolveUnresolvedWikilinks(this.db, note.path, id);
-      // vault#581 — a rename is one of the two ways an ambiguity stops being
-      // ambiguous (the other is a delete). Sweep the OLD path's keys as well
-      // as the new ones: it's the target the collision was recorded under.
-      refreshAmbiguousLinks(this.db, [
-        ...pathResolutionKeys(oldPath, note.extension),
-        ...noteResolutionKeys(note),
-      ]);
-    }
 
-    // Reference-field auto-link sync (vault#typed-reference-field). Only
-    // when this call actually touched `metadata` — see the read above for
-    // why a content/tags/path-only update is skipped.
-    if (updates.metadata !== undefined) {
-      this.syncReferenceFieldLinks(note, priorMetadataForRefs);
-    }
+      if (updates.path !== undefined && note.path) {
+        if (cascadePlan && oldPath && oldPath !== note.path) {
+          this.cascadeRename(cascadePlan, note, oldPath);
+        }
+        resolveUnresolvedWikilinks(this.db, note.path, id);
+        // vault#581 — a rename is one of the two ways an ambiguity stops being
+        // ambiguous (the other is a delete). Sweep the OLD path's keys as well
+        // as the new ones: it's the target the collision was recorded under.
+        refreshAmbiguousLinks(this.db, [
+          ...pathResolutionKeys(oldPath, note.extension),
+          ...noteResolutionKeys(note),
+        ]);
+      }
 
-    // Invalidate before the hook dispatch so any handler that re-queries
-    // the hierarchy from inside its own logic sees post-write state.
-    // `metadata` updates can change the `parents` field on a config note
-    // even when the path didn't change, so always invalidate when the
-    // current path is in a config namespace.
-    this.invalidateConfigCachesForPath(note.path, oldPath);
-    this.hooks.dispatch("updated", note, this);
+      // Reference-field auto-link sync (vault#typed-reference-field). Only
+      // when this call actually touched `metadata` — see the read above for
+      // why a content/tags/path-only update is skipped.
+      if (updates.metadata !== undefined) {
+        this.syncReferenceFieldLinks(note, priorMetadataForRefs);
+      }
+
+      return note;
+    });
+
+    // Dispatch and invalidate only once the whole surrounding transaction
+    // stack commits. In a multi-item transactionAsync batch the inner Store
+    // transaction is a SAVEPOINT, so "after the inner closure" is not yet
+    // post-commit; afterCommit carries these through to the outer boundary.
+    afterCommit(this.db, () => {
+      this.invalidateConfigCachesForPath(note.path, oldPath);
+      this.hooks.dispatch("updated", note, this);
+    });
 
     return note;
   }

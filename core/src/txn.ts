@@ -76,6 +76,49 @@ export interface TxnCapableDb {
  */
 const txnDepth = new WeakMap<TxnCapableDb, number>();
 
+/**
+ * Post-commit callbacks, stacked per transaction frame. A nested transaction
+ * merges its callbacks into its parent when its SAVEPOINT is released; only
+ * the outermost successful commit runs them. A rollback discards the frame.
+ */
+const afterCommitFrames = new WeakMap<TxnCapableDb, Array<Array<() => void>>>();
+
+function enterAfterCommitFrame(db: TxnCapableDb): void {
+  const frames = afterCommitFrames.get(db) ?? [];
+  frames.push([]);
+  afterCommitFrames.set(db, frames);
+}
+
+function commitAfterCommitFrame(db: TxnCapableDb): void {
+  const frames = afterCommitFrames.get(db);
+  const callbacks = frames?.pop() ?? [];
+  const parent = frames?.at(-1);
+  if (parent) {
+    parent.push(...callbacks);
+    return;
+  }
+  afterCommitFrames.delete(db);
+  for (const callback of callbacks) callback();
+}
+
+function rollbackAfterCommitFrame(db: TxnCapableDb): void {
+  const frames = afterCommitFrames.get(db);
+  frames?.pop();
+  if (!frames || frames.length === 0) afterCommitFrames.delete(db);
+}
+
+/**
+ * Run a callback only after the surrounding transaction stack commits. When
+ * called outside a transaction it runs immediately. This keeps hooks and
+ * cache invalidation honest for synchronous store writes nested inside an
+ * outer {@link transactionAsync} batch.
+ */
+export function afterCommit(db: TxnCapableDb, callback: () => void): void {
+  const frame = afterCommitFrames.get(db)?.at(-1);
+  if (frame) frame.push(callback);
+  else callback();
+}
+
 /** One entry on the nesting stack: whether this frame owns the outer
  *  `BEGIN … COMMIT`/`ROLLBACK` (outermost) or a `SAVEPOINT` (nested), plus the
  *  depth to restore on exit. */
@@ -153,18 +196,38 @@ function rollbackTxn(db: TxnCapableDb, frame: TxnFrame): void {
  * below unchanged.
  */
 export function transaction<T>(db: TxnCapableDb, fn: () => T): T {
+  enterAfterCommitFrame(db);
   if (typeof db.transactionSync === "function") {
-    return db.transactionSync(fn);
-  }
-  const frame = enterTxn(db);
-  try {
-    const result = fn();
-    commitTxn(db, frame);
+    let result: T;
+    try {
+      result = db.transactionSync(fn);
+    } catch (err) {
+      rollbackAfterCommitFrame(db);
+      throw err;
+    }
+    commitAfterCommitFrame(db);
     return result;
+  }
+  let frame: TxnFrame;
+  try {
+    frame = enterTxn(db);
   } catch (err) {
+    rollbackAfterCommitFrame(db);
+    throw err;
+  }
+  let result: T;
+  try {
+    result = fn();
+    commitTxn(db, frame);
+  } catch (err) {
+    rollbackAfterCommitFrame(db);
     rollbackTxn(db, frame);
     throw err;
   }
+  // The SQL transaction is already resolved. A callback error must propagate
+  // without attempting a misleading ROLLBACK after COMMIT.
+  commitAfterCommitFrame(db);
+  return result;
 }
 
 /**
@@ -188,13 +251,23 @@ export function transaction<T>(db: TxnCapableDb, fn: () => T): T {
  * than a second `BEGIN`. See the file header.
  */
 export async function transactionAsync<T>(db: TxnCapableDb, fn: () => Promise<T>): Promise<T> {
-  const frame = enterTxn(db);
+  enterAfterCommitFrame(db);
+  let frame: TxnFrame;
   try {
-    const result = await fn();
-    commitTxn(db, frame);
-    return result;
+    frame = enterTxn(db);
   } catch (err) {
+    rollbackAfterCommitFrame(db);
+    throw err;
+  }
+  let result: T;
+  try {
+    result = await fn();
+    commitTxn(db, frame);
+  } catch (err) {
+    rollbackAfterCommitFrame(db);
     rollbackTxn(db, frame);
     throw err;
   }
+  commitAfterCommitFrame(db);
+  return result;
 }

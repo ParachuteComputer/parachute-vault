@@ -12,7 +12,7 @@
 
 import { describe, it, expect } from "bun:test";
 import { Database } from "bun:sqlite";
-import { transaction, transactionAsync, type TxnCapableDb } from "./txn.js";
+import { afterCommit, transaction, transactionAsync, type TxnCapableDb } from "./txn.js";
 
 /** A fake `TxnCapableDb` that records exec calls and can be told to throw on
  *  COMMIT and/or ROLLBACK — lets us drive the failure branches exactly. */
@@ -261,6 +261,38 @@ describe("transactionAsync", () => {
 });
 
 describe("transaction — re-entrancy via SAVEPOINTs (vault#589)", () => {
+  it("does not attempt rollback when an after-commit callback throws", () => {
+    const { db, calls } = fakeDb();
+    expect(() => transaction(db, () => {
+      afterCommit(db, () => { throw new Error("post-commit boom"); });
+    })).toThrow("post-commit boom");
+    expect(calls).toEqual(["BEGIN IMMEDIATE", "COMMIT"]);
+  });
+
+  it("runs nested after-commit work only after the outer commit", async () => {
+    const db = freshDb();
+    const calls: string[] = [];
+    await transactionAsync(db, async () => {
+      transaction(db, () => {
+        afterCommit(db, () => calls.push("after commit"));
+      });
+      expect(calls).toEqual([]);
+    });
+    expect(calls).toEqual(["after commit"]);
+  });
+
+  it("discards nested after-commit work when the outer transaction rolls back", async () => {
+    const db = freshDb();
+    const calls: string[] = [];
+    await expect(transactionAsync(db, async () => {
+      transaction(db, () => {
+        afterCommit(db, () => calls.push("after commit"));
+      });
+      throw new Error("outer boom");
+    })).rejects.toThrow("outer boom");
+    expect(calls).toEqual([]);
+  });
+
   it("a nested sync transaction uses SAVEPOINT/RELEASE, not a second BEGIN", () => {
     const { db, calls } = fakeDb();
     const out = transaction(db, () => {

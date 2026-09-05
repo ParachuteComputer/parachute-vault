@@ -9,6 +9,7 @@ import * as indexedFieldOps from "./indexed-fields.js";
 import { resolveLinkTarget } from "./wikilinks.js";
 import { generateUlid, ULID_REGEX } from "./ulid.js";
 import { getVaultMap, extractH1Title, findNotesByTitle, getNoteByTitle, validatePath, PathValidationError } from "./notes.js";
+import { transactionAsync } from "./txn.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -61,6 +62,51 @@ describe("notes", async () => {
     const updated = await store.updateNote(note.id, { content: "Updated" });
     expect(updated.content).toBe("Updated");
     expect(updated.updatedAt).toBeTruthy();
+  });
+
+  it("rolls back the note row when wikilink re-indexing fails mid-update", async () => {
+    const source = await store.createNote("before", { path: "Source" });
+    await store.createNote("target", { path: "Target" });
+    db.exec(`
+      CREATE TRIGGER fail_link_insert
+      BEFORE INSERT ON links
+      BEGIN
+        SELECT RAISE(ABORT, 'forced mid-update failure');
+      END;
+    `);
+
+    await expect(
+      store.updateNote(source.id, { content: "after [[Target]]" }),
+    ).rejects.toThrow("forced mid-update failure");
+
+    const unchanged = await store.getNote(source.id);
+    expect(unchanged?.content).toBe("before");
+    expect(unchanged?.updatedAt).toBe(source.updatedAt);
+    expect(await store.getLinks(source.id)).toEqual([]);
+  });
+
+  it("does not dispatch update hooks for an outer batch that rolls back", async () => {
+    const first = await store.createNote("first");
+    const second = await store.createNote("second");
+    const fired: string[] = [];
+    store.hooks.onNote({
+      event: "updated",
+      handler: (note) => { fired.push(note.id); },
+    });
+
+    await expect(transactionAsync(db, async () => {
+      await store.updateNote(first.id, { content: "changed first" });
+      await store.updateNote(second.id, { content: "changed second" });
+      throw new Error("forced outer rollback");
+    })).rejects.toThrow("forced outer rollback");
+    // Let any incorrectly queued dispatches reach the registry before drain.
+    await Promise.resolve();
+    await Promise.resolve();
+    await store.hooks.drain();
+
+    expect(fired).toEqual([]);
+    expect((await store.getNote(first.id))?.content).toBe("first");
+    expect((await store.getNote(second.id))?.content).toBe("second");
   });
 
   it("updates note path", async () => {
