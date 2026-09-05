@@ -8,6 +8,7 @@
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { getNoteTags, getVaultMap } from "../core/src/notes.ts";
+import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
@@ -460,6 +461,38 @@ function applyTagScopeWrappers(
   };
 
   /**
+   * Re-decide a write response's `ambiguous_link` warnings against the
+   * caller's OWN sub-vault (vault#707's rule, write side). `candidate_count`
+   * is derived vault-wide, so a `work`-scoped writer saving `[[Dup]]` would
+   * otherwise learn from `candidate_count: 2` that a second `Dup` exists in a
+   * scope it cannot see — the same oracle vault#707 closed on `query-notes`,
+   * reachable through `create-note` / `update-note` instead. Same visibility
+   * model as `ambiguityVisible` / `nearTraversable` in generateScopedMcpTools
+   * (`noteWithinTagScope` by note id), and the same decision function in core
+   * (`visibleResolutionCount`), so the surfaces cannot drift.
+   *
+   * Ordering: identical to `scrubNoteForScope` above — every write wrapper
+   * `await getAllowed()`s before `orig(params)`, so `allowedHolder.value` is
+   * the resolved allowlist by the time this runs.
+   */
+  const scrubWriteNote = (n: any): any => {
+    const scrubbed = scrubNoteForScope(n);
+    if (!scrubbed || !Array.isArray(scrubbed.warnings)) return scrubbed;
+    const visible = (noteId: string) =>
+      noteWithinTagScope(
+        { id: noteId, tags: getNoteTags(store.db, noteId) } as Note,
+        allowedHolder?.value ?? null,
+        rawTags,
+      );
+    const warnings = narrowLinkWarningsForVisibility(store.db, scrubbed.warnings, visible);
+    if (warnings.length === 0) {
+      const { warnings: _dropped, ...rest } = scrubbed;
+      return rest;
+    }
+    return { ...scrubbed, warnings };
+  };
+
+  /**
    * Shape dispatcher for the WRITE tools (vault#568). `create-note` and
    * `update-note` echo the stored note, so they leak exactly what the read
    * paths leak — and a no-op `update-note` would otherwise be a one-call
@@ -469,12 +502,12 @@ function applyTagScopeWrappers(
    */
   const scrubWriteResult = (result: any): any => {
     if (!result || typeof result !== "object") return result;
-    if (Array.isArray(result)) return result.map(scrubNoteForScope);
+    if (Array.isArray(result)) return result.map(scrubWriteNote);
     if ("error" in result) return result;
     if (Array.isArray((result as any).notes)) {
-      return { ...result, notes: (result as any).notes.map(scrubNoteForScope) };
+      return { ...result, notes: (result as any).notes.map(scrubWriteNote) };
     }
-    if ("id" in result && "tags" in result) return scrubNoteForScope(result);
+    if ("id" in result && "tags" in result) return scrubWriteNote(result);
     return result;
   };
 

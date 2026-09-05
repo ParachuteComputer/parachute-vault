@@ -30,6 +30,8 @@ import {
   narrowByVisibleAmbiguity,
   sqlHasAmbiguousLinks,
   getContentWikilinkWarnings,
+  ambiguousLinkWarning,
+  unresolvedLinkWarning,
 } from "./wikilinks.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -1655,20 +1657,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship);
               } else if (outcome.status === "ambiguous") {
-                pushLinkWarning(sourceId, {
-                  code: "ambiguous_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                  candidate_count: outcome.candidates.length,
-                });
+                pushLinkWarning(sourceId, ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
               } else {
-                pushLinkWarning(sourceId, {
-                  code: "unresolved_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                });
+                pushLinkWarning(sourceId, unresolvedLinkWarning(link.target, link.relationship));
               }
             }
           }
@@ -2214,20 +2205,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
-                pushLinkWarning(sourceId, {
-                  code: "ambiguous_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                  candidate_count: outcome.candidates.length,
-                });
+                pushLinkWarning(sourceId, ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
               } else {
-                pushLinkWarning(sourceId, {
-                  code: "unresolved_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                });
+                pushLinkWarning(sourceId, unresolvedLinkWarning(link.target, link.relationship));
               }
             }
           }
