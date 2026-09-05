@@ -1243,6 +1243,84 @@ function visibleResolutionCount(
   return detail.candidates.filter((c) => visible(c.note_id)).length;
 }
 
+/**
+ * Build the `ambiguous_link` write-time warning. ONE template per relationship
+ * shape (content `[[wikilink]]` vs a structured `links` entry), shared by every
+ * producer AND by {@link narrowLinkWarningsForVisibility}'s re-decision, so a
+ * scoped caller's warning text can never drift from the unscoped one.
+ */
+export function ambiguousLinkWarning(
+  target: string,
+  relationship: string,
+  candidateCount: number,
+): QueryWarning {
+  return {
+    code: "ambiguous_link",
+    message: relationship === WIKILINK_REL
+      ? `wikilink target "${target}" matched ${candidateCount} notes — ambiguous, no link created. Use a more specific path, [[Target.ext]], or the note's ID to disambiguate.`
+      : `link target "${target}" (relationship "${relationship}") matched ${candidateCount} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
+    target,
+    relationship,
+    candidate_count: candidateCount,
+  };
+}
+
+/** Twin of {@link ambiguousLinkWarning} for the "matched nothing" outcome. */
+export function unresolvedLinkWarning(target: string, relationship: string): QueryWarning {
+  return {
+    code: "unresolved_link",
+    message: relationship === WIKILINK_REL
+      ? `wikilink target "${target}" did not resolve to any note — queued and will backfill automatically if a matching note is created later.`
+      : `link target "${target}" (relationship "${relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+    target,
+    relationship,
+  };
+}
+
+/**
+ * WRITE-side twin of {@link getAmbiguousLinksForNotes}'s narrowing (vault#707).
+ *
+ * `create-note` / `update-note` echo a per-note `warnings` array, and an
+ * `ambiguous_link` entry there carries a `candidate_count` derived VAULT-WIDE.
+ * Without this, a `work`-scoped WRITER who saves a note containing `[[Dup]]`
+ * learns from `candidate_count: 2` that a second `Dup` exists in a scope it
+ * cannot see — the exact oracle vault#707 closed on the read side, reachable
+ * through the write door instead.
+ *
+ * Same contract, same single decision function ({@link visibleResolutionCount}),
+ * so the two doors cannot drift: a scoped writer gets exactly what an unscoped
+ * writer would get on a vault containing only the notes it can see.
+ *
+ *   - `>= 2` visible → keep, with `candidate_count` = the VISIBLE count
+ *   - `1`    visible → not ambiguous in this sub-vault; drop the warning
+ *   - `0`    visible → demote to `unresolved_link` (a plain broken link)
+ *
+ * Non-`ambiguous_link` warnings pass through untouched: `unresolved_link`
+ * means "matched nothing", which by construction fingerprints nothing (the
+ * same reasoning vault#707 applied to `include_broken_links`). Callers pass
+ * `visible` ONLY for a tag-scoped session, so the unscoped response is
+ * byte-identical — this function is never called there.
+ */
+export function narrowLinkWarningsForVisibility(
+  db: Database,
+  warnings: QueryWarning[],
+  visible: (noteId: string) => boolean,
+): QueryWarning[] {
+  const out: QueryWarning[] = [];
+  for (const w of warnings) {
+    if (w.code !== "ambiguous_link" || typeof w.target !== "string") {
+      out.push(w);
+      continue;
+    }
+    const relationship = typeof w.relationship === "string" ? w.relationship : WIKILINK_REL;
+    const count = visibleResolutionCount(db, w.target, relationship, visible);
+    if (count >= 2) out.push(ambiguousLinkWarning(w.target, relationship, count));
+    else if (count === 0) out.push(unresolvedLinkWarning(w.target, relationship));
+    // count === 1 → resolves cleanly in this sub-vault; report nothing.
+  }
+  return out;
+}
+
 export function getAmbiguousLinksForNotes(
   db: Database,
   noteIds: string[],
@@ -1637,20 +1715,9 @@ export function getContentWikilinkWarnings(
     const detail = resolveWikilinkDetailed(db, wl.target);
     if (detail.resolved) continue; // resolved (incl. self-link) — nothing to warn about
     if (detail.ambiguous) {
-      warnings.push({
-        code: "ambiguous_link",
-        message: `wikilink target "${wl.target}" matched ${detail.candidates.length} notes — ambiguous, no link created. Use a more specific path, [[Target.ext]], or the note's ID to disambiguate.`,
-        target: wl.target,
-        relationship: WIKILINK_REL,
-        candidate_count: detail.candidates.length,
-      });
+      warnings.push(ambiguousLinkWarning(wl.target, WIKILINK_REL, detail.candidates.length));
     } else {
-      warnings.push({
-        code: "unresolved_link",
-        message: `wikilink target "${wl.target}" did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-        target: wl.target,
-        relationship: WIKILINK_REL,
-      });
+      warnings.push(unresolvedLinkWarning(wl.target, WIKILINK_REL));
     }
   }
 

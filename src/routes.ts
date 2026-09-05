@@ -39,6 +39,9 @@ import {
   narrowByVisibleAmbiguity,
   sqlHasAmbiguousLinks,
   getContentWikilinkWarnings,
+  ambiguousLinkWarning,
+  unresolvedLinkWarning,
+  narrowLinkWarningsForVisibility,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
 import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap } from "../core/src/notes.ts";
@@ -947,6 +950,26 @@ function ambiguityVisibilityFor(
       tagScope.allowed,
       tagScope.raw,
     );
+}
+
+/**
+ * Re-decide a WRITE response's `ambiguous_link` warnings against the caller's
+ * own sub-vault. `create-note`/`update-note` echo per-note `warnings`, and an
+ * `ambiguous_link` entry carries a `candidate_count` derived VAULT-WIDE — so
+ * without this a `work`-scoped writer saving `[[Dup]]` learns from
+ * `candidate_count: 2` that a second `Dup` exists in a scope it cannot see.
+ * That is exactly the vault#707 read-side oracle, reachable through the write
+ * door. Same predicate ({@link ambiguityVisibilityFor}) and same core decision
+ * function as the read surfaces, so the doors cannot drift. Unscoped: the
+ * predicate is `undefined` and the array is returned unchanged.
+ */
+function narrowWriteWarnings(
+  db: Database,
+  warnings: QueryWarning[],
+  tagScope: TagScopeCtx,
+): QueryWarning[] {
+  const visible = ambiguityVisibilityFor(db, tagScope);
+  return visible ? narrowLinkWarningsForVisibility(db, warnings, visible) : warnings;
 }
 
 export function parseNotesQueryOpts(url: URL, tagScope: TagScopeCtx = NO_TAG_SCOPE): {
@@ -2406,20 +2429,9 @@ async function handleNotesInner(
             if (outcome.status === "resolved") {
               await store.createLink(sourceId, outcome.note_id, link.relationship);
             } else if (outcome.status === "ambiguous") {
-              pushLinkWarning(sourceId, {
-                code: "ambiguous_link",
-                message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-                target: link.target,
-                relationship: link.relationship,
-                candidate_count: outcome.candidates.length,
-              });
+              pushLinkWarning(sourceId, ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
             } else {
-              pushLinkWarning(sourceId, {
-                code: "unresolved_link",
-                message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-                target: link.target,
-                relationship: link.relationship,
-              });
+              pushLinkWarning(sourceId, unresolvedLinkWarning(link.target, link.relationship));
             }
           }
         }
@@ -2513,10 +2525,10 @@ async function handleNotesInner(
       // default "error" path's response shape is untouched.
       const final = refreshed.map((n) => {
         const validated = attachValidationStatus(store, db, n);
-        const warnings = linkWarningsByNote.get(n.id);
+        const warnings = narrowWriteWarnings(db, linkWarningsByNote.get(n.id) ?? [], tagScope);
         const existed = existedMap.get(n.id);
         let out: any = validated;
-        if (warnings && warnings.length > 0) out = { ...out, warnings };
+        if (warnings.length > 0) out = { ...out, warnings };
         if (existed !== undefined) out = { ...out, existed };
         // Tag-scope (vault#568): a create response echoes the STORED note,
         // and under `if_exists: ignore|update|replace` that's a note that
@@ -2904,20 +2916,9 @@ async function handleNotesInner(
               if (outcome.status === "resolved") {
                 await store.createLink(created.id, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
-                createWarnings.push({
-                  code: "ambiguous_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                  candidate_count: outcome.candidates.length,
-                });
+                createWarnings.push(ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
               } else {
-                createWarnings.push({
-                  code: "unresolved_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                });
+                createWarnings.push(unresolvedLinkWarning(link.target, link.relationship));
               }
             }
           }
@@ -2928,10 +2929,11 @@ async function handleNotesInner(
           if (content) {
             createWarnings.push(...getContentWikilinkWarnings(db, created.id, content));
           }
+          const scopedCreateWarnings = narrowWriteWarnings(db, createWarnings, tagScope);
           const final = await store.getNote(created.id);
           if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
           let validated: any = attachValidationStatus(store, db, final);
-          if (createWarnings.length > 0) validated.warnings = createWarnings;
+          if (scopedCreateWarnings.length > 0) validated.warnings = scopedCreateWarnings;
           // Tag-scope (vault#568): scrub the echoed note so create-then-read
           // returns the SAME shape. A scoped token may legitimately attach an
           // out-of-scope co-tag on write (`tagsWithinScope` only requires ONE
@@ -2949,7 +2951,7 @@ async function handleNotesInner(
           const lean: any = toNoteIndex(validated);
           const vs = (validated as any).validation_status;
           if (vs !== undefined) lean.validation_status = vs;
-          if (createWarnings.length > 0) lean.warnings = createWarnings;
+          if (scopedCreateWarnings.length > 0) lean.warnings = scopedCreateWarnings;
           lean.created = true;
           return json(lean);
         }
@@ -3228,20 +3230,9 @@ async function handleNotesInner(
           if (outcome.status === "resolved") {
             await store.createLink(note.id, outcome.note_id, link.relationship, link.metadata);
           } else if (outcome.status === "ambiguous") {
-            linkWarnings.push({
-              code: "ambiguous_link",
-              message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-              target: link.target,
-              relationship: link.relationship,
-              candidate_count: outcome.candidates.length,
-            });
+            linkWarnings.push(ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
           } else {
-            linkWarnings.push({
-              code: "unresolved_link",
-              message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-              target: link.target,
-              relationship: link.relationship,
-            });
+            linkWarnings.push(unresolvedLinkWarning(link.target, link.relationship));
           }
         }
       }
@@ -3295,7 +3286,8 @@ async function handleNotesInner(
           tagScope.raw,
         );
       }
-      if (linkWarnings.length > 0) validated.warnings = linkWarnings;
+      const scopedLinkWarnings = narrowWriteWarnings(db, linkWarnings, tagScope);
+      if (scopedLinkWarnings.length > 0) validated.warnings = scopedLinkWarnings;
       const includeContentResp = body.include_content !== false;
       // `created: false` is appended to every update-path response so
       // sync-loop callers using `if_missing: "create"` can distinguish
@@ -3308,7 +3300,7 @@ async function handleNotesInner(
       // Carry the link echo across the lean conversion — `toNoteIndex`
       // drops unknown fields, same as the `validation_status` recipe above.
       if (validated.links !== undefined) lean.links = validated.links;
-      if (linkWarnings.length > 0) lean.warnings = linkWarnings;
+      if (scopedLinkWarnings.length > 0) lean.warnings = scopedLinkWarnings;
       lean.created = false;
       return json(lean);
     } catch (e: any) {
