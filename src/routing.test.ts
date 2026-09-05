@@ -1880,6 +1880,73 @@ describe("scope enforcement on /api/*", () => {
     expect(res.status).toBe(401);
   });
 
+  // ----- vault#669: PATCH /api/vault description type guard (cloud#87) ------
+  //
+  // The REST door's `description` write had no runtime type check — the
+  // `description?: string` body annotation was a compile-time claim guarding
+  // nothing, so a write/admin caller could persist a non-string and poison
+  // the next MCP `initialize` (serverInstruction's `description.trim()`).
+  // The guard rejects non-string/non-null with the same 400 shape the
+  // sibling audio_retention / auto_transcribe validators emit. `null` still
+  // clears the description.
+  describe("PATCH /api/vault description type guard (vault#669)", () => {
+    async function patchDescription(vault: string, token: string, description: unknown): Promise<Response> {
+      const path = `/vault/${vault}/api/vault`;
+      return route(
+        new Request(`http://localhost:1940${path}`, {
+          method: "PATCH",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({ description }),
+        }),
+        path,
+      );
+    }
+
+    for (const [label, value] of [
+      ["a number", 123],
+      ["an object", { text: "nope" }],
+      ["an array", ["a", "b"]],
+      ["a boolean", true],
+    ] as const) {
+      test(`${label} description → 400 invalid_description, description unchanged`, async () => {
+        createVault("journal", "original");
+        const token = await mintToken("journal", { permission: "full", scopes: ["vault:write", "vault:admin"] });
+
+        const res = await patchDescription("journal", token, value);
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error_type?: string; field?: string };
+        expect(body.error_type).toBe("invalid_description");
+        expect(body.field).toBe("description");
+
+        // Nothing persisted — no poison state introduced.
+        const getRes = await route(authed(token, "GET", "/vault/journal/api/vault"), "/vault/journal/api/vault");
+        expect(((await getRes.json()) as { description?: unknown }).description).toBe("original");
+      });
+    }
+
+    test("null description → 200, clears it", async () => {
+      createVault("journal", "to be cleared");
+      const token = await mintToken("journal", { permission: "full", scopes: ["vault:write", "vault:admin"] });
+
+      const res = await patchDescription("journal", token, null);
+      expect(res.status).toBe(200);
+
+      const getRes = await route(authed(token, "GET", "/vault/journal/api/vault"), "/vault/journal/api/vault");
+      expect(((await getRes.json()) as { description?: unknown }).description).toBeNull();
+    });
+
+    test("a valid string description → 200, persists un-mangled", async () => {
+      createVault("journal", "before");
+      const token = await mintToken("journal", { permission: "full", scopes: ["vault:write", "vault:admin"] });
+
+      const res = await patchDescription("journal", token, "after the edit");
+      expect(res.status).toBe(200);
+
+      const getRes = await route(authed(token, "GET", "/vault/journal/api/vault"), "/vault/journal/api/vault");
+      expect(((await getRes.json()) as { description?: unknown }).description).toBe("after the edit");
+    });
+  });
+
   // ----- tag-scoped tokens (docs/contracts/tag-scoped-tokens.md) -----------------
 
   /**

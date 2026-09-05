@@ -23,7 +23,15 @@ import {
   resolveStructuredLinkNote,
   getUnresolvedLinksForNote,
   getUnresolvedLinksForNotes,
+  narrowByVisibleBrokenness,
+  sqlHasBrokenLinks,
+  getAmbiguousLinksForNote,
+  getAmbiguousLinksForNotes,
+  narrowByVisibleAmbiguity,
+  sqlHasAmbiguousLinks,
   getContentWikilinkWarnings,
+  ambiguousLinkWarning,
+  unresolvedLinkWarning,
 } from "./wikilinks.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -141,6 +149,17 @@ function structuredError(
   fields: { error_type: string; field?: string; hint?: string } & Record<string, unknown>,
 ): Error {
   return Object.assign(new Error(message), fields);
+}
+
+function requireNoteReference(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw structuredError("`id` is required", {
+      error_type: "missing_required_field",
+      field: "id",
+      hint: "pass the note's id or path (or its unique H1 title)",
+    });
+  }
+  return value;
 }
 
 /**
@@ -471,6 +490,23 @@ export interface GenerateMcpToolsOpts {
    */
   aggregateVisibility?: (note: Note) => boolean;
   /**
+   * `ambiguityVisible` (vault#581 auth review) is an OPTIONAL per-note
+   * predicate gating everything the ambiguous-links surface discloses.
+   * `candidate_count` is derived VAULT-WIDE, so a stored `2` on a `[[Dup]]`
+   * split across scopes tells a tag-scoped reader that a note it cannot see
+   * exists — and `has_ambiguous_links: true` would let it sweep its whole
+   * in-scope corpus for such collisions. When provided, each persisted row
+   * is re-resolved and its candidates narrowed to the visible ones: a row
+   * is disclosed only when ≥2 remain, `candidate_count` is the visible
+   * count, and `has_ambiguous_links` is answered against that same narrowed
+   * view (see `narrowByVisibleAmbiguity` / `sqlHasAmbiguousLinks` in
+   * core/src/wikilinks.ts). Same contract as `nearTraversable`: core stays
+   * scope-unaware and only invokes the injected `(noteId) => boolean`
+   * closure. Omitted (unscoped / internal callers) → the persisted counts
+   * are returned as-is and the SQL filter answers directly, unchanged.
+   */
+  ambiguityVisible?: (noteId: string) => boolean;
+  /**
    * `AttachmentTicketProvider` seam (vault attachment-tickets design,
    * Wave 1 — D10 "tools omitted when unwired"). When provided,
    * `generateMcpTools` appends `request-attachment-upload` /
@@ -549,6 +585,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const nearTraversable = opts?.nearTraversable;
   const ifExistsVisible = opts?.ifExistsVisible;
   const aggregateVisibility = opts?.aggregateVisibility;
+  const ambiguityVisible = opts?.ambiguityVisible;
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
   // and folded into every create/update the tools perform.
@@ -600,6 +637,28 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "query-notes",
       execute: async (params) => {
+        // --- Ambiguous-links scope split (vault#581 auth review) ---
+        // `requestedHasAmbiguous` is what the caller asked for;
+        // `sqlHasAmbiguous` is what is safe to push into SQL for a reader
+        // that will be narrowed by `narrowByVisibleAmbiguity` afterwards
+        // (`true` is a superset and stays; `false` is lifted). Identical for
+        // an unscoped reader, where no predicate is injected and the SQL
+        // filter alone is the whole answer.
+        const requestedHasAmbiguous = params.has_ambiguous_links as boolean | undefined;
+        const sqlHasAmbiguous = sqlHasAmbiguousLinks(requestedHasAmbiguous, Boolean(ambiguityVisible));
+
+        // --- Broken-links scope split (vault#239) ---
+        // Same shape as the ambiguity split above, one polarity stricter:
+        // NEITHER `true` nor `false` is safe to push into SQL for a scoped
+        // reader, because a note can be broken in that reader's sub-vault
+        // while carrying no `unresolved_wikilinks` row at all (its target's
+        // only candidates are invisible, so the row sits in
+        // `ambiguous_wikilinks`). `sqlHasBrokenLinks` lifts both and
+        // `narrowByVisibleBrokenness` re-decides per note. Identical for an
+        // unscoped reader, where the SQL filter alone is the whole answer.
+        const requestedHasBroken = params.has_broken_links as boolean | undefined;
+        const sqlHasBroken = sqlHasBrokenLinks(requestedHasBroken, Boolean(ambiguityVisible));
+
         // --- Link expansion config (shared across single + list paths) ---
         const expandLinks = params.expand_links === true;
         const expandMode = (params.expand_mode as ExpandMode) ?? "full";
@@ -671,7 +730,10 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             result.links = linkOps.getLinksHydrated(db, note.id);
           }
           if (params.include_broken_links) {
-            result.broken_links = getUnresolvedLinksForNote(db, note.id);
+            result.broken_links = getUnresolvedLinksForNote(db, note.id, ambiguityVisible);
+          }
+          if (params.include_ambiguous_links) {
+            result.ambiguous_links = getAmbiguousLinksForNote(db, note.id, ambiguityVisible);
           }
           if (params.include_attachments) {
             result.attachments = await store.getAttachments(note.id);
@@ -816,7 +878,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             excludeTags: aggExcludeTags,
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
-            hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            hasBrokenLinks: sqlHasBroken,
+            hasAmbiguousLinks: sqlHasAmbiguous,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
             excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
@@ -842,7 +905,23 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // set (reusing the `ids` semijoin `near` already pushes into SQL).
           // Core stays scope-unaware — it only invokes the plain closure.
           const aggAllMatches = await store.queryNotes({ ...aggFilterOpts, limit: 1000000 });
-          const aggVisibleIds = aggAllMatches.filter(aggregateVisibility).map((n) => n.id);
+          // vault#581 auth review: a rollup over `has_ambiguous_links` is the
+          // same oracle as the note-level filter (a non-zero count still
+          // reveals the collision), so narrow the visible id set by the
+          // reader's own view of each row before aggregating.
+          // vault#239: the `has_broken_links` rollup is the same oracle for
+          // the same reason — re-decide brokenness on the sub-vault too.
+          const aggVisibleIds = narrowByVisibleBrokenness(
+            db,
+            narrowByVisibleAmbiguity(
+              db,
+              aggAllMatches.filter(aggregateVisibility),
+              requestedHasAmbiguous,
+              ambiguityVisible,
+            ),
+            requestedHasBroken,
+            ambiguityVisible,
+          ).map((n) => n.id);
           // Always run the rollup, even on an empty visible set: ungrouped
           // count (vault#626) must return `[{group:null,value:0}]`, not `[]`.
           return await store.aggregateNotes({ ids: aggVisibleIds, aggregate: aggregateSpec });
@@ -939,7 +1018,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             excludeTags,
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
-            hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            hasBrokenLinks: sqlHasBroken,
+            hasAmbiguousLinks: sqlHasAmbiguous,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
             excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
@@ -1022,7 +1102,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               excludeTags,
               hasTags: params.has_tags as boolean | undefined,
               hasLinks: params.has_links as boolean | undefined,
-              hasBrokenLinks: params.has_broken_links as boolean | undefined,
+              hasBrokenLinks: sqlHasBroken,
+              hasAmbiguousLinks: sqlHasAmbiguous,
               path: params.path as string | undefined,
               pathPrefix: params.path_prefix as string | undefined,
               excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
@@ -1091,7 +1172,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             excludeTags,
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
-            hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            hasBrokenLinks: sqlHasBroken,
+            hasAmbiguousLinks: sqlHasAmbiguous,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
             excludePathPrefix: normalizeTags(params.exclude_path_prefix ?? params.excludePathPrefix),
@@ -1147,6 +1229,17 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         if (nearScope && params.search) {
           results = results.filter((n) => nearScope!.has(n.id));
         }
+
+        // vault#581 auth review — the `has_ambiguous_links` filter must
+        // answer on the reader's OWN sub-vault, not the whole vault. No-op
+        // unscoped (no predicate injected) and when the filter wasn't asked
+        // for. See `narrowByVisibleAmbiguity` for the superset contract and
+        // the page-shortening effect.
+        results = narrowByVisibleAmbiguity(db, results, requestedHasAmbiguous, ambiguityVisible);
+        // vault#239 — same rule for `has_broken_links`: the SQL filter was
+        // lifted for a scoped reader, so the real predicate is applied here
+        // on that reader's own sub-vault. No-op unscoped.
+        results = narrowByVisibleBrokenness(db, results, requestedHasBroken, ambiguityVisible);
 
         // --- Format output ---
         const includeContent = params.include_content === true; // default false for list
@@ -1219,7 +1312,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         }
 
         // --- Hydrate links/attachments/broken-links per note if requested ---
-        if (params.include_links || params.include_attachments || params.include_broken_links) {
+        if (params.include_links || params.include_attachments || params.include_broken_links || params.include_ambiguous_links) {
           // Links hydrate for the WHOLE page in a constant number of
           // queries (see getLinksHydratedForNotes) — the per-note variant
           // cost (1 link query + 1 summary query + N tag queries) × page
@@ -1229,13 +1322,18 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             : null;
           // Same one-batched-query-for-the-page shape as links (vault#555).
           const brokenLinksByNote = params.include_broken_links
-            ? getUnresolvedLinksForNotes(db, (output as any[]).map((n: any) => n.id))
+            ? getUnresolvedLinksForNotes(db, (output as any[]).map((n: any) => n.id), ambiguityVisible)
+            : null;
+          // Same one-batched-query-for-the-page shape for the ambiguity twin (vault#581).
+          const ambiguousLinksByNote = params.include_ambiguous_links
+            ? getAmbiguousLinksForNotes(db, (output as any[]).map((n: any) => n.id), ambiguityVisible)
             : null;
           const enrichedOut: any[] = [];
           for (const n of output as any[]) {
             const enriched: any = { ...n };
             if (linksByNote) enriched.links = linksByNote.get(n.id) ?? [];
             if (brokenLinksByNote) enriched.broken_links = brokenLinksByNote.get(n.id) ?? [];
+            if (ambiguousLinksByNote) enriched.ambiguous_links = ambiguousLinksByNote.get(n.id) ?? [];
             if (params.include_attachments) enriched.attachments = await store.getAttachments(n.id);
             enrichedOut.push(enriched);
           }
@@ -1559,20 +1657,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship);
               } else if (outcome.status === "ambiguous") {
-                pushLinkWarning(sourceId, {
-                  code: "ambiguous_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                  candidate_count: outcome.candidates.length,
-                });
+                pushLinkWarning(sourceId, ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
               } else {
-                pushLinkWarning(sourceId, {
-                  code: "unresolved_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                });
+                pushLinkWarning(sourceId, unresolvedLinkWarning(link.target, link.relationship));
               }
             }
           }
@@ -1730,7 +1817,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // branch using this same item's payload. Otherwise mirror the
             // existing `requireNote` behavior (throw "Note not found").
             // vault#309.
-            const resolved = resolveNote(db, item.id as string);
+            const idOrPath = requireNoteReference(item.id);
+            const resolved = resolveNote(db, idOrPath);
             if (!resolved) {
               if (item.if_missing === "create") {
                 // Treat the update payload as a create payload. Minimum:
@@ -1765,7 +1853,6 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                 //     processed and used by Gitcoin's sync; the
                 //     misleading wording is fixed here so a future
                 //     reader doesn't trust it and break the workflow.
-                const idOrPath = item.id as string;
                 // Heuristic: if `path` isn't set AND the `id` looks like a
                 // path (contains "/" or doesn't match a typical opaque-id
                 // shape), use it as the path too. Otherwise treat it as a
@@ -2118,20 +2205,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
-                pushLinkWarning(sourceId, {
-                  code: "ambiguous_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                  candidate_count: outcome.candidates.length,
-                });
+                pushLinkWarning(sourceId, ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
               } else {
-                pushLinkWarning(sourceId, {
-                  code: "unresolved_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                });
+                pushLinkWarning(sourceId, unresolvedLinkWarning(link.target, link.relationship));
               }
             }
           }
@@ -2193,7 +2269,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "delete-note",
       execute: async (params) => {
-        const note = requireNote(db, params.id as string);
+        const note = requireNote(db, requireNoteReference(params.id));
         await store.deleteNote(note.id);
         return { deleted: true, id: note.id };
       },
@@ -3032,4 +3108,3 @@ export class BatchTooLargeError extends Error {
     this.got = got;
   }
 }
-

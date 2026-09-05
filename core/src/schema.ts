@@ -4,8 +4,9 @@ import { rebuildIndexes, listIndexedFields } from "./indexed-fields.js";
 import { findMixedTypeIndexedFieldNotes } from "./doctor.js";
 import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
+import { ensureRelationshipColumn } from "./wikilinks.js";
 
-export const SCHEMA_VERSION = 27;
+export const SCHEMA_VERSION = 28;
 
 /**
  * Deterministic last-resort epoch for a note whose `updated_at` AND
@@ -620,6 +621,13 @@ export function initSchema(db: Database): void {
   // every pre-existing note simply has zero rows, which the staleness gate
   // already reads as "needs embedding." See vault semantic-search MVP plan.
   migrateToV27(db);
+
+  // Migrate v27 → v28: fold the lazy unresolved_wikilinks `relationship`
+  // column self-heal into the versioned chain (vault#567 item 2). Gated:
+  // no table → no-op; 3-column table → no-op; only a pre-#555 2-column
+  // table is rebuilt. Does not create the table on vaults that never
+  // queued an unresolved link, and does not rewrite notes.
+  migrateToV28(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1727,6 +1735,25 @@ function migrateToV27(db: Database): void {
     `);
     db.exec("CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content_hash)");
   });
+}
+
+/**
+ * Migrate v27 → v28: version the unresolved_wikilinks relationship-column
+ * self-heal that used to run lazily on first touch (vault#567 item 2).
+ *
+ * COST: this does NOT rewrite every vault on open. `ensureRelationshipColumn`
+ * gates on PRAGMA table_info:
+ *   - table missing (most vaults — lazy creation, never queued a dangling
+ *     link) → return immediately, no CREATE;
+ *   - `relationship` already present (post-#555 / fresh 3-column table) →
+ *     return immediately;
+ *   - pre-#555 2-column table only → one atomic 4-statement rebuild of
+ *     `unresolved_wikilinks` (typically tiny; not a notes rewrite).
+ * Subsequent opens are the same PRAGMA no-op. The per-touch lazy call in
+ * `wikilinks.ts` stays as a no-op safety net after this version.
+ */
+function migrateToV28(db: Database): void {
+  ensureRelationshipColumn(db);
 }
 
 function hasTable(db: Database, name: string): boolean {

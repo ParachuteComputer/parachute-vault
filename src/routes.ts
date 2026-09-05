@@ -11,6 +11,7 @@
  * and the Request, and returns a Response.
  */
 
+import type { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
@@ -30,7 +31,17 @@ import {
   resolveStructuredLinkNote,
   getUnresolvedLinksForNote,
   getUnresolvedLinksForNotes,
+  listZeroVisibleAmbiguousAsUnresolved,
+  narrowByVisibleBrokenness,
+  sqlHasBrokenLinks,
+  getAmbiguousLinksForNote,
+  getAmbiguousLinksForNotes,
+  narrowByVisibleAmbiguity,
+  sqlHasAmbiguousLinks,
   getContentWikilinkWarnings,
+  ambiguousLinkWarning,
+  unresolvedLinkWarning,
+  narrowLinkWarningsForVisibility,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
 import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap } from "../core/src/notes.ts";
@@ -67,6 +78,7 @@ import {
   filterHydratedLinksByTagScope,
   filterNotesByTagScope,
   noteWithinTagScope,
+  scopeQueryTags,
   scrubIndexedFieldConflictError,
   scrubNotesTagsByScope,
   scrubNoteTagsByScope,
@@ -901,8 +913,66 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
  * Returns `{ error }` (a 400 Response) on a malformed metadata filter, exactly
  * as the inline code did. `hasSearch` is surfaced from the raw `search` param
  * (this helper does not itself build a search query — the caller routes that).
+ *
+ * `tagScope` (vault#675): out-of-scope `tag=` / `exclude_tag=` inputs are
+ * rewritten so they match nothing, exactly as a nonexistent tag would — see
+ * `scopeQueryTags`. Applied here so every branch that lowers a query string
+ * (structured, `search`, `semantic`, `aggregate`, `near`, cursor) is covered
+ * by one call, the same way this helper already gives subscribe/search
+ * predicate parity. Default `NO_TAG_SCOPE` → no-op, so the WS route's
+ * upgrade-time parse (which runs before the socket authenticates) is
+ * unchanged; `ws-server.ts` applies the scoping once auth is known.
  */
-export function parseNotesQueryOpts(url: URL): {
+/**
+ * The `visible` predicate the vault#581 ambiguous-links surface consults for
+ * a TAG-SCOPED reader — `undefined` (and therefore a complete no-op) for an
+ * unscoped one. Identical shape and rule to the MCP door's `ambiguityVisible`
+ * (`src/mcp-tools.ts`) and to `nearTraversable`: look a CANDIDATE note's tags
+ * up by id and apply the same `noteWithinTagScope` test every other read path
+ * uses, so the two doors cannot drift on who counts as a visible candidate.
+ *
+ * Needed because `candidate_count` is derived vault-wide: without it a
+ * `work`-scoped reader learns from `candidate_count: 2` on its own `[[Dup]]`
+ * that a second `Dup` exists in a scope it cannot see.
+ *
+ * vault#239 reuses the SAME predicate for the BROKEN-links surface — "which
+ * of this target's candidates can the reader see" is one question, and the
+ * ambiguous (>=2 visible) and broken (0 visible) answers are two faces of it.
+ */
+function ambiguityVisibilityFor(
+  db: Database,
+  tagScope: TagScopeCtx,
+): ((noteId: string) => boolean) | undefined {
+  if (tagScope.raw === null) return undefined;
+  return (noteId: string) =>
+    noteWithinTagScope(
+      { id: noteId, tags: getNoteTags(db, noteId) } as Note,
+      tagScope.allowed,
+      tagScope.raw,
+    );
+}
+
+/**
+ * Re-decide a WRITE response's `ambiguous_link` warnings against the caller's
+ * own sub-vault. `create-note`/`update-note` echo per-note `warnings`, and an
+ * `ambiguous_link` entry carries a `candidate_count` derived VAULT-WIDE — so
+ * without this a `work`-scoped writer saving `[[Dup]]` learns from
+ * `candidate_count: 2` that a second `Dup` exists in a scope it cannot see.
+ * That is exactly the vault#707 read-side oracle, reachable through the write
+ * door. Same predicate ({@link ambiguityVisibilityFor}) and same core decision
+ * function as the read surfaces, so the doors cannot drift. Unscoped: the
+ * predicate is `undefined` and the array is returned unchanged.
+ */
+function narrowWriteWarnings(
+  db: Database,
+  warnings: QueryWarning[],
+  tagScope: TagScopeCtx,
+): QueryWarning[] {
+  const visible = ambiguityVisibilityFor(db, tagScope);
+  return visible ? narrowLinkWarningsForVisibility(db, warnings, visible) : warnings;
+}
+
+export function parseNotesQueryOpts(url: URL, tagScope: TagScopeCtx = NO_TAG_SCOPE): {
   queryOpts?: QueryOpts;
   hasSearch: boolean;
   hasNear: boolean;
@@ -959,7 +1029,26 @@ export function parseNotesQueryOpts(url: URL): {
     hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
     // Presence filter on dangling outbound wikilinks/structured links
     // (vault#555) — see core/src/types.ts QueryOpts.hasBrokenLinks.
-    hasBrokenLinks: parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+    // vault#239: for a TAG-SCOPED reader NEITHER polarity is safe to push
+    // into SQL — a note can be broken in that reader's sub-vault while
+    // carrying no `unresolved_wikilinks` row at all (its target's only
+    // candidates are invisible, so the row sits in `ambiguous_wikilinks`
+    // instead). Both are lifted here and re-decided per note by
+    // `narrowByVisibleBrokenness`. Identity for an unscoped reader.
+    hasBrokenLinks: sqlHasBrokenLinks(
+      parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+      tagScope.raw !== null,
+    ),
+    // Presence filter on AMBIGUOUS outbound links — a target that matched ≥2
+    // notes (vault#581) — see core/src/types.ts QueryOpts.hasAmbiguousLinks.
+    // vault#581 auth review: for a TAG-SCOPED reader only the `true` polarity
+    // is safe to push into SQL (it's a superset of the right answer);
+    // `false` is lifted here and both are re-decided per note by
+    // `narrowByVisibleAmbiguity` on the reader's own visible sub-vault.
+    hasAmbiguousLinks: sqlHasAmbiguousLinks(
+      parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+      tagScope.raw !== null,
+    ),
     path: parseQuery(url, "path") ?? undefined,
     pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
     excludePathPrefix: parseQueryList(url, "exclude_path_prefix"),
@@ -986,7 +1075,12 @@ export function parseNotesQueryOpts(url: URL): {
     cursor: cursorParam ?? undefined,
   };
 
-  return { queryOpts, hasSearch, hasNear, hasCursor };
+  return {
+    queryOpts: scopeQueryTags(queryOpts, tagScope.allowed, tagScope.raw),
+    hasSearch,
+    hasNear,
+    hasCursor,
+  };
 }
 
 /**
@@ -1264,8 +1358,17 @@ async function handleNotesInner(
           // No tag-scope filtering needed (unlike include_links above): a
           // broken-link `target` never resolved to a note, so there's no
           // neighbor identity/content to leak — just the string this note's
-          // own [[wikilink]]/structured link already named.
-          result.broken_links = getUnresolvedLinksForNote(db, note.id);
+          // own [[wikilink]]/structured link already named. The predicate is
+          // not a filter but an ADDITION (vault#239): it makes a reference
+          // whose only candidates are invisible read as broken here, instead
+          // of only once the last of them is deleted.
+          result.broken_links = getUnresolvedLinksForNote(db, note.id, ambiguityVisibilityFor(db, tagScope));
+        }
+        if (parseBool(parseQuery(url, "include_ambiguous_links"), false)) {
+          // Same no-tag-scope-needed reasoning as broken_links above: an
+          // ambiguous `target` never became a link, so no neighbor identity
+          // is exposed — only the string this note's own reference named.
+          result.ambiguous_links = getAmbiguousLinksForNote(db, note.id, ambiguityVisibilityFor(db, tagScope));
         }
         if (parseBool(parseQuery(url, "include_attachments"), false)) {
           result.attachments = await store.getAttachments(note.id);
@@ -1338,7 +1441,7 @@ async function handleNotesInner(
             400,
           );
         }
-        const parsed = parseNotesQueryOpts(url);
+        const parsed = parseNotesQueryOpts(url, tagScope);
         if (parsed.error) return parsed.error;
         try {
           const semanticResult = await store.semanticSearch(nearText, { ...parsed.queryOpts, cursor: undefined });
@@ -1456,7 +1559,7 @@ async function handleNotesInner(
         // were silently dropped — a well-formed result set answering a
         // different question. `search_mode` is still parsed here because it
         // is search-specific (the helper does not know about it).
-        const parsed = parseNotesQueryOpts(url);
+        const parsed = parseNotesQueryOpts(url, tagScope);
         if (parsed.error) return parsed.error;
         const searchModeParsed = parseSearchModeParam(url);
         if (searchModeParsed.error) return searchModeParsed.error;
@@ -1608,7 +1711,7 @@ async function handleNotesInner(
       // Structured-query parsing is shared with the live `/subscribe` route
       // (see `parseNotesQueryOpts`) so both endpoints lower an identical query
       // string to the same `QueryOpts` — predicate parity by construction.
-      const parsed = parseNotesQueryOpts(url);
+      const parsed = parseNotesQueryOpts(url, tagScope);
       if (parsed.error) return parsed.error;
       const queryOpts = parsed.queryOpts!;
       const cursorParam = parseQuery(url, "cursor");
@@ -1685,7 +1788,25 @@ async function handleNotesInner(
             // path applies, THEN aggregate over just that visible id set
             // (reusing the `ids` filter `near` already pushes into SQL).
             const allMatches = await store.queryNotes({ ...queryOpts, limit: 1000000, offset: 0 });
-            const visible = filterNotesByTagScope(allMatches, tagScope.allowed, tagScope.raw);
+            let visible = filterNotesByTagScope(allMatches, tagScope.allowed, tagScope.raw);
+            // vault#581 auth review: a rollup over `has_ambiguous_links` is
+            // the same oracle as the note-level filter — a non-zero count
+            // still reveals the collision — so re-decide each note's
+            // ambiguity on the visible sub-vault before aggregating.
+            visible = narrowByVisibleAmbiguity(
+              db,
+              visible,
+              parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+              ambiguityVisibilityFor(db, tagScope),
+            );
+            // vault#239: the `has_broken_links` rollup is the same oracle for
+            // the same reason — re-decide brokenness on the sub-vault too.
+            visible = narrowByVisibleBrokenness(
+              db,
+              visible,
+              parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+              ambiguityVisibilityFor(db, tagScope),
+            );
             // Always run the rollup, even on an empty visible set: ungrouped
             // count (vault#626) must return `[{group:null,value:0}]`, not `[]`.
             rows = await store.aggregateNotes({ ids: visible.map((n) => n.id), aggregate: aggregateParsed.aggregate });
@@ -1839,12 +1960,33 @@ async function handleNotesInner(
       // output. Same semantics as the search path — empty result is 200 [],
       // not 403.
       results = filterNotesByTagScope(results, tagScope.allowed, tagScope.raw);
+      // vault#581 auth review — `has_ambiguous_links` must answer on the
+      // reader's OWN sub-vault: the SQL filter counts a persisted row even
+      // when the notes that collided are invisible, which would let a scoped
+      // token sweep its corpus for cross-scope naming collisions. No-op
+      // unscoped and when the filter wasn't asked for. Mirrors the MCP door.
+      results = narrowByVisibleAmbiguity(
+        db,
+        results,
+        parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+        ambiguityVisibilityFor(db, tagScope),
+      );
+      // vault#239 — same rule for `has_broken_links`: the SQL filter was
+      // lifted for a scoped reader, so the real predicate is applied here on
+      // that reader's own sub-vault. No-op unscoped. Mirrors the MCP door.
+      results = narrowByVisibleBrokenness(
+        db,
+        results,
+        parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+        ambiguityVisibilityFor(db, tagScope),
+      );
 
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
       const contentRange = parseContentRangeQuery(url, includeContent);
       if (contentRange.error) return contentRange.error;
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
       const includeBrokenLinks = parseBool(parseQuery(url, "include_broken_links"), false);
+      const includeAmbiguousLinks = parseBool(parseQuery(url, "include_ambiguous_links"), false);
       const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
       const includeLinkCount = parseBool(parseQuery(url, "include_link_count"), false);
       const inclMeta = parseIncludeMetadata(url);
@@ -1945,7 +2087,7 @@ async function handleNotesInner(
         );
       }
 
-      if (includeLinks || includeBrokenLinks || includeAttachments) {
+      if (includeLinks || includeBrokenLinks || includeAmbiguousLinks || includeAttachments) {
         // Whole-page link hydration in a constant number of queries — the
         // per-note variant cost (1 link query + 1 summary query + N tag
         // queries) × page size. 2026-06-10 perf measurements.
@@ -1956,7 +2098,11 @@ async function handleNotesInner(
         // filtering needed — a broken-link `target` never resolved to a
         // note, so there's no neighbor identity to leak.
         const brokenLinksByNote = includeBrokenLinks
-          ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id))
+          ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id), ambiguityVisibilityFor(db, tagScope))
+          : null;
+        // Same again for the ambiguity twin (vault#581), same non-leak logic.
+        const ambiguousLinksByNote = includeAmbiguousLinks
+          ? getAmbiguousLinksForNotes(db, output.map((n: any) => n.id), ambiguityVisibilityFor(db, tagScope))
           : null;
         const enrichedOut: any[] = [];
         for (const n of output) {
@@ -1970,6 +2116,7 @@ async function handleNotesInner(
             );
           }
           if (brokenLinksByNote) enriched.broken_links = brokenLinksByNote.get(n.id) ?? [];
+          if (ambiguousLinksByNote) enriched.ambiguous_links = ambiguousLinksByNote.get(n.id) ?? [];
           if (includeAttachments) enriched.attachments = await store.getAttachments(n.id);
           enrichedOut.push(enriched);
         }
@@ -2282,20 +2429,9 @@ async function handleNotesInner(
             if (outcome.status === "resolved") {
               await store.createLink(sourceId, outcome.note_id, link.relationship);
             } else if (outcome.status === "ambiguous") {
-              pushLinkWarning(sourceId, {
-                code: "ambiguous_link",
-                message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-                target: link.target,
-                relationship: link.relationship,
-                candidate_count: outcome.candidates.length,
-              });
+              pushLinkWarning(sourceId, ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
             } else {
-              pushLinkWarning(sourceId, {
-                code: "unresolved_link",
-                message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-                target: link.target,
-                relationship: link.relationship,
-              });
+              pushLinkWarning(sourceId, unresolvedLinkWarning(link.target, link.relationship));
             }
           }
         }
@@ -2389,10 +2525,10 @@ async function handleNotesInner(
       // default "error" path's response shape is untouched.
       const final = refreshed.map((n) => {
         const validated = attachValidationStatus(store, db, n);
-        const warnings = linkWarningsByNote.get(n.id);
+        const warnings = narrowWriteWarnings(db, linkWarningsByNote.get(n.id) ?? [], tagScope);
         const existed = existedMap.get(n.id);
         let out: any = validated;
-        if (warnings && warnings.length > 0) out = { ...out, warnings };
+        if (warnings.length > 0) out = { ...out, warnings };
         if (existed !== undefined) out = { ...out, existed };
         // Tag-scope (vault#568): a create response echoes the STORED note,
         // and under `if_exists: ignore|update|replace` that's a note that
@@ -2780,20 +2916,9 @@ async function handleNotesInner(
               if (outcome.status === "resolved") {
                 await store.createLink(created.id, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
-                createWarnings.push({
-                  code: "ambiguous_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                  candidate_count: outcome.candidates.length,
-                });
+                createWarnings.push(ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
               } else {
-                createWarnings.push({
-                  code: "unresolved_link",
-                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-                  target: link.target,
-                  relationship: link.relationship,
-                });
+                createWarnings.push(unresolvedLinkWarning(link.target, link.relationship));
               }
             }
           }
@@ -2804,10 +2929,11 @@ async function handleNotesInner(
           if (content) {
             createWarnings.push(...getContentWikilinkWarnings(db, created.id, content));
           }
+          const scopedCreateWarnings = narrowWriteWarnings(db, createWarnings, tagScope);
           const final = await store.getNote(created.id);
           if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
           let validated: any = attachValidationStatus(store, db, final);
-          if (createWarnings.length > 0) validated.warnings = createWarnings;
+          if (scopedCreateWarnings.length > 0) validated.warnings = scopedCreateWarnings;
           // Tag-scope (vault#568): scrub the echoed note so create-then-read
           // returns the SAME shape. A scoped token may legitimately attach an
           // out-of-scope co-tag on write (`tagsWithinScope` only requires ONE
@@ -2825,7 +2951,7 @@ async function handleNotesInner(
           const lean: any = toNoteIndex(validated);
           const vs = (validated as any).validation_status;
           if (vs !== undefined) lean.validation_status = vs;
-          if (createWarnings.length > 0) lean.warnings = createWarnings;
+          if (scopedCreateWarnings.length > 0) lean.warnings = scopedCreateWarnings;
           lean.created = true;
           return json(lean);
         }
@@ -3104,20 +3230,9 @@ async function handleNotesInner(
           if (outcome.status === "resolved") {
             await store.createLink(note.id, outcome.note_id, link.relationship, link.metadata);
           } else if (outcome.status === "ambiguous") {
-            linkWarnings.push({
-              code: "ambiguous_link",
-              message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
-              target: link.target,
-              relationship: link.relationship,
-              candidate_count: outcome.candidates.length,
-            });
+            linkWarnings.push(ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
           } else {
-            linkWarnings.push({
-              code: "unresolved_link",
-              message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-              target: link.target,
-              relationship: link.relationship,
-            });
+            linkWarnings.push(unresolvedLinkWarning(link.target, link.relationship));
           }
         }
       }
@@ -3171,7 +3286,8 @@ async function handleNotesInner(
           tagScope.raw,
         );
       }
-      if (linkWarnings.length > 0) validated.warnings = linkWarnings;
+      const scopedLinkWarnings = narrowWriteWarnings(db, linkWarnings, tagScope);
+      if (scopedLinkWarnings.length > 0) validated.warnings = scopedLinkWarnings;
       const includeContentResp = body.include_content !== false;
       // `created: false` is appended to every update-path response so
       // sync-loop callers using `if_missing: "create"` can distinguish
@@ -3184,7 +3300,7 @@ async function handleNotesInner(
       // Carry the link echo across the lean conversion — `toNoteIndex`
       // drops unknown fields, same as the `validation_status` recipe above.
       if (validated.links !== undefined) lean.links = validated.links;
-      if (linkWarnings.length > 0) lean.warnings = linkWarnings;
+      if (scopedLinkWarnings.length > 0) lean.warnings = scopedLinkWarnings;
       lean.created = false;
       return json(lean);
     } catch (e: any) {
@@ -3924,7 +4040,7 @@ export async function handleFindPath(
 
 type VaultConfigLike = {
   name: string;
-  description?: string;
+  description?: string | null;
   audio_retention?: "keep" | "until_transcribed" | "never";
   auto_transcribe?: { enabled?: boolean };
 };
@@ -4024,12 +4140,33 @@ export async function handleVault(
     const parsedBody = await parseJsonBody(req);
     if (!parsedBody.ok) return parsedBody.response;
     const body = parsedBody.body as {
-      description?: string;
+      description?: unknown;
       config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown } };
     };
     let dirty = false;
 
     if (body.description !== undefined) {
+      // vault#669: runtime type guard mirroring the audio_retention /
+      // auto_transcribe validators below — the `description?: string`
+      // annotation was a compile-time claim guarding nothing (cast retyped
+      // to `unknown` so the check is mandatory), so a write/admin caller
+      // could persist a non-string and poison the next MCP `initialize`
+      // (cloud#87). Reject non-string/non-null with the same 400 body
+      // shape the sibling validators in this handler emit. `null` stays
+      // legal: it clears the description. Cross-door parity with cloud#263.
+      if (body.description !== null && typeof body.description !== "string") {
+        return json(
+          {
+            error: "invalid_description",
+            error_type: "invalid_description",
+            field: "description",
+            got: body.description,
+            message: "description must be a string or null",
+            hint: "pass a string, or null to clear the description",
+          },
+          400,
+        );
+      }
       vaultConfig.description = body.description;
       dirty = true;
     }
@@ -4111,11 +4248,28 @@ export function handleUnresolvedWikilinks(
   // and the wikilink target strings those notes contain. Filter the page and
   // recompute `count` from the filtered set so the aggregate total of
   // out-of-scope rows doesn't leak either.
-  const filtered = result.unresolved.filter((row) => {
+  const inScope = (row: { source_id: string }): boolean => {
     const note = getNote(db, row.source_id);
     return note !== null && noteWithinTagScope(note, tagScope.allowed, tagScope.raw);
-  });
-  return Response.json({ unresolved: filtered, count: filtered.length });
+  };
+  const filtered = result.unresolved.filter(inScope);
+
+  // vault#239: a reference whose only candidates are OUT OF SCOPE is broken
+  // in this reader's sub-vault, but its row lives in `ambiguous_wikilinks`
+  // until the last of those candidates is deleted. Reporting it only after
+  // that deletion makes this listing a timing oracle for a cross-scope naming
+  // collision — the same one `getAmbiguousLinksForNotes` narrows away on the
+  // note surfaces. Fold those rows in so the answer is stable across the
+  // delete. Deduped against the base listing by (source, relationship,
+  // target); the two tables are disjoint by construction, so this only
+  // guards against a stale row.
+  const seen = new Set(filtered.map((r) => `${r.source_id}\u0000${r.relationship}\u0000${r.target_path.toLowerCase()}`));
+  const collapsed = listZeroVisibleAmbiguousAsUnresolved(db, ambiguityVisibilityFor(db, tagScope)!, limit)
+    .filter((row) => inScope(row)
+      && !seen.has(`${row.source_id}\u0000${row.relationship}\u0000${row.target_path.toLowerCase()}`));
+
+  const merged = [...filtered, ...collapsed].slice(0, limit);
+  return Response.json({ unresolved: merged, count: merged.length });
 }
 
 // ---------------------------------------------------------------------------
