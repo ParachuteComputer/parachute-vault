@@ -11,8 +11,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   compareVersions,
+  coreVersion,
   decidePublish,
   distTagFor,
+  matchingRcVersions,
   readRegistry,
   unpublishedDrift,
 } from "../scripts/release-plan.ts";
@@ -193,9 +195,77 @@ describe("decidePublish", () => {
       {
         versionExists: false,
         currentDistTagVersion: "0.7.8",
-        publishedVersions: ["0.7.8"],
+        publishedVersions: ["0.7.8", "0.7.9-rc.1"],
       },
       { branch: "main" },
+    );
+    expect(d).toMatchObject({ publish: true });
+  });
+
+  test("a stable without a matching rc is refused — vault#697", () => {
+    // Hub 0.7.13–0.7.16 shipped @latest with no rc of the same X.Y.Z.
+    // Vault's previous plan (and the inline shell it replaced) did the same.
+    const d = decidePublish(
+      "0.7.9",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.8",
+        publishedVersions: ["0.7.8", "0.7.8-rc.2"],
+      },
+      { branch: "main" },
+    );
+    expect(d).toMatchObject({ refuse: true });
+    expect("refuse" in d && d.reason).toMatch(/0\.7\.9-rc/);
+    expect("refuse" in d && d.reason).toMatch(/suffix-drop|Cut an rc first/i);
+  });
+
+  test("a stable whose only published rcs are a different X.Y.Z is still refused", () => {
+    const d = decidePublish(
+      "0.7.9",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.8",
+        publishedVersions: ["0.7.8", "0.7.8-rc.1"],
+      },
+      { branch: "main" },
+    );
+    expect(d).toMatchObject({ refuse: true });
+  });
+
+  test("a stable with a matching rc publishes from main", () => {
+    const d = decidePublish(
+      "0.7.9",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.8",
+        publishedVersions: ["0.7.8", "0.7.9-rc.1"],
+      },
+      { branch: "main" },
+    );
+    expect(d).toMatchObject({ publish: true });
+  });
+
+  test("omitted publishedVersions still refuses a stable when latest already exists", () => {
+    const d = decidePublish(
+      "0.7.9",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.8",
+      },
+      { branch: "main" },
+    );
+    expect(d).toMatchObject({ refuse: true });
+  });
+
+  test("an rc publishes even with no prior rc of the same core", () => {
+    const d = decidePublish(
+      "0.7.9-rc.1",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.8-rc.5",
+        publishedVersions: ["0.7.8", "0.7.8-rc.5"],
+      },
+      { branch: "next" },
     );
     expect(d).toMatchObject({ publish: true });
   });
@@ -278,6 +348,25 @@ describe("readRegistry", () => {
     const v = await readRegistry("@openparachute/vault", "1.0.0", (() =>
       Promise.reject(new Error("ECONNRESET"))) as unknown as typeof fetch);
     expect(v).toMatchObject({ ambiguous: true });
+  });
+});
+
+describe("matchingRcVersions", () => {
+  test("matches only the same X.Y.Z rc chain", () => {
+    expect(
+      matchingRcVersions("0.7.9", ["0.7.8", "0.7.8-rc.1", "0.7.9-rc.1", "0.7.9-rc.2"]),
+    ).toEqual(["0.7.9-rc.1", "0.7.9-rc.2"]);
+  });
+
+  test("a prerelease still matches siblings of its core", () => {
+    expect(matchingRcVersions("0.7.9-rc.3", ["0.7.9-rc.1", "0.7.8-rc.1"])).toEqual(["0.7.9-rc.1"]);
+  });
+});
+
+describe("coreVersion", () => {
+  test("strips the rc suffix and leaves a stable alone", () => {
+    expect(coreVersion("0.7.9-rc.1")).toBe("0.7.9");
+    expect(coreVersion("0.7.9")).toBe("0.7.9");
   });
 });
 

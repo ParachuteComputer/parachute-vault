@@ -15,9 +15,12 @@
  * file's `readRegistry` fetches the package document, so "never published"
  * (empty `publishedVersions`) is distinct from "this version is new".
  *
- * Unlike hub, this function has no matchingRcVersions()/suffix-drop check —
- * the from-main gate is the only thing stopping a stable on `next` from
- * going straight to `@latest`, matching the shell this replaces.
+ * A stable `X.Y.Z` is refused unless npm already has an `X.Y.Z-rc.*` of
+ * the same core (hub#870 / surface#215 / vault#697). The git suffix-drop
+ * *diff* gate (stable vs the latest matching rc tag may only touch
+ * version/changelog/lockfile) is not ported here — this is the registry
+ * half only. The from-main gate still stops a stable on `next` from
+ * going straight to `@latest`.
  *
  * `@openparachute/vault` is already on npm. The skip is so a second
  * package, or a forgotten `publishedVersions` plumbing, cannot 404 the
@@ -36,12 +39,11 @@ export interface RegistryView {
   /** Current version behind the dist-tag we'd move (`rc` or `latest`). */
   currentDistTagVersion?: string;
   /**
-   * Every version currently on npm. When it is empty AND no dist-tag
-   * resolves, the package has never been published at all (surface#220).
-   * Omitted is treated as empty, which means "never published" and skips.
-   * That is the safe direction for a plumbing mistake: a forgotten list can
-   * only cost a skip, never an attempted first-publish npm will 404. An
-   * unreadable registry is `{ ambiguous: true }`, not an empty list.
+   * Every version currently on npm. Used to require an `X.Y.Z-rc.*` of the
+   * same core before a stable, and — when it is empty AND no dist-tag
+   * resolves — to recognise a package that has never been published at all
+   * (surface#220). Omitted is treated as empty. An unreadable registry is
+   * `{ ambiguous: true }`, not an empty list.
    */
   publishedVersions?: readonly string[];
 }
@@ -77,6 +79,22 @@ export function compareVersions(a: string, b: string): number {
   }
   if (pa.preNum === pb.preNum) return 0;
   return pa.preNum < pb.preNum ? -1 : 1;
+}
+
+/** `0.7.9-rc.1` → `0.7.9`; a stable is returned unchanged. */
+export function coreVersion(version: string): string {
+  return version.split("-")[0] ?? version;
+}
+
+/**
+ * Published versions that are an `X.Y.Z-rc.N` of `version`'s core.
+ * `0.7.8-rc.1` does not match a `0.7.9` stable.
+ */
+export function matchingRcVersions(version: string, published: readonly string[]): string[] {
+  const core = coreVersion(version);
+  const escaped = core.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^${escaped}-rc\\.\\d+$`);
+  return published.filter((v) => re.test(v)).sort(compareVersions);
 }
 
 /**
@@ -132,6 +150,20 @@ export function decidePublish(
       refuse: true,
       reason: `${version} is OLDER than the current ${distTagFor(version)} (${current}) — publishing would move the dist-tag backwards and downgrade anyone installing it. This usually means parallel PRs merged out of version order; bump and re-merge.`,
     };
+  }
+  if (distTagFor(version) === "latest") {
+    // No first-ever carve-out here any more: a package with nothing published
+    // returned above, so by this point npm has *something* and a stable owes
+    // us a matching rc unconditionally.
+    const published = registry.publishedVersions ?? [];
+    const rcs = matchingRcVersions(version, published);
+    if (rcs.length === 0) {
+      const core = coreVersion(version);
+      return {
+        refuse: true,
+        reason: `${version} is a stable release but npm has no ${core}-rc.* — stable is a suffix-drop from an rc, never a skip. Cut an rc first, soak, then drop the suffix.`,
+      };
+    }
   }
   return { publish: true, reason: `${version} is not on npm` };
 }
