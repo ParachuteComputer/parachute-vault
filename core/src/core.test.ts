@@ -4476,6 +4476,131 @@ describe("MCP tools", async () => {
     expect(links.links.map((l: any) => l.targetId)).toEqual([keep.id]);
   });
 
+  // ---- vault#239: the visibility model reaches the BROKEN-links surface ----
+  //
+  // vault#581's auth review made the AMBIGUOUS surface answer on a scoped
+  // reader's own sub-vault (>=2 VISIBLE candidates). The same question has a
+  // second answer core must give: 0 visible candidates means the reference is
+  // BROKEN for that reader — whichever table its row currently lives in.
+  //
+  // Without this, `refreshAmbiguousLinks`' delete-time demotion into
+  // `unresolved_wikilinks` is the ONLY thing that makes such a note "broken",
+  // so the answer flips purely because notes the reader can't see were
+  // deleted. Core stays scope-unaware: it just invokes the injected
+  // `ambiguityVisible` closure, exactly as the ambiguity surface does.
+
+  /** `[[Dup]]` with two candidates, neither of which `visibleIds` contains. */
+  async function hiddenCandidates(prefix: string) {
+    const h1 = await store.createNote("hidden one", { path: `${prefix}-p1/Dup` });
+    const h2 = await store.createNote("hidden two", { path: `${prefix}-p2/Dup` });
+    const src = await store.createNote("see [[Dup]]", { id: `${prefix}-src`, path: `${prefix}-src` });
+    return { h1, h2, src, hidden: new Set([h1.id, h2.id]) };
+  }
+
+  it("include_broken_links reports a target whose only candidates fail the visibility predicate", async () => {
+    const { src, hidden } = await hiddenCandidates("mq-vis-brk");
+    const tools = generateMcpTools(store, { ambiguityVisible: (id: string) => !hidden.has(id) });
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: src.id, include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    // ...and it is NOT also reported as ambiguous (the surfaces stay disjoint).
+    expect((await query.execute({ id: src.id, include_ambiguous_links: true }) as any).ambiguous_links)
+      .toEqual([]);
+  });
+
+  it("has_broken_links answers on the visible sub-vault and does not move when a hidden candidate is deleted", async () => {
+    const { src, h1, h2, hidden } = await hiddenCandidates("mq-vis-heal");
+    const tools = generateMcpTools(store, { ambiguityVisible: (id: string) => !hidden.has(id) });
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const snapshot = async () => ({
+      truthy: ((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id),
+      falsy: ((await query.execute({ has_broken_links: false })) as any[]).map((n: any) => n.id),
+      broken: (await query.execute({ id: src.id, include_broken_links: true }) as any).broken_links,
+    });
+
+    const before = await snapshot();
+    expect(before.truthy).toContain(src.id);
+    expect(before.falsy).not.toContain(src.id);
+
+    await store.deleteNote(h1.id);
+    await store.deleteNote(h2.id);
+
+    const after = await snapshot();
+    expect(after.truthy).toContain(src.id);
+    expect(after.falsy).not.toContain(src.id);
+    expect(after.broken).toEqual(before.broken);
+  });
+
+  it("a target with ONE visible candidate is neither broken nor ambiguous (negative control)", async () => {
+    // Guards against a fix that just reports every ambiguous row as broken:
+    // one candidate survives the predicate, so the reference RESOLVES in the
+    // reader's sub-vault.
+    const keep = await store.createNote("visible", { path: "mq-vis-one-a/Dup" });
+    const hide = await store.createNote("hidden", { path: "mq-vis-one-b/Dup" });
+    const src = await store.createNote("see [[Dup]]", { id: "mq-vis-one-src", path: "mq-vis-one-src" });
+
+    const tools = generateMcpTools(store, { ambiguityVisible: (id: string) => id !== hide.id });
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      id: src.id, include_broken_links: true, include_ambiguous_links: true,
+    }) as any;
+    expect(result.broken_links).toEqual([]);
+    expect(result.ambiguous_links).toEqual([]);
+    expect(((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id))
+      .not.toContain(src.id);
+    expect(keep.id).toBeTruthy();
+  });
+
+  it("a STALE ambiguous row that resolves cleanly again is not reported broken", async () => {
+    // A `WikilinkResolution` that RESOLVED carries an empty `candidates`
+    // array, which a naive "count the visible candidates" check would read
+    // as 0 == broken. The row goes stale through the documented vault#581
+    // gap: ambiguity via the H1-TITLE fallback, cleared by editing one
+    // title, which does not re-run the sweep (only a path change does).
+    await store.createNote("# Twin\n\nfirst", { id: "mq-vis-stale-a", path: "mq-vis-stale-a" });
+    const b = await store.createNote("# Twin\n\nsecond", { id: "mq-vis-stale-b", path: "mq-vis-stale-b" });
+    const src = await store.createNote("see [[Twin]]", { id: "mq-vis-stale-src", path: "mq-vis-stale-src" });
+
+    const unscoped = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    expect((await unscoped.execute({ id: src.id, include_ambiguous_links: true }) as any).ambiguous_links)
+      .toEqual([{ target: "Twin", relationship: "wikilink", candidate_count: 2 }]);
+
+    await store.updateNote(b.id, { content: "# Other\n\nsecond" });
+
+    // Row still says "ambiguous"; the target now resolves to the ONE
+    // remaining, visible note — so neither surface may report it.
+    const query = generateMcpTools(store, { ambiguityVisible: () => true })
+      .find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      id: src.id, include_broken_links: true, include_ambiguous_links: true,
+    }) as any;
+    expect(result.broken_links).toEqual([]);
+    expect(result.ambiguous_links).toEqual([]);
+  });
+
+  it("NO predicate injected → broken-links answers from the persisted tables only (regression)", async () => {
+    const { src, h1, h2 } = await hiddenCandidates("mq-vis-unscoped");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const read = async () => await query.execute({
+      id: src.id, include_broken_links: true, include_ambiguous_links: true,
+    }) as any;
+
+    const before = await read();
+    expect(before.broken_links).toEqual([]);
+    expect(before.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+    expect(((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id))
+      .not.toContain(src.id);
+
+    await store.deleteNote(h1.id);
+    await store.deleteNote(h2.id);
+
+    const after = await read();
+    expect(after.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(after.ambiguous_links).toEqual([]);
+  });
+
   // ---- vault#708: the rename cascade follows resolution, not basenames ----
 
   it("cascadeRename leaves an unambiguous full-path bracket aimed at the OTHER same-named note alone", async () => {
