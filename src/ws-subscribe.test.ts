@@ -342,7 +342,12 @@ describe("WS live-query — tag-scope isolation (per-agent boundary)", () => {
     await store.createNote("eng note", { tags: ["shared", "work/eng"] });
     await store.createNote("sales note", { tags: ["shared", "work/sales"] });
     const { server } = makeServer();
-    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=shared`);
+    // Unfiltered subscription: `shared` is OUT of this token's scope, and
+    // since vault#675 a scoped token can no longer subscribe BY an
+    // out-of-scope tag (it matches nothing, exactly like a nonexistent
+    // tag). This test is about the RESULT filter, so it drops the tag
+    // filter rather than probing across the scope boundary.
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe`);
     await h.ready();
     h.send({ type: "auth", token: "scoped-eng" }); // scoped to work/eng
 
@@ -383,7 +388,10 @@ describe("WS live-query — tag-scope isolation (per-agent boundary)", () => {
 
   it("re-auth with the SAME tag-scope stays ready (normal refresh)", async () => {
     const { server } = makeServer();
-    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=shared`);
+    // Unfiltered, for the same reason as the isolation test above: since
+    // vault#675 a scoped token subscribing BY the out-of-scope `shared`
+    // matches nothing, which would mask the live delivery this asserts.
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe`);
     await h.ready();
     h.send({ type: "auth", token: "scoped-eng" });
     await h.readSnapshot();
@@ -396,6 +404,72 @@ describe("WS live-query — tag-scope isolation (per-agent boundary)", () => {
     const m = await h.nextMessage();
     expect(m.type).toBe("upsert");
     expect(m.note.content).toBe("eng after refresh");
+    h.close();
+  });
+});
+
+describe("WS live-query — vault#675: subscribing BY an out-of-scope tag is not an oracle", () => {
+  /**
+   * The one-shot query oracle (REST/MCP, covered in
+   * `tag-scope-query-tag.test.ts`) has a live twin: subscribe to
+   * `?tag=<guessed name>` and watch whether frames arrive. A note tagged
+   * `["shared","work/eng"]` is admitted to a `work/eng` token via `work/eng`,
+   * so pre-fix it landed in the snapshot of a `?tag=shared` subscription and
+   * confirmed that `shared` exists. Post-fix an out-of-scope subscription tag
+   * matches nothing — the same treatment a nonexistent tag gets.
+   */
+  it("out-of-scope subscription tag → empty snapshot AND no live frames, while an in-scope control socket sees the write", async () => {
+    await store.createNote("eng note", { tags: ["shared", "work/eng"] });
+    const { server } = makeServer();
+
+    // The probe: names a tag outside its allowlist.
+    const probe = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=shared`);
+    await probe.ready();
+    probe.send({ type: "auth", token: "scoped-eng" });
+    const snap = await probe.readSnapshot();
+    expect(snap.notes).toEqual([]); // pre-fix: ["eng note"] — the oracle
+
+    // The control: same token, same corpus, no cross-scope tag named.
+    const control = connect(server.port, `/vault/${VAULT}/api/subscribe`);
+    await control.ready();
+    control.send({ type: "auth", token: "scoped-eng" });
+    expect((await control.readSnapshot()).notes.map((n: any) => n.content)).toEqual(["eng note"]);
+
+    // One write, both sockets live. The control receiving it is what makes
+    // the probe's silence evidence rather than a race.
+    await store.createNote("eng live", { tags: ["shared", "work/eng"] });
+    const m = await control.nextMessage();
+    expect(m.type).toBe("upsert");
+    expect(m.note.content).toBe("eng live");
+    await expect(probe.nextMessage(200)).rejects.toThrow(/timeout/);
+
+    probe.close();
+    control.close();
+  });
+
+  it("UNSCOPED control — an unscoped subscription to the same tag is unaffected", async () => {
+    await store.createNote("eng note", { tags: ["shared", "work/eng"] });
+    const { server } = makeServer();
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=shared`);
+    await h.ready();
+    h.send({ type: "auth", token: "good" }); // no scoped_tags
+
+    expect((await h.readSnapshot()).notes.map((n: any) => n.content)).toEqual(["eng note"]);
+    h.close();
+  });
+
+  it("an IN-SCOPE subscription tag still matches — snapshot and live", async () => {
+    await store.createNote("eng note", { tags: ["shared", "work/eng"] });
+    const { server } = makeServer();
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=work/eng`);
+    await h.ready();
+    h.send({ type: "auth", token: "scoped-eng" });
+
+    expect((await h.readSnapshot()).notes.map((n: any) => n.content)).toEqual(["eng note"]);
+    await store.createNote("eng live", { tags: ["work/eng"] });
+    const m = await h.nextMessage();
+    expect(m.type).toBe("upsert");
+    expect(m.note.content).toBe("eng live");
     h.close();
   });
 });

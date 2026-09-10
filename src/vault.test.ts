@@ -1803,6 +1803,191 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
+  // vault#581 auth-review MUST-FIX, MCP door. Same contract as the REST
+  // twins in the "HTTP tag-scope confidentiality" block: a scoped reader's
+  // ambiguous-links answer is exactly what an unscoped reader would get on a
+  // vault containing only the notes it can see.
+  async function ambiguityVault(prefix: string, secondDupTags: string[]) {
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore } = await import("./vault-store.ts");
+    const vaultName = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("work dup", { path: "wdup/Dup", tags: ["work"] });
+    await store.createNote("other dup", { path: "odup/Dup", tags: secondDupTags });
+    const src = await store.createNote("src [[Dup]]", { path: "work-src", tags: ["work"] });
+    return { vaultName, src };
+  }
+
+  test("MCP include_ambiguous_links does NOT reveal an out-of-scope colliding note", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-amb", ["personal"]);
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: src.id, include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain("odup/Dup");
+
+    closeAllStores();
+  });
+
+  test("MCP has_ambiguous_links does not let a scoped session sweep for cross-scope collisions", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-amb-sweep", ["personal"]);
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const truthy = await query.execute({ has_ambiguous_links: true }) as any[];
+    expect(truthy.map((n: any) => n.id)).not.toContain(src.id);
+    expect(truthy).toEqual([]);
+    // ...and the same fact must not leak by ABSENCE from the false query.
+    const falsy = await query.execute({ has_ambiguous_links: false }) as any[];
+    expect(falsy.map((n: any) => n.id)).toContain(src.id);
+
+    closeAllStores();
+  });
+
+  test("MCP POSITIVE CONTROL: both colliding notes in scope → real ambiguity, count 2", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-amb-pos", ["work"]);
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: src.id, include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+    expect(((await query.execute({ has_ambiguous_links: true })) as any[]).map((n: any) => n.id))
+      .toEqual([src.id]);
+
+    closeAllStores();
+  });
+
+  test("UNSCOPED MCP still sees the cross-scope collision in full (regression)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-amb-unscoped", ["personal"]);
+
+    const tools = generateScopedMcpTools(vaultName);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: src.id, include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+    expect(((await query.execute({ has_ambiguous_links: true })) as any[]).map((n: any) => n.id))
+      .toEqual([src.id]);
+
+    closeAllStores();
+  });
+
+  // ---------------------------------------------------------------------
+  // vault#239 / vault#707 review sub-case — the DELETE self-heal is
+  // scope-blind. `refreshAmbiguousLinks` demotes an ambiguous row to
+  // `unresolved_wikilinks` once its last candidate is deleted, so a
+  // `work`-scoped reader's own note flips from "no broken links" to
+  // "has a broken link" purely because notes it can never see were
+  // deleted — a timing oracle for exactly the cross-scope naming
+  // collision vault#707's `candidate_count` narrowing was added to hide.
+  //
+  // The stable, sub-vault-correct answer (vault#707's rule: a scoped
+  // reader gets what an unscoped reader would get on a vault containing
+  // only the notes it can see) is BROKEN in BOTH states: `[[Dup]]`
+  // matches zero VISIBLE notes before the deletes and zero after.
+  async function hiddenOnlyDupVault(prefix: string) {
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore } = await import("./vault-store.ts");
+    const vaultName = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    const h1 = await store.createNote("hidden dup one", { path: "p1/Dup", tags: ["personal"] });
+    const h2 = await store.createNote("hidden dup two", { path: "p2/Dup", tags: ["personal"] });
+    const src = await store.createNote("src [[Dup]]", { path: "work-src", tags: ["work"] });
+    return { vaultName, store, src, hidden: [h1, h2] };
+  }
+
+  test("MCP: a [[Dup]] whose only candidates are out of scope reads as BROKEN for the scoped reader", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await hiddenOnlyDupVault("tagscope-brk");
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: src.id, include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    // ...and the presence filter agrees on both polarities.
+    expect(((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id))
+      .toContain(src.id);
+    expect(((await query.execute({ has_broken_links: false })) as any[]).map((n: any) => n.id))
+      .not.toContain(src.id);
+
+    closeAllStores();
+  });
+
+  test("MCP: deleting the last OUT-OF-SCOPE candidate does not change the scoped reader's broken-link view (vault#239)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, store, src, hidden } = await hiddenOnlyDupVault("tagscope-brk-heal");
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const snapshot = async () => ({
+      broken: (await query.execute({ id: src.id, include_broken_links: true }) as any).broken_links,
+      truthy: ((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id),
+      falsy: ((await query.execute({ has_broken_links: false })) as any[]).map((n: any) => n.id),
+    });
+
+    const before = await snapshot();
+    for (const h of hidden) await store.deleteNote(h.id);
+    const after = await snapshot();
+
+    expect(after).toEqual(before);
+    expect(after.broken).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+
+    closeAllStores();
+  });
+
+  test("MCP NEGATIVE CONTROL: one IN-SCOPE candidate → not broken for the scoped reader", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, src } = await ambiguityVault("tagscope-brk-neg", ["personal"]);
+
+    // `wdup/Dup` is in scope, `odup/Dup` is not — the reference resolves in
+    // the reader's sub-vault, so it must NOT be reported broken.
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ id: src.id, include_broken_links: true }) as any).broken_links)
+      .toEqual([]);
+    expect(((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id))
+      .not.toContain(src.id);
+
+    closeAllStores();
+  });
+
+  test("UNSCOPED MCP is unchanged: ambiguous before the deletes, broken after (regression)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { vaultName, store, src, hidden } = await hiddenOnlyDupVault("tagscope-brk-unscoped");
+
+    const tools = generateScopedMcpTools(vaultName);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const inc = { id: src.id, include_broken_links: true, include_ambiguous_links: true };
+
+    const before = await query.execute(inc) as any;
+    expect(before.broken_links).toEqual([]);
+    expect(before.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+
+    for (const h of hidden) await store.deleteNote(h.id);
+
+    const after = await query.execute(inc) as any;
+    expect(after.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(after.ambiguous_links).toEqual([]);
+
+    closeAllStores();
+  });
+
   test("MCP include_links strips out-of-scope NEIGHBOR summaries", async () => {
     const { generateScopedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");
@@ -4841,6 +5026,264 @@ describe("HTTP tag-scope confidentiality (security review)", async () => {
     expect(targets).toContain("NoSuchPersonal");
   });
 
+  // vault#581 auth-review MUST-FIX: `candidate_count` is derived VAULT-WIDE,
+  // so the ambiguous-links surface must not tell a scoped reader that a note
+  // it cannot see exists. The contract: a scoped reader's answer is exactly
+  // what an unscoped reader would get on a vault containing only the notes it
+  // can see. Each assertion MUST fail without the visible-candidate recompute.
+
+  /** One #work source `[[Dup]]`, one in-scope Dup, one out-of-scope Dup. */
+  async function crossScopeDupFixture(secondDupTags: string[]) {
+    await store.createNote("work dup", { path: "wdup/Dup", tags: ["work"] });
+    await store.createNote("other dup", { path: "odup/Dup", tags: secondDupTags });
+    return await store.createNote("src [[Dup]]", { path: "work-src", tags: ["work"] });
+  }
+
+  test("include_ambiguous_links does NOT reveal an out-of-scope colliding note", async () => {
+    // The reviewer's exact probe. Only ONE Dup is visible to `work`, so in
+    // this reader's sub-vault `[[Dup]]` is not ambiguous at all.
+    const src = await crossScopeDupFixture(["personal"]);
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_ambiguous_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any;
+    expect(body.ambiguous_links).toEqual([]);
+    expect(JSON.stringify(body)).not.toContain("odup/Dup");
+  });
+
+  test("has_ambiguous_links=true does not let a scoped token sweep for cross-scope collisions", async () => {
+    const src = await crossScopeDupFixture(["personal"]);
+    const res = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=true"),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.id)).not.toContain(src.id);
+    expect(body).toEqual([]);
+  });
+
+  test("has_ambiguous_links=false does not leak the same fact by ABSENCE", async () => {
+    // The note is not ambiguous in this reader's sub-vault, so a `false`
+    // query must RETURN it. Excluding it would leak the collision just as
+    // loudly as including it in the `true` query.
+    const src = await crossScopeDupFixture(["personal"]);
+    const res = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=false"),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.id)).toContain(src.id);
+  });
+
+  test("aggregate over has_ambiguous_links does not leak the collision as a count", async () => {
+    await crossScopeDupFixture(["personal"]);
+    const res = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=true&aggregate[op]=count"),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    // Ungrouped count comes back as `[{group: null, value: N}]`; N must be 0
+    // — a 1 here would announce the invisible collision just as loudly.
+    expect(await res.json()).toEqual([{ group: null, value: 0 }]);
+  });
+
+  test("POSITIVE CONTROL: both colliding notes in scope → real ambiguity, count 2", async () => {
+    // Same shape, both Dups #work. The scoped reader must get the FULL,
+    // unredacted answer — otherwise the tests above would pass on a fix that
+    // simply disabled the feature for scoped tokens.
+    const src = await crossScopeDupFixture(["work"]);
+    const single = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_ambiguous_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect((await single.json() as any).ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+
+    const swept = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=true"),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect((await swept.json() as any[]).map((n) => n.id)).toEqual([src.id]);
+  });
+
+  test("UNSCOPED still sees the cross-scope collision in full (regression)", async () => {
+    const src = await crossScopeDupFixture(["personal"]);
+    const single = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_ambiguous_links=true`),
+      store,
+      "",
+      "v",
+      NO_SCOPE,
+    );
+    expect((await single.json() as any).ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+
+    const swept = await handleNotes(
+      mkReq("GET", "/notes?has_ambiguous_links=true"),
+      store,
+      "",
+      "v",
+      NO_SCOPE,
+    );
+    expect((await swept.json() as any[]).map((n) => n.id)).toEqual([src.id]);
+  });
+
+  test("a partly-visible collision reports only the VISIBLE candidate count", async () => {
+    // Three Dups: two #work (visible), one #personal (not). The reader's
+    // sub-vault genuinely has an ambiguity — of degree 2, not 3.
+    await store.createNote("w1", { path: "w1/Trio", tags: ["work"] });
+    await store.createNote("w2", { path: "w2/Trio", tags: ["work"] });
+    await store.createNote("p1", { path: "p1/Trio", tags: ["personal"] });
+    const src = await store.createNote("src [[Trio]]", { path: "trio-src", tags: ["work"] });
+
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_ambiguous_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect((await res.json() as any).ambiguous_links)
+      .toEqual([{ target: "Trio", relationship: "wikilink", candidate_count: 2 }]);
+  });
+
+  // vault#239 / vault#707 review sub-case — the DELETE self-heal is
+  // scope-blind. `refreshAmbiguousLinks` demotes an ambiguous row into
+  // `unresolved_wikilinks` once its last candidate is deleted, so a scoped
+  // reader's own note flips from "no broken links" to "has a broken link"
+  // purely because notes it can never see were deleted. That is a timing
+  // oracle for exactly the cross-scope naming collision the block above
+  // hides. The stable, sub-vault-correct answer is BROKEN in BOTH states:
+  // `[[Dup]]` matches zero VISIBLE notes before the deletes and zero after.
+
+  /** One #work source `[[Dup]]`, with every Dup candidate out of scope. */
+  async function hiddenOnlyDupFixture() {
+    const h1 = await store.createNote("hidden dup one", { path: "p1/Dup", tags: ["personal"] });
+    const h2 = await store.createNote("hidden dup two", { path: "p2/Dup", tags: ["personal"] });
+    const src = await store.createNote("src [[Dup]]", { path: "work-src", tags: ["work"] });
+    return { src, hidden: [h1, h2] };
+  }
+
+  test("include_broken_links reports a reference whose only candidates are out of scope", async () => {
+    const { src } = await hiddenOnlyDupFixture();
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_broken_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any;
+    expect(body.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(JSON.stringify(body)).not.toContain("p1/Dup");
+  });
+
+  test("deleting the last OUT-OF-SCOPE candidate does not change the scoped broken-link view (vault#239)", async () => {
+    const { src, hidden } = await hiddenOnlyDupFixture();
+    const scope = await scopeCtx(["work"]);
+    const snapshot = async () => ({
+      broken: (await (await handleNotes(
+        mkReq("GET", `/notes?id=${src.id}&include_broken_links=true`), store, "", "v", scope,
+      )).json() as any).broken_links,
+      truthy: ((await (await handleNotes(
+        mkReq("GET", "/notes?has_broken_links=true"), store, "", "v", scope,
+      )).json()) as any[]).map((n) => n.id),
+      falsy: ((await (await handleNotes(
+        mkReq("GET", "/notes?has_broken_links=false"), store, "", "v", scope,
+      )).json()) as any[]).map((n) => n.id),
+    });
+
+    const before = await snapshot();
+    for (const h of hidden) await store.deleteNote(h.id);
+    const after = await snapshot();
+
+    expect(after).toEqual(before);
+    expect(after.broken).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(after.truthy).toContain(src.id);
+    expect(after.falsy).not.toContain(src.id);
+  });
+
+  test("aggregate over has_broken_links does not leak the collision as a count either", async () => {
+    const { hidden } = await hiddenOnlyDupFixture();
+    const scope = await scopeCtx(["work"]);
+    const rollup = async () => (await (await handleNotes(
+      mkReq("GET", "/notes?has_broken_links=true&aggregate[op]=count"), store, "", "v", scope,
+    )).json()) as any[];
+
+    const before = await rollup();
+    for (const h of hidden) await store.deleteNote(h.id);
+    expect(await rollup()).toEqual(before);
+  });
+
+  test("/unresolved-wikilinks does not gain a row when an out-of-scope candidate is deleted", async () => {
+    const { hidden } = await hiddenOnlyDupFixture();
+    const scope = await scopeCtx(["work"]);
+    const list = async () => {
+      const body = await (handleUnresolvedWikilinks(
+        mkReq("GET", "/unresolved-wikilinks"), store, scope,
+      )).json() as any;
+      return { targets: (body.unresolved as any[]).map((r) => r.target_path).sort(), count: body.count };
+    };
+
+    const before = await list();
+    expect(before.targets).toContain("Dup");
+    for (const h of hidden) await store.deleteNote(h.id);
+    expect(await list()).toEqual(before);
+  });
+
+  test("NEGATIVE CONTROL: one IN-SCOPE candidate is not reported broken", async () => {
+    // `wdup/Dup` is visible, `odup/Dup` is not — the reference resolves in
+    // the reader's sub-vault, so it must NOT be reported broken. Guards
+    // against a fix that simply reports every ambiguous row as broken.
+    const src = await crossScopeDupFixture(["personal"]);
+    const scope = await scopeCtx(["work"]);
+    const body = await (await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_broken_links=true`), store, "", "v", scope,
+    )).json() as any;
+    expect(body.broken_links).toEqual([]);
+    const swept = (await (await handleNotes(
+      mkReq("GET", "/notes?has_broken_links=true"), store, "", "v", scope,
+    )).json()) as any[];
+    expect(swept.map((n) => n.id)).not.toContain(src.id);
+  });
+
+  test("UNSCOPED REST is unchanged: ambiguous before the deletes, broken after (regression)", async () => {
+    const { src, hidden } = await hiddenOnlyDupFixture();
+    const read = async () => (await (await handleNotes(
+      mkReq("GET", `/notes?id=${src.id}&include_broken_links=true&include_ambiguous_links=true`),
+      store, "", "v", NO_SCOPE,
+    )).json()) as any;
+
+    const before = await read();
+    expect(before.broken_links).toEqual([]);
+    expect(before.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+
+    for (const h of hidden) await store.deleteNote(h.id);
+
+    const after = await read();
+    expect(after.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(after.ambiguous_links).toEqual([]);
+  });
+
   // vault#555 auth-review CRITICAL: `if_exists` must NOT become a tag-scope
   // bypass. A scoped token naming an out-of-scope note's PATH must not read
   // (ignore), update, or replace it — treat it as a path_conflict (path taken,
@@ -6220,6 +6663,87 @@ describe("HTTP GET /notes — has_broken_links / include_broken_links (vault#555
   });
 });
 
+// vault#581 — has_ambiguous_links / include_ambiguous_links on GET /notes.
+// The queryable twin of the has_broken_links block above: before #581 an
+// ambiguous target existed only in the transient write-time warning, so REST
+// callers auditing a vault could not find one after the fact.
+describe("HTTP GET /notes — has_ambiguous_links / include_ambiguous_links (vault#581)", async () => {
+  test("has_ambiguous_links=true filters to notes whose wikilink matched two notes", async () => {
+    await store.createNote("first", { path: "ra1/Dup" });
+    await store.createNote("second", { path: "ra2/Dup" });
+    await store.createNote("[[Dup]]", { path: "rest-ambiguous" });
+    await store.createNote("clean", { path: "rest-amb-clean" });
+    const res = await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.path)).toEqual(["rest-ambiguous"]);
+  });
+
+  test("has_ambiguous_links=false excludes them", async () => {
+    await store.createNote("first", { path: "rb1/Twin" });
+    await store.createNote("second", { path: "rb2/Twin" });
+    await store.createNote("[[Twin]]", { path: "rest-ambiguous2" });
+    await store.createNote("clean", { path: "rest-amb-clean2" });
+    const res = await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=false&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.path).sort()).toEqual(["rb1/Twin", "rb2/Twin", "rest-amb-clean2"]);
+  });
+
+  test("an ambiguous link is not reported as a broken one (the filters are disjoint)", async () => {
+    await store.createNote("first", { path: "rc1/Both" });
+    await store.createNote("second", { path: "rc2/Both" });
+    await store.createNote("[[Both]]", { path: "rest-amb-disjoint" });
+    const broken = await (await handleNotes(mkReq("GET", "/notes?has_broken_links=true"), store, "")).json() as any[];
+    expect(broken.map((n) => n.path)).toEqual([]);
+    const ambiguous = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true"), store, "")).json() as any[];
+    expect(ambiguous.map((n) => n.path)).toEqual(["rest-amb-disjoint"]);
+  });
+
+  test("include_ambiguous_links on a single note surfaces {target, relationship, candidate_count}", async () => {
+    await store.createNote("first", { path: "rd1/Fork" });
+    await store.createNote("second", { path: "rd2/Fork" });
+    await store.createNote("[[Fork]]", { path: "rest-single-ambiguous" });
+    const res = await handleNotes(mkReq("GET", "/notes?id=rest-single-ambiguous&include_ambiguous_links=true"), store, "");
+    const body = await res.json() as any;
+    expect(body.ambiguous_links).toEqual([{ target: "Fork", relationship: "wikilink", candidate_count: 2 }]);
+  });
+
+  test("include_ambiguous_links in list mode is batched per note", async () => {
+    await store.createNote("first", { path: "re1/Echo" });
+    await store.createNote("second", { path: "re2/Echo" });
+    await store.createNote("[[Echo]]", { path: "rest-amb-list-a" });
+    await store.createNote("clean", { path: "rest-amb-list-b" });
+    const res = await handleNotes(mkReq("GET", "/notes?include_ambiguous_links=true&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    const byPath = new Map(body.map((n: any) => [n.path, n.ambiguous_links]));
+    expect(byPath.get("rest-amb-list-a")).toEqual([{ target: "Echo", relationship: "wikilink", candidate_count: 2 }]);
+    expect(byPath.get("rest-amb-list-b")).toEqual([]);
+  });
+
+  test("both filters are safe on a vault where no link has ever been ambiguous", async () => {
+    await store.createNote("plain", { path: "rest-amb-never" });
+    const truthy = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true"), store, "")).json() as any[];
+    expect(truthy).toEqual([]);
+    const falsy = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=false&include_content=true"), store, "")).json() as any[];
+    expect(falsy.map((n) => n.path)).toEqual(["rest-amb-never"]);
+    const single = await (await handleNotes(mkReq("GET", "/notes?id=rest-amb-never&include_ambiguous_links=true"), store, "")).json() as any;
+    expect(single.ambiguous_links).toEqual([]);
+  });
+
+  test("deleting one colliding candidate heals the ambiguity through the REST filter", async () => {
+    const keep = await store.createNote("first", { path: "rf1/Heal" });
+    const drop = await store.createNote("second", { path: "rf2/Heal" });
+    await store.createNote("[[Heal]]", { path: "rest-amb-heal" });
+    let body = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true"), store, "")).json() as any[];
+    expect(body.map((n) => n.path)).toEqual(["rest-amb-heal"]);
+
+    await store.deleteNote(drop.id);
+    body = await (await handleNotes(mkReq("GET", "/notes?has_ambiguous_links=true"), store, "")).json() as any[];
+    expect(body).toEqual([]);
+    const linked = await (await handleNotes(mkReq("GET", "/notes?id=rest-amb-heal&include_links=true"), store, "")).json() as any;
+    expect(linked.links.map((l: any) => l.targetId)).toEqual([keep.id]);
+  });
+});
+
 // vault#309 — HTTP PATCH /notes/:id with if_missing: "create" mirrors
 // the MCP update-note path. Sync loops (Gitcoin Brain et al) use this
 // for idempotent upsert without a separate query-first round trip.
@@ -7135,6 +7659,167 @@ describe("stateless MCP transport", async () => {
     expect(readVaultConfig(vaultName)?.description).toBe("updated via admin scope");
 
     closeAllStores();
+  });
+
+  // vault#669: the MCP door's `description` write had no runtime type check
+  // (an `as string` cast), so a write/admin caller could persist a non-string
+  // and poison the next `initialize` (serverInstruction's `description.trim()`
+  // throws → -32603 INTERNAL, the first frame, unrepairable in-session — the
+  // bun half of cloud#87). The guard rejects non-string/non-null as a
+  // structured -32602 INVALID_PARAMS (`error_type: invalid_description`), the
+  // same shape every other MCP validation leaf takes. `null` still clears.
+  describe("vault-info description type guard (vault#669 / cloud#87)", () => {
+    for (const [label, value] of [
+      ["a number", 123],
+      ["an object", { text: "nope" }],
+      ["an array", ["a", "b"]],
+      ["a boolean", true],
+    ] as const) {
+      test(`tools/call vault-info with ${label} description → -32602 invalid_description, nothing persisted`, async () => {
+        const { handleScopedMcp } = await import("./mcp-http.ts");
+        const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+        const { closeAllStores } = await import("./vault-store.ts");
+
+        const vaultName = `desc-type-${label.replace(/\s+/g, "-")}-${Date.now()}`;
+        writeVaultConfig({
+          name: vaultName,
+          api_keys: [],
+          created_at: new Date().toISOString(),
+          description: "original",
+        });
+
+        const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "vault-info", arguments: { description: value } },
+          }),
+        });
+
+        const res = await handleScopedMcp(req, vaultName, {
+          permission: "full",
+          scopes: ["vault:read", "vault:write", "vault:admin"],
+          legacyDerived: false,
+          scoped_tags: null,
+        } as any);
+
+        expect(res.status).toBe(200);
+        const body = await res.json() as any;
+        // Structured JSON-RPC error (protocol-level), NOT the in-band
+        // isError text: -32602 INVALID_PARAMS carrying error_type/field.
+        expect(body.error).toBeDefined();
+        expect(body.error.code).toBe(-32602);
+        expect(body.error.data.error_type).toBe("invalid_description");
+        expect(body.error.data.field).toBe("description");
+        // Nothing persisted — no poison state introduced.
+        expect(readVaultConfig(vaultName)?.description).toBe("original");
+
+        closeAllStores();
+      });
+    }
+
+    test("a refused non-string description leaves MCP initialize working (poison prevented)", async () => {
+      const { handleScopedMcp } = await import("./mcp-http.ts");
+      const { writeVaultConfig } = await import("./config.ts");
+      const { closeAllStores } = await import("./vault-store.ts");
+
+      const vaultName = `desc-poison-${Date.now()}`;
+      writeVaultConfig({
+        name: vaultName,
+        api_keys: [],
+        created_at: new Date().toISOString(),
+        description: "healthy brief",
+      });
+
+      const admin = {
+        permission: "full" as const,
+        scopes: ["vault:read", "vault:write", "vault:admin"],
+        legacyDerived: false,
+        scoped_tags: null,
+      };
+
+      // Attempt to poison with a number — must be rejected.
+      const poisonReq = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "accept": "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "vault-info", arguments: { description: 123 } },
+        }),
+      });
+      const poisonRes = await handleScopedMcp(poisonReq, vaultName, admin as any);
+      expect((await poisonRes.json() as any).error.code).toBe(-32602);
+
+      // initialize must still succeed — before the guard this answered
+      // -32603 INTERNAL_ERROR (`description.trim is not a function`).
+      const initReq = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "accept": "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "1.0" } },
+        }),
+      });
+      const initRes = await handleScopedMcp(initReq, vaultName, admin as any);
+      expect(initRes.status).toBe(200);
+      const initBody = await initRes.json() as any;
+      expect(initBody.error).toBeUndefined();
+      expect(initBody.result.instructions).toContain("healthy brief");
+
+      closeAllStores();
+    });
+
+    test("null description clears it (still legal on the MCP door)", async () => {
+      const { handleScopedMcp } = await import("./mcp-http.ts");
+      const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+      const { closeAllStores } = await import("./vault-store.ts");
+
+      const vaultName = `desc-null-${Date.now()}`;
+      writeVaultConfig({
+        name: vaultName,
+        api_keys: [],
+        created_at: new Date().toISOString(),
+        description: "to be cleared",
+      });
+
+      const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "accept": "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "vault-info", arguments: { description: null } },
+        }),
+      });
+
+      const res = await handleScopedMcp(req, vaultName, {
+        permission: "full",
+        scopes: ["vault:read", "vault:write", "vault:admin"],
+        legacyDerived: false,
+        scoped_tags: null,
+      } as any);
+
+      expect(res.status).toBe(200);
+      const body = await res.json() as any;
+      expect(body.error).toBeUndefined();
+      expect(body.result.isError).toBeFalsy();
+      // Cleared — readVaultConfig returns null (or undefined) for a cleared
+      // description, never the old string.
+      expect(readVaultConfig(vaultName)?.description ?? null).toBeNull();
+
+      closeAllStores();
+    });
   });
 
   test("tools/call of create-note with vault:read scope is refused (not silently allowed)", async () => {

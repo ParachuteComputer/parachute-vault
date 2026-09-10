@@ -23,6 +23,7 @@ import type { Store, Note, HydratedLink, NoteSummary } from "../core/src/types.t
 import type { TagFieldViolation } from "../core/src/tag-schemas.ts";
 import { ParentCycleError } from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
+import { stripTagHash } from "../core/src/tag-hierarchy.ts";
 
 /** Generic replacement for a redacted out-of-scope tag name — never the real name. */
 const OUT_OF_SCOPE_LABEL = "(outside your token's tag scope)";
@@ -244,6 +245,121 @@ export function scrubNotesTagsByScope<T extends { tags?: string[] }>(
 ): T[] {
   if (rawRoots === null) return notes;
   return notes.map((n) => scrubNoteTagsByScope(n, allowed, rawRoots));
+}
+
+/**
+ * The stand-in an out-of-scope QUERY tag is rewritten to (vault#675) — a
+ * name no real tagging workflow can produce, so a filter naming it matches
+ * nothing. See `scopeQueryTags` for why that is the whole fix.
+ *
+ * Two properties are load-bearing, both pinned by
+ * `tag-scope-query-tag.test.ts`:
+ *
+ *  1. **It survives `stripTagHash`.** `SqliteStore.normalizeQueryTags` maps
+ *     `stripTagHash` over query tags and drops the empties — a substitute
+ *     that normalized away would collapse `tags` to `[]`, skip the tag
+ *     filter entirely, and hand an out-of-scope probe the caller's WHOLE
+ *     visible set. Hence the NUL rather than a leading `#`/space.
+ *  2. **A collision is inert.** Storage does not police tag bytes, so a
+ *     note CAN be written carrying this name (nothing that reads YAML
+ *     front-matter or a JSON `tags` array will do so by accident). It buys
+ *     an attacker nothing: this rewrite only changes which notes the query
+ *     matches, and every read path still applies the unchanged result-side
+ *     `filterNotesByTagScope` — so a planted decoy can only ever surface to
+ *     a caller who could already read it.
+ */
+export const OUT_OF_SCOPE_QUERY_TAG = "\u0000out-of-scope";
+
+/**
+ * Rewrite an out-of-scope tag NAMED IN A QUERY to `OUT_OF_SCOPE_QUERY_TAG`
+ * (vault#675 — the existence-oracle class left open after #568/#674).
+ *
+ * #568 stopped scoped reads from DISCLOSING an out-of-scope co-tag's name.
+ * A scoped caller could still name one itself — `?tag=project-manhattan`,
+ * `query-notes { tag }`, a live subscription — and read the answer off
+ * hit/miss: a note tagged `["mine","project-manhattan"]` passes
+ * `noteWithinTagScope` via `mine`, so the co-tagged filter came back with a
+ * row and confirmed the guessed name. No name leaked; membership did.
+ *
+ * Policy: **an out-of-scope tag behaves exactly as a tag that does not
+ * exist** — the same equivalence the rest of this contract already runs on
+ * (an out-of-scope note 404s like a missing one; `list-tags { tag }` /
+ * `GET /api/tags?tag=` return `tag_not_found` for an out-of-scope name
+ * "whether the tag exists or not"). In the FILTER position a nonexistent tag
+ * is not an error — it is a filter that matches nothing — so this is a
+ * rewrite, not a rejection: the query still runs and still returns 200, it
+ * just can't match. Rewriting (rather than short-circuiting per door) is
+ * what makes the response byte-identical to the nonexistent-tag control on
+ * every door and in every shape — list, cursor envelope, `format=graph`,
+ * aggregate rollup, live snapshot — because it IS the nonexistent-tag code
+ * path, not a reconstruction of it.
+ *
+ * Composition falls out of that, no special cases:
+ *   - `tag=X` (out of scope) → matches nothing → `[]`.
+ *   - `tag=mine&tag=X&tag_match=all` → the `X` membership clause matches
+ *     nothing → `[]` (dropping `X` instead would have WIDENED the answer).
+ *   - `tag=mine&tag=X&tag_match=any` → the union is just `mine`'s notes.
+ *   - `exclude_tag=X` → core skips an exclude clause that can't match,
+ *     so it excludes nothing — again exactly a nonexistent tag.
+ *
+ * Visibility uses the same `tagVisibleInScope` rule that admits a note and
+ * scrubs `.tags`, applied to the BARE form (`stripTagHash`) because the
+ * query engine strips `#` before matching — otherwise `?tag=%23mine` would
+ * be neutralised for a `mine`-scoped caller.
+ *
+ * Non-mutating, and a no-op for unscoped tokens (`rawRoots === null`) and
+ * for queries whose tags are all in scope — the input object is returned by
+ * reference in both cases.
+ */
+export function scopeQueryTags<T extends { tags?: string[]; excludeTags?: string[] }>(
+  opts: T,
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): T {
+  if (rawRoots === null || !opts) return opts;
+  const tags = scopeQueryTagList(opts.tags, allowed, rawRoots);
+  const excludeTags = scopeQueryTagList(opts.excludeTags, allowed, rawRoots);
+  if (tags === opts.tags && excludeTags === opts.excludeTags) return opts;
+  const next: T = { ...opts };
+  if (tags !== opts.tags) next.tags = tags;
+  if (excludeTags !== opts.excludeTags) next.excludeTags = excludeTags;
+  return next;
+}
+
+/** `scopeQueryTags` for one array of query tags. Same array back if unchanged. */
+function scopeQueryTagList(
+  tags: string[] | undefined,
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): string[] | undefined {
+  if (!tags || tags.length === 0) return tags;
+  let changed = false;
+  const out = tags.map((t) => {
+    if (typeof t !== "string" || tagVisibleInScope(stripTagHash(t), allowed, rawRoots)) return t;
+    changed = true;
+    return OUT_OF_SCOPE_QUERY_TAG;
+  });
+  return changed ? out : tags;
+}
+
+/**
+ * `scopeQueryTags` for an MCP tool param, which is `string | string[]`
+ * (`normalizeTags` accepts either). Shape-preserving — a string stays a
+ * string — so the rewritten params lower to the same `QueryOpts` the
+ * original would have. Same reference back when nothing is rewritten.
+ */
+export function scopeQueryTagParam<V>(value: V, allowed: Set<string> | null, rawRoots: string[] | null): V {
+  if (rawRoots === null || value === undefined || value === null) return value;
+  if (typeof value === "string") {
+    return (tagVisibleInScope(stripTagHash(value), allowed, rawRoots)
+      ? value
+      : OUT_OF_SCOPE_QUERY_TAG) as unknown as V;
+  }
+  if (Array.isArray(value)) {
+    const scoped = scopeQueryTagList(value as string[], allowed, rawRoots);
+    return (scoped === (value as unknown as string[]) ? value : scoped) as unknown as V;
+  }
+  return value;
 }
 
 /**

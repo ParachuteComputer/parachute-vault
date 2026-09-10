@@ -440,6 +440,53 @@ describe("handleMirrorPut", () => {
     expect(manager.getConfig().safety_net_seconds).toBe(120);
     await manager.stop();
   });
+
+  test("two concurrent PUTs both 200 and leave a live watcher (safety envelope, vault#662)", async () => {
+    // From #661's review: the serialized sibling above soundly proves the
+    // only promised behavior (sequential last-writer-wins). Concurrent
+    // execution still has residual value — both PUTs 200, watcher stays
+    // live, final safety_net_seconds is one of the two requested values.
+    // The product makes no concurrent-winner promise, so we do not assert
+    // which config won.
+    home = tmp("mirror-put-concurrent-");
+    const { manager } = makeManager(home);
+    const put = (body: Record<string, unknown>) =>
+      handleMirrorPut(
+        new Request("http://x/admin/mirror", {
+          method: "PUT",
+          body: JSON.stringify(body),
+        }),
+        manager,
+      );
+    const [res1, res2] = await Promise.all([
+      put({
+        enabled: true,
+        location: "internal",
+        sync_mode: "events",
+        auto_commit: false,
+        safety_net_seconds: 60,
+      }),
+      put({
+        enabled: true,
+        location: "internal",
+        sync_mode: "events",
+        auto_commit: false,
+        safety_net_seconds: 120,
+      }),
+    ]);
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
+    const status = manager.getStatus();
+    expect(status.enabled).toBe(true);
+    expect(status.watch_running).toBe(true);
+    expect([60, 120]).toContain(manager.getConfig().safety_net_seconds);
+    // Concurrent start() can re-arm timers after the other PUT's stop().
+    // Drain once more so this test cannot leak a safety-net interval into
+    // the rest of the suite.
+    await new Promise((r) => setTimeout(r, 50));
+    await manager.stop();
+    await manager.stop();
+  });
 });
 
 // ---------------------------------------------------------------------------

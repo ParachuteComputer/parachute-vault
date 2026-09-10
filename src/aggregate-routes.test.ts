@@ -217,6 +217,82 @@ describe("REST GET /notes — aggregate: count without group_by (vault#626)", ()
   });
 });
 
+describe("REST GET /notes — the filtered total's filter surface IS the list's (vault#626)", () => {
+  /**
+   * vault#626 item 1 promises the ungrouped count runs over "the same filter
+   * surface as the list query". Today that holds by construction — both
+   * `queryNotes` and `aggregateNotes` build their WHERE from the shared
+   * `buildFilterConditions` (core/src/notes.ts) — but "by construction" is
+   * exactly the kind of fact a later refactor breaks silently: a filter
+   * handled OUTSIDE the shared builder would still narrow the list while the
+   * count kept reporting the unfiltered total, and every existing test here
+   * (which only exercises `tag`) would stay green.
+   *
+   * So: for each filter, assert `count == list.length` — and assert the
+   * filter actually NARROWED (`0 < n < TOTAL`), because a param that both
+   * paths ignore would satisfy the equality vacuously.
+   */
+  const TOTAL = 5;
+
+  async function seed(): Promise<void> {
+    await store.upsertTagRecord("task", { fields: { status: { type: "string", indexed: true } } });
+    // 1 + 2 are linked to each other (the [[wikilink]] resolves by path).
+    await store.createNote("alpha [[Projects/beta]]", {
+      path: "Projects/alpha",
+      tags: ["task", "work"],
+      metadata: { status: "open" },
+    });
+    await store.createNote("beta", { path: "Projects/beta", tags: ["task"], metadata: { status: "done" } });
+    await store.createNote("gamma", { path: "Archive/gamma", tags: ["work"] });
+    await store.createNote("delta", { path: "Archive/delta", tags: ["work"] });
+    await store.createNote("untagged epsilon", { path: "Archive/epsilon" });
+  }
+
+  async function listLength(qs: string): Promise<number> {
+    const res = await get(`?${qs}&limit=500`);
+    expect(res.status).toBe(200);
+    return ((await res.json()) as any[]).length;
+  }
+
+  async function count(qs: string): Promise<number> {
+    const res = await get(`?${qs}&aggregate[op]=count`);
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].group).toBeNull();
+    return body[0].value;
+  }
+
+  const CASES: [name: string, qs: string][] = [
+    ["tag", "tag=task"],
+    ["tag + tag_match=all", "tag=task&tag=work&tag_match=all"],
+    ["exclude_tag", "exclude_tag=work"],
+    ["has_tags=false", "has_tags=false"],
+    ["has_links=true", "has_links=true"],
+    ["path_prefix", "path_prefix=Projects/"],
+    ["exclude_path_prefix", "exclude_path_prefix=Projects/"],
+    ["meta[field][op]", "meta[status][eq]=open"],
+  ];
+
+  it("the unfiltered total matches the unfiltered list", async () => {
+    await seed();
+    expect(await count("")).toBe(TOTAL);
+    expect(await listLength("")).toBe(TOTAL);
+  });
+
+  for (const [name, qs] of CASES) {
+    it(`${name}: count == list length, and the filter really narrowed`, async () => {
+      await seed();
+      const n = await listLength(qs);
+      // Non-vacuity: a param both paths silently ignored would make the
+      // equality below trivially true.
+      expect(n).toBeGreaterThan(0);
+      expect(n).toBeLessThan(TOTAL);
+      expect(await count(qs)).toBe(n);
+    });
+  }
+});
+
 describe("REST GET /notes — aggregate: group_by \"tag\"", () => {
   it("counts by tag membership", async () => {
     await store.createNote("a", { tags: ["work", "urgent"] });

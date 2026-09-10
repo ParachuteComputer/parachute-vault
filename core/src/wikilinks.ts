@@ -3,6 +3,7 @@ import type { Note } from "./types.js";
 import * as linkOps from "./links.js";
 import { getNote, findNotesByTitle, extractH1Title } from "./notes.js";
 import { chunkForInClause } from "./sql-in.js";
+import { pathTitle } from "./paths.js";
 import { transaction } from "./txn.js";
 import type { QueryWarning } from "./query-warnings.js";
 
@@ -105,6 +106,117 @@ function stripCode(content: string): string {
   // Replace inline code (` ... `)
   result = result.replace(/`[^`\n]+`/g, (m) => " ".repeat(m.length));
   return result;
+}
+
+/**
+ * Rewrite the TARGET portion of `[[wikilinks]]` in `content`, in place.
+ *
+ * `rename` is called with each bracket's parsed target (trimmed, exactly as
+ * {@link parseWikilinks} would report it) and returns the replacement target
+ * string, or `null`/`undefined` to leave that bracket alone. Everything else
+ * about the bracket survives verbatim — the `!` embed marker, a `|display`
+ * alias, a `#Heading` anchor, a `#^block-ref`, and any surrounding text.
+ *
+ * Brackets inside fenced/inline code are skipped, because {@link stripCode}
+ * is applied before matching — same as the parser. That is deliberate: a
+ * `[[link]]` in a code fence is not a link (it is never parsed, never
+ * resolved, never given a `links` row), so a rename must not silently edit
+ * someone's sample text. The pre-vault#708 cascade rewrote those too, via a
+ * blind content-wide regex.
+ */
+export function rewriteWikilinkTargets(
+  content: string,
+  rename: (target: string) => string | null | undefined,
+): string {
+  const stripped = stripCode(content);
+  const regex = /(!)?\[\[([^\[\]\n]+?)\]\]/g;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(stripped)) !== null) {
+    const inner = match[2]!;
+    // Target part = everything before the first `#` (anchor/block-ref) or
+    // `|` (display alias), whichever comes first. Matches how
+    // `parseWikilinks` splits, for every ordering of the two.
+    let boundary = inner.length;
+    const hashIdx = inner.indexOf("#");
+    const pipeIdx = inner.indexOf("|");
+    if (hashIdx !== -1) boundary = Math.min(boundary, hashIdx);
+    if (pipeIdx !== -1) boundary = Math.min(boundary, pipeIdx);
+    const targetPart = inner.slice(0, boundary);
+    const target = targetPart.trim();
+    if (!target) continue;
+
+    const next = rename(target);
+    if (!next || next === targetPart) continue;
+
+    // `stripCode` preserves offsets, so the match indices address `content`.
+    const start = match.index;
+    const end = start + match[0].length;
+    const innerStart = start + (match[1] ? 3 : 2);
+    out += content.slice(last, innerStart) + next + content.slice(innerStart + boundary, end);
+    last = end;
+  }
+
+  return last === 0 ? content : out + content.slice(last);
+}
+
+/**
+ * How a wikilink target names a note PATH — the shapes
+ * {@link resolveWikilink} can match a path by, in its resolution order.
+ * `null` means the target is not a path-derived name for `path` at all (e.g.
+ * it resolved through the H1-title fallback, which a repath doesn't affect).
+ *
+ * Used by the rename cascade (vault#708) to rewrite a bracket into the SAME
+ * shape it already had rather than forcing every reference to a full path.
+ */
+export type WikilinkPathForm =
+  | { form: "path" }
+  | { form: "title" }
+  | { form: "path-ext"; ext: string };
+
+export function wikilinkPathForm(target: string, path: string): WikilinkPathForm | null {
+  const lower = target.toLowerCase();
+  const title = pathTitle(path);
+  // Order mirrors `resolveWikilink`: a literal path wins over the
+  // explicit-extension reading of the same string (`Recipe.v2`).
+  if (lower === path.toLowerCase()) return { form: "path" };
+  if (lower === title.toLowerCase()) return { form: "title" };
+  // Only the FULL-path `.ext` form exists: `resolveWikilink`'s
+  // explicit-extension rule matches on `(path, extension)`, so a
+  // basename+ext bracket (`[[Data.csv]]` for `move/Data`) never resolved in
+  // the first place and is not this cascade's to repair.
+  const extMatch = target.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch && extMatch[1]!.toLowerCase() === path.toLowerCase()) {
+    return { form: "path-ext", ext: extMatch[2]! };
+  }
+  return null;
+}
+
+/**
+ * The candidate replacement texts for a bracket of `form` after the note
+ * moved to `newPath`, most-preferred first. The caller picks the first one
+ * that resolves back to the renamed note (see `Store.cascadeRename`):
+ * a basename bracket stays a basename bracket unless the new basename would
+ * now be ambiguous (or collide across extensions), in which case it widens
+ * to the full path.
+ */
+export function wikilinkRenameCandidates(
+  form: WikilinkPathForm,
+  newPath: string,
+  noteExtension: string | null | undefined,
+): string[] {
+  const newTitle = pathTitle(newPath);
+  const ext = noteExtension || "md";
+  switch (form.form) {
+    case "path":
+      return [newPath, `${newPath}.${ext}`];
+    case "title":
+      return [newTitle, newPath, `${newPath}.${ext}`];
+    case "path-ext":
+      return [`${newPath}.${form.ext}`];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +448,50 @@ export function listUnresolvedWikilinks(db: Database, limit = 50): { unresolved:
   return { unresolved, count: total };
 }
 
+/**
+ * The `ambiguous_wikilinks` rows that are BROKEN in a tag-scoped reader's own
+ * sub-vault — every candidate invisible to it — shaped as
+ * {@link UnresolvedWikilink} so `/unresolved-wikilinks` can report them
+ * alongside the genuinely-unresolved ones (vault#239).
+ *
+ * Without this the admin listing is the third face of the same delete-time
+ * oracle `getUnresolvedLinksForNotes` closes on the note surfaces: the row
+ * only appears there once the last invisible candidate is deleted and
+ * `refreshAmbiguousLinks` demotes it. Callers are expected to apply their own
+ * source-note tag-scope filter afterwards, exactly as they do for the base
+ * listing. Scanned under the same `limit` slice as
+ * {@link listUnresolvedWikilinks}; `[]` when the table has never been created
+ * (and never called at all for an unscoped reader, whose answer is the
+ * persisted tables as-is).
+ */
+export function listZeroVisibleAmbiguousAsUnresolved(
+  db: Database,
+  visible: (noteId: string) => boolean,
+  limit = 50,
+): UnresolvedWikilink[] {
+  let rows: { source_id: string; target_path: string; relationship: string }[];
+  try {
+    rows = db.prepare(
+      "SELECT source_id, target_path, relationship FROM ambiguous_wikilinks ORDER BY source_id LIMIT ?",
+    ).all(limit) as typeof rows;
+  } catch {
+    return []; // Table doesn't exist — nothing has ever been ambiguous here.
+  }
+  const out: UnresolvedWikilink[] = [];
+  for (const r of rows) {
+    const relationship = r.relationship || WIKILINK_REL;
+    if (visibleResolutionCount(db, r.target_path, relationship, visible) > 0) continue;
+    const note = db.prepare("SELECT path FROM notes WHERE id = ?").get(r.source_id) as { path: string | null } | null;
+    out.push({
+      source_id: r.source_id,
+      source_path: note?.path ?? undefined,
+      target_path: r.target_path,
+      relationship,
+    });
+  }
+  return out;
+}
+
 /** One note's dangling outbound link, as surfaced on a note read (vault#555). */
 export interface BrokenLink {
   target: string;
@@ -347,11 +503,32 @@ export interface BrokenLink {
  * `include_broken_links` surfacing on `query-notes` / `GET /notes`. ONE
  * query for the whole page (mirrors `getLinksHydratedForNotes`'s batching),
  * not one per note. Returns a map with an entry (possibly `[]`) for every
- * requested id whenever the table exists; when the table has never been
- * created (no note in this vault has ever had a broken link) every id maps
- * to `[]` without a query attempt.
+ * requested id.
+ *
+ * `visible` (vault#239) is an OPTIONAL per-candidate-note predicate, injected
+ * by the server layer for a TAG-SCOPED reader — the SAME closure the
+ * ambiguity surface uses, because "which of this target's candidates can the
+ * reader see" is one question with two answers. Core stays scope-unaware; it
+ * only invokes the closure.
+ *
+ * When it is supplied, the persisted `ambiguous_wikilinks` rows are folded in
+ * too, as broken, whenever NONE of their candidates is visible: such a target
+ * matches nothing in the reader's sub-vault, which is what "broken" means.
+ * Without that, `refreshAmbiguousLinks`' delete-time demotion into
+ * `unresolved_wikilinks` is the only thing that ever makes the note broken —
+ * so the answer moves when notes the reader cannot see are deleted, which is
+ * an oracle for exactly the cross-scope naming collision
+ * {@link getAmbiguousLinksForNotes} narrows away.
+ *
+ * Cost: one extra query plus one re-resolution per ambiguous row, and only
+ * for scoped readers — the same profile the ambiguity surface accepts, on a
+ * table that is rare by nature. An unscoped reader does no extra work.
  */
-export function getUnresolvedLinksForNotes(db: Database, noteIds: string[]): Map<string, BrokenLink[]> {
+export function getUnresolvedLinksForNotes(
+  db: Database,
+  noteIds: string[],
+  visible?: (noteId: string) => boolean,
+): Map<string, BrokenLink[]> {
   const result = new Map<string, BrokenLink[]>(noteIds.map((id) => [id, []]));
   if (noteIds.length === 0) return result;
 
@@ -365,19 +542,89 @@ export function getUnresolvedLinksForNotes(db: Database, noteIds: string[]): Map
       ).all(...chunk) as typeof rows);
     }
   } catch {
-    // Table doesn't exist — every id already maps to [] above.
-    return result;
+    // Table doesn't exist — no note in this vault has ever had a link go
+    // unresolved. NOT an early return: a tag-scoped reader can still have
+    // broken references whose rows live in `ambiguous_wikilinks` (vault#239),
+    // and this is the common case for them — a vault where every collision
+    // was ambiguous vault-wide never creates `unresolved_wikilinks` at all.
+    rows.length = 0;
   }
 
+  const seen = new Set<string>();
   for (const row of rows) {
-    result.get(row.source_id)?.push({ target: row.target_path, relationship: row.relationship || WIKILINK_REL });
+    const relationship = row.relationship || WIKILINK_REL;
+    seen.add(`${row.source_id}\u0000${relationship}\u0000${row.target_path.toLowerCase()}`);
+    result.get(row.source_id)?.push({ target: row.target_path, relationship });
+  }
+
+  // vault#239 — a target whose candidates are ALL invisible to this reader
+  // is broken in the reader's sub-vault, whichever table its row happens to
+  // live in right now. Without this the note only becomes "broken" once the
+  // last invisible candidate is DELETED and `refreshAmbiguousLinks` demotes
+  // the row into `unresolved_wikilinks` — a timing oracle for exactly the
+  // cross-scope naming collision `getAmbiguousLinksForNotes` narrows away.
+  // No-op (and no extra query) for an unscoped reader.
+  if (visible) {
+    for (const row of readAmbiguousRows(db, noteIds)) {
+      const relationship = row.relationship || WIKILINK_REL;
+      if (visibleResolutionCount(db, row.target_path, relationship, visible) > 0) continue;
+      const key = `${row.source_id}\u0000${relationship}\u0000${row.target_path.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.get(row.source_id)?.push({ target: row.target_path, relationship });
+    }
   }
   return result;
 }
 
 /** Single-note convenience wrapper around {@link getUnresolvedLinksForNotes}. */
-export function getUnresolvedLinksForNote(db: Database, noteId: string): BrokenLink[] {
-  return getUnresolvedLinksForNotes(db, [noteId]).get(noteId) ?? [];
+export function getUnresolvedLinksForNote(
+  db: Database,
+  noteId: string,
+  visible?: (noteId: string) => boolean,
+): BrokenLink[] {
+  return getUnresolvedLinksForNotes(db, [noteId], visible).get(noteId) ?? [];
+}
+
+/**
+ * Narrow a page of notes by the `has_broken_links` filter as a TAG-SCOPED
+ * reader should see it — the vault#239 twin of
+ * {@link narrowByVisibleAmbiguity}, and the reason
+ * {@link sqlHasBrokenLinks} lifts the SQL filter entirely under scope: the
+ * `unresolved_wikilinks` EXISTS test is neither a superset NOR a subset of
+ * the right answer (it MISSES a note whose only candidates are invisible,
+ * and it INCLUDES nothing it shouldn't), so neither polarity can be pushed
+ * down and both are re-decided here on the reader's own sub-vault.
+ *
+ * Page-shortening is the same effect `filterNotesByTagScope` already has on
+ * every scoped read. No-op when `wanted` is undefined or no predicate is
+ * injected (unscoped).
+ */
+export function narrowByVisibleBrokenness<T extends { id: string }>(
+  db: Database,
+  notes: T[],
+  wanted: boolean | undefined,
+  visible: ((noteId: string) => boolean) | undefined,
+): T[] {
+  if (wanted === undefined || !visible || notes.length === 0) return notes;
+  const byNote = getUnresolvedLinksForNotes(db, notes.map((n) => n.id), visible);
+  return notes.filter((n) => ((byNote.get(n.id)?.length ?? 0) > 0) === wanted);
+}
+
+/**
+ * The `hasBrokenLinks` value to push into SQL for a reader that will be
+ * narrowed by {@link narrowByVisibleBrokenness} afterwards. Unlike
+ * {@link sqlHasAmbiguousLinks} — where `true` survives because every
+ * truly-ambiguous note also has a persisted row — BOTH polarities are lifted
+ * under scope, because a note can be broken in the reader's sub-vault while
+ * having no `unresolved_wikilinks` row at all (vault#239). Identity for
+ * unscoped readers. Shared by both doors so REST and MCP cannot drift.
+ */
+export function sqlHasBrokenLinks(
+  wanted: boolean | undefined,
+  scoped: boolean,
+): boolean | undefined {
+  return scoped ? undefined : wanted;
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +672,10 @@ export interface AmbiguousWikilinkTarget {
  * THIRD same-named note rather than reporting the collision. The caller
  * (MCP `create-note`/`update-note`, REST `POST`/`PATCH /notes`) surfaces
  * `ambiguous` as an `ambiguous_link` warning naming the target + match
- * count, distinct from `unresolved`'s `unresolved_link`.
+ * count, distinct from `unresolved`'s `unresolved_link`. Each ambiguous
+ * target is ALSO persisted to `ambiguous_wikilinks` (vault#581) so the
+ * collision stays queryable after the write, symmetric with how
+ * `unresolved_wikilinks` backs `has_broken_links`/`include_broken_links`.
  */
 export function syncWikilinks(
   db: Database,
@@ -491,8 +741,13 @@ export function syncWikilinks(
   }
 
   // Store unresolved wikilinks for later resolution. Ambiguous targets are
-  // deliberately NOT queued here — see the doc comment above.
+  // deliberately NOT queued into `unresolved_wikilinks` — see the doc comment
+  // above — but they ARE recorded in their own `ambiguous_wikilinks` table
+  // (vault#581) so a later audit can find them via
+  // `has_ambiguous_links`/`include_ambiguous_links` instead of only seeing
+  // the transient write-time warning.
   syncUnresolvedWikilinks(db, noteId, unresolved);
+  syncAmbiguousWikilinks(db, noteId, ambiguous);
 
   return { added, removed, unresolved, ambiguous };
 }
@@ -515,8 +770,15 @@ export function syncWikilinks(
  * already migrated. `PRAGMA table_info` on a nonexistent table returns zero
  * rows rather than throwing, so this is safe to call unconditionally,
  * including from read paths that don't want to create the table lazily.
+ *
+ * Also the body of `migrateToV28` (vault#567 item 2): boot runs this once
+ * via `initSchema` so a pre-#555 2-column table is healed before the first
+ * wikilink touch. Gated the existing way — no table → return; column
+ * present → return; only the 2-column shape rebuilds. Does NOT create the
+ * table on vaults that never queued an unresolved link (lazy creation
+ * stays). The per-touch calls below become a no-op after v28.
  */
-function ensureRelationshipColumn(db: Database): void {
+export function ensureRelationshipColumn(db: Database): void {
   const cols = db.prepare("PRAGMA table_info(unresolved_wikilinks)").all() as { name: string }[];
   if (cols.length === 0) return; // table doesn't exist — nothing to heal
   if (cols.some((c) => c.name === "relationship")) return; // already migrated
@@ -746,6 +1008,515 @@ export function resolveUnresolvedWikilinks(
   return resolved;
 }
 
+
+// ---------------------------------------------------------------------------
+// Ambiguous links (vault#581) — the queryable twin of `unresolved_wikilinks`
+//
+// An ambiguous target (≥2 notes match) is deliberately never linked and never
+// queued for backfill (see {@link syncWikilinks}). Before #581 that meant it
+// existed ONLY in the create/update response's transient `ambiguous_link`
+// warning: `has_broken_links` didn't match the note (`unresolved_wikilinks`
+// held no row for it), so a later audit couldn't surface the collision at all
+// — asymmetric with the unresolved-link story. These helpers persist it in its
+// own lazily-created table, which backs the `has_ambiguous_links` /
+// `include_ambiguous_links` filters on `query-notes` / `GET /notes`.
+//
+// Kept in a SEPARATE table rather than folded into `unresolved_wikilinks` on
+// purpose: the two states mean different things to a caller ("nothing there
+// yet, will heal itself when the note arrives" vs. "too many things there,
+// disambiguate the reference"), the backfill sweep must never treat an
+// ambiguous row as pending-resolution, and folding them would have silently
+// widened what `has_broken_links: true` returns for every existing caller.
+//
+// Like `unresolved_wikilinks`, the table lives outside `SCHEMA_SQL` and is
+// created lazily on first write — a vault where no link has ever been
+// ambiguous never grows it, and no schema-version bump is needed.
+// ---------------------------------------------------------------------------
+
+/** One note's ambiguous outbound link, as surfaced on a note read (vault#581). */
+export interface AmbiguousLink {
+  target: string;
+  relationship: string;
+  /** How many notes the target matched at the time it was last evaluated. */
+  candidate_count: number;
+}
+
+/**
+ * Ensure the ambiguous_wikilinks table exists. Called lazily — only when we
+ * actually have an ambiguous link. Same shape as `unresolved_wikilinks`
+ * (3-column PK, `ON DELETE CASCADE` so deleting the SOURCE note drops its
+ * rows) plus the match count the write-time warning already carries.
+ */
+export function ensureAmbiguousTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ambiguous_wikilinks (
+      source_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+      target_path TEXT NOT NULL COLLATE NOCASE,
+      relationship TEXT NOT NULL DEFAULT '${WIKILINK_REL}',
+      candidate_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (source_id, target_path, relationship)
+    )
+  `);
+}
+
+/**
+ * Replace this note's `relationship = "wikilink"` ambiguous rows with the
+ * targets a fresh content parse just found ambiguous. Scoped to wikilink-kind
+ * rows only, exactly like {@link syncUnresolvedWikilinks} — a content
+ * re-parse must not clobber ambiguous STRUCTURED-link rows recorded for this
+ * note by {@link queueAmbiguousLink} (a different relationship, same table).
+ */
+function syncAmbiguousWikilinks(
+  db: Database,
+  noteId: string,
+  ambiguous: AmbiguousWikilinkTarget[],
+): void {
+  if (ambiguous.length === 0) {
+    // Clean up any old wikilink-kind ambiguous entries for this note (the
+    // `[[Dup]]` was edited out, or one of the colliding notes went away and
+    // the target now resolves).
+    try {
+      db.prepare("DELETE FROM ambiguous_wikilinks WHERE source_id = ? AND relationship = ?").run(noteId, WIKILINK_REL);
+    } catch {
+      // Table may not exist yet — that's fine.
+    }
+    return;
+  }
+
+  ensureAmbiguousTable(db);
+  db.prepare("DELETE FROM ambiguous_wikilinks WHERE source_id = ? AND relationship = ?").run(noteId, WIKILINK_REL);
+  const insert = db.prepare(
+    "INSERT OR REPLACE INTO ambiguous_wikilinks (source_id, target_path, relationship, candidate_count) VALUES (?, ?, ?, ?)",
+  );
+  for (const entry of ambiguous) {
+    insert.run(noteId, entry.target, WIKILINK_REL, entry.count);
+  }
+}
+
+/**
+ * Record a structured link (or typed `reference` field value) whose target
+ * matched ≥2 notes. `INSERT OR REPLACE` so a re-write with a different match
+ * count refreshes rather than keeping a stale one. Called from
+ * {@link resolveOrQueueLink}, the single funnel every structured-link write
+ * path goes through.
+ */
+export function queueAmbiguousLink(
+  db: Database,
+  sourceId: string,
+  targetPath: string,
+  relationship: string,
+  candidateCount: number,
+): void {
+  ensureAmbiguousTable(db);
+  db.prepare(
+    "INSERT OR REPLACE INTO ambiguous_wikilinks (source_id, target_path, relationship, candidate_count) VALUES (?, ?, ?, ?)",
+  ).run(sourceId, targetPath, relationship, candidateCount);
+}
+
+/**
+ * Ambiguous-table twin of {@link clearQueuedLink} — drop every ambiguous row
+ * for `sourceId` under `relationship`, whatever (stale) target it names. Used
+ * by the scalar `reference`-field sync before re-resolving a changed value.
+ * Safe no-op when the table doesn't exist yet.
+ */
+export function clearAmbiguousLink(db: Database, sourceId: string, relationship: string): void {
+  try {
+    db.prepare(
+      "DELETE FROM ambiguous_wikilinks WHERE source_id = ? AND relationship = ?",
+    ).run(sourceId, relationship);
+  } catch {
+    // Table may not exist yet — nothing to clear.
+  }
+}
+
+/**
+ * Ambiguous-table twin of {@link clearQueuedLinkTarget} — drop exactly ONE
+ * row, scoped by `targetPath` as well, so a `cardinality: "many"` reference
+ * field losing one element doesn't blanket-clear the others' rows.
+ * Safe no-op when the table doesn't exist yet.
+ */
+export function clearAmbiguousLinkTarget(
+  db: Database,
+  sourceId: string,
+  relationship: string,
+  targetPath: string,
+): void {
+  try {
+    db.prepare(
+      "DELETE FROM ambiguous_wikilinks WHERE source_id = ? AND relationship = ? AND target_path = ? COLLATE NOCASE",
+    ).run(sourceId, relationship, targetPath);
+  } catch {
+    // Table may not exist yet — nothing to clear.
+  }
+}
+
+/**
+ * Batch-fetch each note's ambiguous outbound links — the
+ * `include_ambiguous_links` surfacing on `query-notes` / `GET /notes`. ONE
+ * query for the whole page (mirrors {@link getUnresolvedLinksForNotes}), not
+ * one per note. Every requested id gets an entry (possibly `[]`); when the
+ * table has never been created every id maps to `[]` without a query attempt.
+ *
+ * `visible` (vault#581 auth review) is an OPTIONAL per-candidate-note
+ * predicate, injected by the server layer for a TAG-SCOPED reader. Core
+ * stays scope-unaware — it only invokes the closure — exactly like
+ * `nearTraversable` / `expandVisibility` / `aggregateVisibility` on the MCP
+ * tool layer.
+ *
+ * Why it's needed: `candidate_count` is derived VAULT-WIDE by
+ * {@link resolveWikilinkDetailed}, so the stored `2` on a `[[Dup]]` whose
+ * candidates are one `#work` and one `#personal` note tells a `work`-scoped
+ * reader that a second `Dup` exists somewhere it cannot see. Unlike
+ * `broken_links` — which is safe by construction, since "unresolved" can
+ * only mean *matched nothing* and therefore can't fingerprint anything —
+ * an ambiguous row exists ONLY because ≥2 notes matched, and the count
+ * quantifies exactly that.
+ *
+ * So when `visible` is supplied, the persisted count is NOT trusted: each
+ * row's target is re-resolved and its candidates narrowed to the ones the
+ * reader can see. A row is reported only when ≥2 VISIBLE candidates remain,
+ * and `candidate_count` is the visible count. That is precisely the answer
+ * an unscoped reader would get on a vault containing only the visible notes
+ * — the same "answer on the visible sub-vault" rule vault#674 (`.tags`
+ * scrubbing) and vault#675 (out-of-scope query tags match nothing) chose,
+ * rather than refusing the request. It also incidentally hides a row that
+ * has gone stale (its target resolves cleanly again but no sweep has
+ * touched it yet), since that too collapses to <2 candidates.
+ *
+ * Cost: one re-resolution per persisted row, and only for scoped readers.
+ * Ambiguous rows are rare by nature (each is a genuine naming collision),
+ * and a page with none does no extra work at all.
+ */
+interface AmbiguousRow {
+  source_id: string;
+  target_path: string;
+  relationship: string;
+  candidate_count: number;
+}
+
+/**
+ * Read the persisted `ambiguous_wikilinks` rows for a set of source notes,
+ * batched under the bound-param cap. `[]` when the table has never been
+ * created. Shared by the ambiguity surface and the vault#239 brokenness
+ * surface so the two read the same rows the same way.
+ */
+function readAmbiguousRows(db: Database, noteIds: string[]): AmbiguousRow[] {
+  const rows: AmbiguousRow[] = [];
+  try {
+    for (const chunk of chunkForInClause(noteIds)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      rows.push(...db.prepare(
+        `SELECT source_id, target_path, relationship, candidate_count FROM ambiguous_wikilinks WHERE source_id IN (${placeholders})`,
+      ).all(...chunk) as AmbiguousRow[]);
+    }
+  } catch {
+    return []; // Table doesn't exist — nothing has ever been ambiguous here.
+  }
+  return rows;
+}
+
+/**
+ * How many notes this target resolves to IN THE READER'S OWN SUB-VAULT — the
+ * single place both scoped link surfaces decide what a reference means for a
+ * tag-scoped reader, so they cannot drift:
+ *
+ *   - `>= 2` → ambiguous for this reader ({@link getAmbiguousLinksForNotes})
+ *   - `0`    → broken for this reader ({@link getUnresolvedLinksForNotes})
+ *   - `1`    → resolves cleanly; neither surface reports it
+ *
+ * A row that has gone stale (its target resolves to exactly one note again,
+ * but no sweep has touched it yet) resolves through the SAME resolver its
+ * write path used, so `resolved` has to be honoured explicitly — a resolved
+ * `WikilinkResolution` carries an EMPTY `candidates` array, which would
+ * otherwise read as "0 visible", i.e. broken.
+ */
+function visibleResolutionCount(
+  db: Database,
+  targetPath: string,
+  relationship: string,
+  visible: (noteId: string) => boolean,
+): number {
+  const detail = relationship === WIKILINK_REL
+    ? resolveWikilinkDetailed(db, targetPath)
+    : resolveLinkTargetDetailed(db, targetPath);
+  if (detail.resolved) return detail.note_id && visible(detail.note_id) ? 1 : 0;
+  return detail.candidates.filter((c) => visible(c.note_id)).length;
+}
+
+/**
+ * Build the `ambiguous_link` write-time warning. ONE template per relationship
+ * shape (content `[[wikilink]]` vs a structured `links` entry), shared by every
+ * producer AND by {@link narrowLinkWarningsForVisibility}'s re-decision, so a
+ * scoped caller's warning text can never drift from the unscoped one.
+ */
+export function ambiguousLinkWarning(
+  target: string,
+  relationship: string,
+  candidateCount: number,
+): QueryWarning {
+  return {
+    code: "ambiguous_link",
+    message: relationship === WIKILINK_REL
+      ? `wikilink target "${target}" matched ${candidateCount} notes — ambiguous, no link created. Use a more specific path, [[Target.ext]], or the note's ID to disambiguate.`
+      : `link target "${target}" (relationship "${relationship}") matched ${candidateCount} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
+    target,
+    relationship,
+    candidate_count: candidateCount,
+  };
+}
+
+/** Twin of {@link ambiguousLinkWarning} for the "matched nothing" outcome. */
+export function unresolvedLinkWarning(target: string, relationship: string): QueryWarning {
+  return {
+    code: "unresolved_link",
+    message: relationship === WIKILINK_REL
+      ? `wikilink target "${target}" did not resolve to any note — queued and will backfill automatically if a matching note is created later.`
+      : `link target "${target}" (relationship "${relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+    target,
+    relationship,
+  };
+}
+
+/**
+ * WRITE-side twin of {@link getAmbiguousLinksForNotes}'s narrowing (vault#707).
+ *
+ * `create-note` / `update-note` echo a per-note `warnings` array, and an
+ * `ambiguous_link` entry there carries a `candidate_count` derived VAULT-WIDE.
+ * Without this, a `work`-scoped WRITER who saves a note containing `[[Dup]]`
+ * learns from `candidate_count: 2` that a second `Dup` exists in a scope it
+ * cannot see — the exact oracle vault#707 closed on the read side, reachable
+ * through the write door instead.
+ *
+ * Same contract, same single decision function ({@link visibleResolutionCount}),
+ * so the two doors cannot drift: a scoped writer gets exactly what an unscoped
+ * writer would get on a vault containing only the notes it can see.
+ *
+ *   - `>= 2` visible → keep, with `candidate_count` = the VISIBLE count
+ *   - `1`    visible → not ambiguous in this sub-vault; drop the warning
+ *   - `0`    visible → demote to `unresolved_link` (a plain broken link)
+ *
+ * Non-`ambiguous_link` warnings pass through untouched: `unresolved_link`
+ * means "matched nothing", which by construction fingerprints nothing (the
+ * same reasoning vault#707 applied to `include_broken_links`). Callers pass
+ * `visible` ONLY for a tag-scoped session, so the unscoped response is
+ * byte-identical — this function is never called there.
+ */
+export function narrowLinkWarningsForVisibility(
+  db: Database,
+  warnings: QueryWarning[],
+  visible: (noteId: string) => boolean,
+): QueryWarning[] {
+  const out: QueryWarning[] = [];
+  for (const w of warnings) {
+    if (w.code !== "ambiguous_link" || typeof w.target !== "string") {
+      out.push(w);
+      continue;
+    }
+    const relationship = typeof w.relationship === "string" ? w.relationship : WIKILINK_REL;
+    const count = visibleResolutionCount(db, w.target, relationship, visible);
+    if (count >= 2) out.push(ambiguousLinkWarning(w.target, relationship, count));
+    else if (count === 0) out.push(unresolvedLinkWarning(w.target, relationship));
+    // count === 1 → resolves cleanly in this sub-vault; report nothing.
+  }
+  return out;
+}
+
+export function getAmbiguousLinksForNotes(
+  db: Database,
+  noteIds: string[],
+  visible?: (noteId: string) => boolean,
+): Map<string, AmbiguousLink[]> {
+  const result = new Map<string, AmbiguousLink[]>(noteIds.map((id) => [id, []]));
+  if (noteIds.length === 0) return result;
+
+  const rows = readAmbiguousRows(db, noteIds);
+
+  for (const row of rows) {
+    const relationship = row.relationship || WIKILINK_REL;
+    let candidateCount = row.candidate_count;
+    if (visible) {
+      candidateCount = visibleResolutionCount(db, row.target_path, relationship, visible);
+      if (candidateCount < 2) continue; // not ambiguous in the reader's sub-vault
+    }
+    result.get(row.source_id)?.push({
+      target: row.target_path,
+      relationship,
+      candidate_count: candidateCount,
+    });
+  }
+  return result;
+}
+
+/** Single-note convenience wrapper around {@link getAmbiguousLinksForNotes}. */
+export function getAmbiguousLinksForNote(
+  db: Database,
+  noteId: string,
+  visible?: (noteId: string) => boolean,
+): AmbiguousLink[] {
+  return getAmbiguousLinksForNotes(db, [noteId], visible).get(noteId) ?? [];
+}
+
+/**
+ * Narrow a page of notes by the vault#581 `has_ambiguous_links` filter as a
+ * TAG-SCOPED reader should see it. Core's SQL filter counts a persisted row
+ * regardless of whether the reader can see the notes that collided, so on
+ * its own it is an oracle: a scoped caller could sweep its whole in-scope
+ * corpus and enumerate cross-scope naming collisions.
+ *
+ * The server layer therefore asks core for a SUPERSET and applies the real
+ * predicate here:
+ *   - `wanted === true` — the SQL filter is kept (every truly-ambiguous note
+ *     also has a row, so `EXISTS` is a superset) and this drops the notes
+ *     whose rows collapse to <2 visible candidates.
+ *   - `wanted === false` — the SQL filter is LIFTED (it would have excluded
+ *     notes that are not ambiguous in the reader's sub-vault, and a
+ *     post-filter cannot add rows back), and this keeps only notes with no
+ *     surviving row.
+ *
+ * Page-shortening is the same effect `filterNotesByTagScope` already has on
+ * every scoped read — the page is narrowed after core drew it, so a scoped
+ * page can come back shorter than `limit` while more results remain.
+ * No-op when `wanted` is undefined or no predicate is injected (unscoped).
+ */
+export function narrowByVisibleAmbiguity<T extends { id: string }>(
+  db: Database,
+  notes: T[],
+  wanted: boolean | undefined,
+  visible: ((noteId: string) => boolean) | undefined,
+): T[] {
+  if (wanted === undefined || !visible || notes.length === 0) return notes;
+  const byNote = getAmbiguousLinksForNotes(db, notes.map((n) => n.id), visible);
+  return notes.filter((n) => ((byNote.get(n.id)?.length ?? 0) > 0) === wanted);
+}
+
+/**
+ * The `hasAmbiguousLinks` value to push into SQL for a reader that will be
+ * narrowed by {@link narrowByVisibleAmbiguity} afterwards. `true` stays (it
+ * is a superset); `false` is lifted to `undefined` (it is not). Identity for
+ * unscoped readers. Shared by both doors so REST and MCP cannot drift on
+ * which polarity is safe to push down.
+ */
+export function sqlHasAmbiguousLinks(
+  wanted: boolean | undefined,
+  scoped: boolean,
+): boolean | undefined {
+  return scoped && wanted === false ? undefined : wanted;
+}
+
+/**
+ * Every string a `[[wikilink]]` / structured-link target could have used to
+ * match `note` — its path, its basename, its `path.ext` form, and its H1
+ * title: the four legs {@link resolveWikilinkDetailed} matches on, so this is
+ * a complete necessary-condition superset. Lower-cased and trimmed. Shared by
+ * {@link requeueInboundWikilinksForDelete}'s pre-filter and
+ * {@link refreshAmbiguousLinks}'s scope so the two can't drift on what
+ * "targets this note" means.
+ */
+export function noteResolutionKeys(note: Pick<Note, "path" | "extension" | "content"> | null | undefined): string[] {
+  const keys = new Set<string>();
+  const addKey = (s: string | null | undefined): void => {
+    const k = s?.trim().toLowerCase();
+    if (k) keys.add(k);
+  };
+  if (note?.path) {
+    addKey(note.path);
+    const slash = note.path.lastIndexOf("/");
+    addKey(slash >= 0 ? note.path.slice(slash + 1) : note.path); // basename
+    if (note.extension) addKey(`${note.path}.${note.extension}`);
+  }
+  if (note?.content) addKey(extractH1Title(note.content));
+  return [...keys];
+}
+
+/** {@link noteResolutionKeys} for a bare path string (no note row to read) — used for a note's OLD path after a rename. */
+export function pathResolutionKeys(path: string | null | undefined, extension?: string | null): string[] {
+  if (!path) return [];
+  const keys = [path];
+  const slash = path.lastIndexOf("/");
+  keys.push(slash >= 0 ? path.slice(slash + 1) : path);
+  if (extension) keys.push(`${path}.${extension}`);
+  return keys.map((k) => k.trim().toLowerCase()).filter(Boolean);
+}
+
+/**
+ * Re-evaluate every persisted ambiguous row whose target is one of `keys` —
+ * the self-healing counterpart of {@link resolveUnresolvedWikilinks}, and the
+ * reason `has_ambiguous_links` can't go stale when the collision is cleaned
+ * up. Called AFTER a note is created, deleted, or repathed, with that note's
+ * {@link noteResolutionKeys} (plus the OLD path's keys on a rename), so the
+ * scan is bounded to rows that note could possibly have been a candidate for.
+ *
+ * Each surviving row is re-run through the SAME resolver its write path used
+ * (picked by `relationship`, exactly as the unresolved sweep does), and lands
+ * in one of three places:
+ *
+ *   - resolves to exactly one note now (a candidate was deleted or renamed
+ *     away) → the link is created and the row is dropped. The reference is
+ *     no longer ambiguous, so it must stop being reported as such.
+ *   - still ambiguous → the row stays; `candidate_count` is refreshed if the
+ *     number of colliding notes changed.
+ *   - matches nothing now (every candidate is gone) → the row moves to
+ *     `unresolved_wikilinks`, i.e. it becomes an ordinary BROKEN link that
+ *     `has_broken_links` reports and the normal backfill can later heal.
+ *
+ * Returns the number of rows changed. No-op (one bounded SELECT, or none at
+ * all when the table has never been created) on a vault with no ambiguity.
+ */
+export function refreshAmbiguousLinks(db: Database, keys: (string | null | undefined)[]): number {
+  const normalized = [...new Set(
+    keys.map((k) => k?.trim().toLowerCase()).filter((k): k is string => Boolean(k)),
+  )];
+  if (normalized.length === 0) return 0;
+
+  let rows: { source_id: string; target_path: string; relationship: string; candidate_count: number }[];
+  try {
+    // `keys` is at most a handful of strings (one note's resolution keys,
+    // optionally plus an old path's), so this stays well under the bound-param
+    // cap that `chunkForInClause` guards elsewhere.
+    const clauses = normalized.map(() => "target_path = ? COLLATE NOCASE").join(" OR ");
+    rows = db.prepare(
+      `SELECT source_id, target_path, relationship, candidate_count FROM ambiguous_wikilinks WHERE ${clauses}`,
+    ).all(...normalized) as typeof rows;
+  } catch {
+    return 0; // Table doesn't exist — nothing has ever been ambiguous here.
+  }
+  if (rows.length === 0) return 0;
+
+  const drop = db.prepare(
+    "DELETE FROM ambiguous_wikilinks WHERE source_id = ? AND target_path = ? AND relationship = ?",
+  );
+  const bumpCount = db.prepare(
+    "UPDATE ambiguous_wikilinks SET candidate_count = ? WHERE source_id = ? AND target_path = ? AND relationship = ?",
+  );
+
+  let changed = 0;
+  for (const row of rows) {
+    const relationship = row.relationship || WIKILINK_REL;
+    const detail = relationship === WIKILINK_REL
+      ? resolveWikilinkDetailed(db, row.target_path)
+      : resolveLinkTargetDetailed(db, row.target_path);
+
+    if (detail.resolved) {
+      // Wikilinks never self-link (write-time skips them), so guard here too.
+      if (detail.note_id !== row.source_id) {
+        linkOps.createLink(db, row.source_id, detail.note_id!, relationship);
+      }
+      drop.run(row.source_id, row.target_path, relationship);
+      changed++;
+    } else if (detail.ambiguous) {
+      if (detail.candidates.length !== row.candidate_count) {
+        bumpCount.run(detail.candidates.length, row.source_id, row.target_path, relationship);
+        changed++;
+      }
+    } else {
+      drop.run(row.source_id, row.target_path, relationship);
+      queueUnresolvedLink(db, row.source_id, row.target_path, relationship);
+      changed++;
+    }
+  }
+  return changed;
+}
+
 // ---------------------------------------------------------------------------
 // Structured links — same resolution + lazy forward-ref semantics as
 // [[wikilinks]] (vault#555). A structured `links: [{target, relationship}]`
@@ -879,10 +1650,12 @@ export function clearQueuedLinkTarget(
  * Returns a {@link ResolveOrQueueOutcome}:
  *   - `"resolved"` — the edge should be created against `note_id` now.
  *   - `"ambiguous"` (vault#570) — the target matched ≥2 notes (e.g. two
- *     notes sharing an H1 title). NEITHER linked nor queued — see
- *     {@link syncWikilinks}'s doc comment for why queuing an ambiguous
- *     target would be wrong. Callers MUST surface a distinct
- *     `ambiguous_link` warning naming the target + `candidates.length`.
+ *     notes sharing an H1 title). NEITHER linked nor queued for backfill —
+ *     see {@link syncWikilinks}'s doc comment for why queuing an ambiguous
+ *     target into `unresolved_wikilinks` would be wrong — but recorded in
+ *     `ambiguous_wikilinks` (vault#581) so it stays queryable after the
+ *     write. Callers MUST surface a distinct `ambiguous_link` warning
+ *     naming the target + `candidates.length`.
  *   - `"queued"` — the target matched NO note; queued for lazy backfill.
  *     Callers MUST surface an `unresolved_link` warning naming the target.
  *
@@ -897,8 +1670,18 @@ export function resolveOrQueueLink(
   relationship: string,
 ): ResolveOrQueueOutcome {
   const detail = resolveLinkTargetDetailed(db, target);
+  if (detail.ambiguous) {
+    // vault#581 — record the collision so it survives the response. Every
+    // structured-link write path (MCP create/update-note, REST POST/PATCH,
+    // typed `reference` fields) funnels through here, so persisting once
+    // here covers all of them and can't drift from the warning.
+    queueAmbiguousLink(db, sourceId, target, relationship, detail.candidates.length);
+    return { status: "ambiguous", candidates: detail.candidates };
+  }
+  // Not ambiguous (any more): drop a stale row this exact (source, target,
+  // relationship) may have left behind on an earlier write.
+  clearAmbiguousLinkTarget(db, sourceId, relationship, target);
   if (detail.resolved) return { status: "resolved", note_id: detail.note_id! };
-  if (detail.ambiguous) return { status: "ambiguous", candidates: detail.candidates };
   queueUnresolvedLink(db, sourceId, target, relationship);
   return { status: "queued" };
 }
@@ -932,20 +1715,9 @@ export function getContentWikilinkWarnings(
     const detail = resolveWikilinkDetailed(db, wl.target);
     if (detail.resolved) continue; // resolved (incl. self-link) — nothing to warn about
     if (detail.ambiguous) {
-      warnings.push({
-        code: "ambiguous_link",
-        message: `wikilink target "${wl.target}" matched ${detail.candidates.length} notes — ambiguous, no link created. Use a more specific path, [[Target.ext]], or the note's ID to disambiguate.`,
-        target: wl.target,
-        relationship: WIKILINK_REL,
-        candidate_count: detail.candidates.length,
-      });
+      warnings.push(ambiguousLinkWarning(wl.target, WIKILINK_REL, detail.candidates.length));
     } else {
-      warnings.push({
-        code: "unresolved_link",
-        message: `wikilink target "${wl.target}" did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
-        target: wl.target,
-        relationship: WIKILINK_REL,
-      });
+      warnings.push(unresolvedLinkWarning(wl.target, WIKILINK_REL));
     }
   }
 
@@ -1005,25 +1777,15 @@ export function requeueInboundWikilinksForDelete(db: Database, noteId: string): 
   // resolution keys — its path, basename, H1 title, or `path.ext` form (the
   // four legs {@link resolveWikilinkDetailed} matches on; every leg produces a
   // target string equal to one of these, so the key set is a complete
-  // necessary-condition superset). Computed ONCE, then each source wikilink's
-  // target is gated on set membership BEFORE the expensive resolver call
+  // necessary-condition superset — {@link noteResolutionKeys} owns that key
+  // set, shared with the vault#581 ambiguity sweep). Computed ONCE, then each
+  // source wikilink's target is gated on set membership BEFORE the resolver call
   // (whose title-fallback leg scans every note's content). Without this, a hub
   // note with hundreds of inbound sources would fire hundreds of full-vault
   // scans in one delete. The resolver still CONFIRMS each survivor — the
   // pre-filter narrows, it doesn't decide.
   const deleted = getNote(db, noteId);
-  const keys = new Set<string>();
-  const addKey = (s: string | null | undefined): void => {
-    const k = s?.trim().toLowerCase();
-    if (k) keys.add(k);
-  };
-  if (deleted?.path) {
-    addKey(deleted.path);
-    const slash = deleted.path.lastIndexOf("/");
-    addKey(slash >= 0 ? deleted.path.slice(slash + 1) : deleted.path); // basename
-    if (deleted.extension) addKey(`${deleted.path}.${deleted.extension}`);
-  }
-  if (deleted?.content) addKey(extractH1Title(deleted.content));
+  const keys = new Set(noteResolutionKeys(deleted));
   if (keys.size === 0) return; // no key any wikilink could have matched on
 
   for (const { source_id } of inbound) {

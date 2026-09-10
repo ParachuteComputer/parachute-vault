@@ -12,16 +12,25 @@ import {
 } from "./indexed-fields.js";
 import {
   syncWikilinks,
+  parseWikilinks,
+  resolveWikilinkDetailed,
+  rewriteWikilinkTargets,
+  wikilinkPathForm,
+  wikilinkRenameCandidates,
   resolveUnresolvedWikilinks,
   resolveOrQueueLink,
   clearQueuedLink,
   clearQueuedLinkTarget,
+  clearAmbiguousLink,
+  clearAmbiguousLinkTarget,
+  refreshAmbiguousLinks,
+  noteResolutionKeys,
+  pathResolutionKeys,
   requeueInboundWikilinksForDelete,
 } from "./wikilinks.js";
 import { chunkForInClause } from "./sql-in.js";
-import { pathTitle } from "./paths.js";
 import { timestampToMs } from "./cursor.js";
-import { transaction } from "./txn.js";
+import { afterCommit, transaction } from "./txn.js";
 import { HookRegistry } from "./hooks.js";
 import {
   loadTagHierarchy,
@@ -257,6 +266,9 @@ export class BunSqliteStore implements Store {
       // resolved target.
       linkOps.deleteLinksBySourceRelationship(this.db, note.id, fieldName);
       clearQueuedLink(this.db, note.id, fieldName);
+      // vault#581 twin: a recorded ambiguity for the OLD value must go too,
+      // or the field would keep reporting a collision it no longer has.
+      clearAmbiguousLink(this.db, note.id, fieldName);
 
       if (typeof nextValue === "string" && nextValue.trim() !== "") {
         // Resolves now, or queues a lazy forward-ref on a miss — same
@@ -374,7 +386,10 @@ export class BunSqliteStore implements Store {
     // still-present-but-unresolved element stays queued (re-queued
     // idempotently above).
     for (const value of priorSet) {
-      if (!nextSet.has(value)) clearQueuedLinkTarget(this.db, noteId, fieldName, value);
+      if (!nextSet.has(value)) {
+        clearQueuedLinkTarget(this.db, noteId, fieldName, value);
+        clearAmbiguousLinkTarget(this.db, noteId, fieldName, value); // vault#581 twin
+      }
     }
   }
 
@@ -519,6 +534,10 @@ export class BunSqliteStore implements Store {
 
     if (note.path) {
       resolveUnresolvedWikilinks(this.db, note.path, note.id);
+      // vault#581 — this note becoming a NEW candidate can only make an
+      // existing ambiguity wider, but the recorded `candidate_count` has to
+      // stay honest. Bounded to rows whose target could name this note.
+      refreshAmbiguousLinks(this.db, noteResolutionKeys(note));
     }
 
     // Reference-field auto-link (vault#typed-reference-field) — no prior
@@ -601,71 +620,173 @@ export class BunSqliteStore implements Store {
       }
     }
 
-    const note = noteOps.updateNote(this.db, id, updates);
+    // vault#708 — the rename cascade has to know which brackets resolved to
+    // THIS note, and resolution is only observable BEFORE the path moves.
+    // So the plan (source note -> the exact bracket texts that pointed here)
+    // is computed against the pre-write index; `cascadeRename` applies it
+    // after, when the new path is known.
+    const cascadePlan = oldPath && updates.path !== undefined && oldPath !== updates.path
+      ? this.planCascadeRename(id, oldPath)
+      : undefined;
 
-    // Wikilink sync runs against the *resulting* content. For append/prepend
-    // we don't have the new value pre-write — read it back off the returned
-    // note so a `[[Foo]]` introduced via append still creates the link.
-    if (updates.content !== undefined || updates.append !== undefined || updates.prepend !== undefined) {
-      syncWikilinks(this.db, id, note.content);
-    }
+    // Keep the note-row write and every derived index/cascade write in one
+    // atomic unit. Any later failure must leave the note and its indexes at
+    // the pre-update state rather than committing only the first SQL write.
+    const note = this.transaction(() => {
+      const note = noteOps.updateNote(this.db, id, updates);
 
-    if (updates.path !== undefined && note.path) {
-      if (oldPath && oldPath !== note.path) {
-        this.cascadeRename(oldPath, note.path);
+      // Wikilink sync runs against the *resulting* content. For append/prepend
+      // we don't have the new value pre-write — read it back off the returned
+      // note so a `[[Foo]]` introduced via append still creates the link.
+      if (updates.content !== undefined || updates.append !== undefined || updates.prepend !== undefined) {
+        syncWikilinks(this.db, id, note.content);
       }
-      resolveUnresolvedWikilinks(this.db, note.path, id);
-    }
 
-    // Reference-field auto-link sync (vault#typed-reference-field). Only
-    // when this call actually touched `metadata` — see the read above for
-    // why a content/tags/path-only update is skipped.
-    if (updates.metadata !== undefined) {
-      this.syncReferenceFieldLinks(note, priorMetadataForRefs);
-    }
+      if (updates.path !== undefined && note.path) {
+        if (cascadePlan && oldPath && oldPath !== note.path) {
+          this.cascadeRename(cascadePlan, note, oldPath);
+        }
+        resolveUnresolvedWikilinks(this.db, note.path, id);
+        // vault#581 — a rename is one of the two ways an ambiguity stops being
+        // ambiguous (the other is a delete). Sweep the OLD path's keys as well
+        // as the new ones: it's the target the collision was recorded under.
+        refreshAmbiguousLinks(this.db, [
+          ...pathResolutionKeys(oldPath, note.extension),
+          ...noteResolutionKeys(note),
+        ]);
+      }
 
-    // Invalidate before the hook dispatch so any handler that re-queries
-    // the hierarchy from inside its own logic sees post-write state.
-    // `metadata` updates can change the `parents` field on a config note
-    // even when the path didn't change, so always invalidate when the
-    // current path is in a config namespace.
-    this.invalidateConfigCachesForPath(note.path, oldPath);
-    this.hooks.dispatch("updated", note, this);
+      // Reference-field auto-link sync (vault#typed-reference-field). Only
+      // when this call actually touched `metadata` — see the read above for
+      // why a content/tags/path-only update is skipped.
+      if (updates.metadata !== undefined) {
+        this.syncReferenceFieldLinks(note, priorMetadataForRefs);
+      }
+
+      return note;
+    });
+
+    // Dispatch and invalidate only once the whole surrounding transaction
+    // stack commits. In a multi-item transactionAsync batch the inner Store
+    // transaction is a SAVEPOINT, so "after the inner closure" is not yet
+    // post-commit; afterCommit carries these through to the outer boundary.
+    afterCommit(this.db, () => {
+      this.invalidateConfigCachesForPath(note.path, oldPath);
+      this.hooks.dispatch("updated", note, this);
+    });
 
     return note;
   }
 
   /**
-   * When a note is renamed, update [[wikilinks]] in other notes that referenced the old path.
-   * Matches both full path and basename references.
+   * Plan the rename cascade (vault#708) — for a note about to move off
+   * `oldPath`, the exact `[[bracket]]` texts in each source note that
+   * RESOLVED TO THIS NOTE, keyed by source id.
+   *
+   * MUST run before the path write: resolution is a property of the index,
+   * and once the row moves, `[[Rename]]` no longer means what it meant.
+   *
+   * The source set comes from the `links` rows pointing at this note
+   * (`relationship = 'wikilink'`) — an index-driven prefilter that already
+   * excludes the two classes the old basename-matching cascade corrupted:
+   *   - AMBIGUOUS brackets (`[[Rename]]` with `keep/Rename` AND `move/Rename`
+   *     present) never get a `links` row at all — they live in
+   *     `ambiguous_wikilinks` (vault#581/#707) and are healed by
+   *     `refreshAmbiguousLinks` after the rename, not by a text rewrite.
+   *   - brackets that resolved to a DIFFERENT same-basename note, whose
+   *     `links` row points elsewhere.
+   * The note itself is added to the set because a self-referencing bracket
+   * is deliberately never given a `links` row (`syncWikilinks` skips
+   * self-links) yet the old cascade rewrote it — parity.
+   *
+   * `links` rows only say "this note links here", not WHICH bracket did it
+   * (`syncWikilinks` dedupes by resolved target id and stores no bracket
+   * text), so every candidate source is re-parsed and each bracket
+   * re-resolved. That is also what keeps a source's OTHER same-named
+   * brackets untouched.
    */
-  private cascadeRename(oldPath: string, newPath: string): void {
-    const oldTitle = pathTitle(oldPath);
-    const newTitle = pathTitle(newPath);
+  private planCascadeRename(id: string, oldPath: string): Map<string, string[]> {
+    const rows = this.db.prepare(
+      "SELECT source_id FROM links WHERE target_id = ? AND relationship = 'wikilink'",
+    ).all(id) as { source_id: string }[];
+    const sourceIds = new Set<string>(rows.map((r) => r.source_id));
+    sourceIds.add(id);
 
-    const candidates = this.db.prepare(`
-      SELECT id, content FROM notes
-      WHERE content LIKE ? OR content LIKE ?
-    `).all(`%[[${oldPath}%`, `%[[${oldTitle}%`) as { id: string; content: string }[];
-
-    for (const row of candidates) {
-      let updated = row.content;
-
-      updated = updated.replace(
-        new RegExp(`\\[\\[${escapeRegex(oldPath)}([#|\\]])`, "g"),
-        `[[${newPath}$1`,
-      );
-
-      if (oldTitle !== newTitle && oldTitle !== oldPath) {
-        updated = updated.replace(
-          new RegExp(`\\[\\[${escapeRegex(oldTitle)}([#|\\]])`, "g"),
-          `[[${newTitle}$1`,
-        );
+    const plan = new Map<string, string[]>();
+    for (const sourceId of sourceIds) {
+      const row = this.db.prepare("SELECT content FROM notes WHERE id = ?")
+        .get(sourceId) as { content: string } | null;
+      if (!row?.content) continue;
+      const targets: string[] = [];
+      const seen = new Set<string>();
+      for (const wl of parseWikilinks(row.content)) {
+        const key = wl.target.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        // Only path-derived forms of the old path can be invalidated by a
+        // repath; an H1-title-fallback bracket keeps resolving and must not
+        // be touched.
+        if (!wikilinkPathForm(wl.target, oldPath)) continue;
+        const detail = resolveWikilinkDetailed(this.db, wl.target);
+        if (detail.resolved && detail.note_id === id) targets.push(wl.target);
       }
+      if (targets.length > 0) plan.set(sourceId, targets);
+    }
+    return plan;
+  }
 
+  /**
+   * Apply a {@link planCascadeRename} plan after the path write: rewrite only
+   * the brackets that resolved to the renamed note, preserving each one's
+   * shape (basename stays a basename, full path stays a full path, an
+   * explicit `.ext` keeps its `.ext`). A basename widens to the full path
+   * only when the NEW basename would no longer resolve back to this note —
+   * i.e. the move created a fresh collision.
+   *
+   * Each rewritten source is re-parsed via `syncWikilinks`, so `links`,
+   * `unresolved_wikilinks` and `ambiguous_wikilinks` stay consistent with
+   * the new text.
+   */
+  private cascadeRename(plan: Map<string, string[]>, note: Note, oldPath: string): void {
+    if (plan.size === 0 || !note.path) return;
+    const newPath = note.path;
+
+    // One resolution per distinct bracket text, shared across sources.
+    const replacement = new Map<string, string>();
+
+    for (const [sourceId, targets] of plan) {
+      const row = this.db.prepare("SELECT content FROM notes WHERE id = ?")
+        .get(sourceId) as { content: string } | null;
+      if (!row?.content) continue;
+
+      const mapping = new Map<string, string>();
+      for (const target of targets) {
+        const key = target.toLowerCase();
+        let next = replacement.get(key);
+        if (next === undefined) {
+          const form = wikilinkPathForm(target, oldPath);
+          if (!form) continue;
+          const candidates = wikilinkRenameCandidates(form, newPath, note.extension);
+          // First candidate that actually resolves back to this note wins;
+          // if none does (e.g. every shape is now ambiguous), keep the
+          // preferred shape rather than inventing a third one.
+          next = candidates.find((c) => {
+            const detail = resolveWikilinkDetailed(this.db, c);
+            return detail.resolved && detail.note_id === note.id;
+          }) ?? candidates[0]!;
+          replacement.set(key, next);
+        }
+        if (next !== target) mapping.set(key, next);
+      }
+      if (mapping.size === 0) continue;
+
+      const updated = rewriteWikilinkTargets(
+        row.content,
+        (target) => mapping.get(target.toLowerCase()) ?? null,
+      );
       if (updated !== row.content) {
-        noteOps.updateNote(this.db, row.id, { content: updated });
-        syncWikilinks(this.db, row.id, updated);
+        noteOps.updateNote(this.db, sourceId, { content: updated });
+        syncWikilinks(this.db, sourceId, updated);
       }
     }
   }
@@ -706,7 +827,13 @@ export class BunSqliteStore implements Store {
     // comment for why this must run pre-delete and what it deliberately
     // excludes (typed `links`, not just wikilinks).
     requeueInboundWikilinksForDelete(this.db, id);
+    // vault#581 — the deleted note's resolution keys, captured BEFORE the row
+    // goes away and swept AFTER, so a `[[Dup]]` that was ambiguous only
+    // because of THIS note resolves (or, if it was the last candidate,
+    // demotes to an ordinary broken link).
+    const ambiguityKeys = noteResolutionKeys(existing);
     noteOps.deleteNote(this.db, id);
+    refreshAmbiguousLinks(this.db, ambiguityKeys);
     if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
     // Dispatch even when `existing` was null — the caller asked for a
     // deletion, and downstream consumers (e.g. the mirror) reconcile via
@@ -1601,7 +1728,3 @@ export class BunSqliteStore implements Store {
 export const SqliteStore = BunSqliteStore;
 /** @deprecated Renamed to `BunSqliteStore`. */
 export type SqliteStore = BunSqliteStore;
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}

@@ -8,6 +8,7 @@
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { getNoteTags, getVaultMap } from "../core/src/notes.ts";
+import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
@@ -23,6 +24,7 @@ import {
   expandTokenTagScope,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
+  scopeQueryTagParam,
   scrubIndexedFieldConflictError,
   scrubNoteTagsByScope,
   scrubParentCycleError,
@@ -211,6 +213,24 @@ export function generateScopedMcpTools(
         )
     : undefined;
 
+  // Tag-scope guard for the ambiguous-links surface (vault#581 auth review):
+  // `candidate_count` is derived vault-wide, so without this a `work`-scoped
+  // reader learns from `candidate_count: 2` on its own `[[Dup]]` that a
+  // second `Dup` exists in a scope it cannot see — and `has_ambiguous_links:
+  // true` turns that into a standing, sweepable census of cross-scope naming
+  // collisions. Identical closure/shape to `nearTraversable` above (by note
+  // id, tags looked up sync + core-native); core narrows each row's
+  // candidates through it. Unscoped sessions install no predicate, so the
+  // persisted counts and the SQL filter answer directly, unchanged.
+  const ambiguityVisible = scoped
+    ? (noteId: string) =>
+        noteWithinTagScope(
+          { id: noteId, tags: getNoteTags(store.db, noteId) } as Note,
+          allowedHolder.value,
+          rawTags,
+        )
+    : undefined;
+
   // Tag-scope guard for `create-note` `if_exists` (vault#555 auth-review
   // must-fix): the core `if_exists` upsert resolves the target path VAULT-WIDE
   // and returns/updates/replaces the found note, so a scoped caller could
@@ -274,6 +294,7 @@ export function generateScopedMcpTools(
     ...(nearTraversable ? { nearTraversable } : {}),
     ...(ifExistsVisible ? { ifExistsVisible } : {}),
     ...(aggregateVisibility ? { aggregateVisibility } : {}),
+    ...(ambiguityVisible ? { ambiguityVisible } : {}),
     ...(writeContext ? { writeContext } : {}),
     ...(strictBypass ? { strictBypass } : {}),
     ...(onStrictBypass ? { onStrictBypass } : {}),
@@ -440,6 +461,38 @@ function applyTagScopeWrappers(
   };
 
   /**
+   * Re-decide a write response's `ambiguous_link` warnings against the
+   * caller's OWN sub-vault (vault#707's rule, write side). `candidate_count`
+   * is derived vault-wide, so a `work`-scoped writer saving `[[Dup]]` would
+   * otherwise learn from `candidate_count: 2` that a second `Dup` exists in a
+   * scope it cannot see — the same oracle vault#707 closed on `query-notes`,
+   * reachable through `create-note` / `update-note` instead. Same visibility
+   * model as `ambiguityVisible` / `nearTraversable` in generateScopedMcpTools
+   * (`noteWithinTagScope` by note id), and the same decision function in core
+   * (`visibleResolutionCount`), so the surfaces cannot drift.
+   *
+   * Ordering: identical to `scrubNoteForScope` above — every write wrapper
+   * `await getAllowed()`s before `orig(params)`, so `allowedHolder.value` is
+   * the resolved allowlist by the time this runs.
+   */
+  const scrubWriteNote = (n: any): any => {
+    const scrubbed = scrubNoteForScope(n);
+    if (!scrubbed || !Array.isArray(scrubbed.warnings)) return scrubbed;
+    const visible = (noteId: string) =>
+      noteWithinTagScope(
+        { id: noteId, tags: getNoteTags(store.db, noteId) } as Note,
+        allowedHolder?.value ?? null,
+        rawTags,
+      );
+    const warnings = narrowLinkWarningsForVisibility(store.db, scrubbed.warnings, visible);
+    if (warnings.length === 0) {
+      const { warnings: _dropped, ...rest } = scrubbed;
+      return rest;
+    }
+    return { ...scrubbed, warnings };
+  };
+
+  /**
    * Shape dispatcher for the WRITE tools (vault#568). `create-note` and
    * `update-note` echo the stored note, so they leak exactly what the read
    * paths leak — and a no-op `update-note` would otherwise be a one-call
@@ -449,18 +502,46 @@ function applyTagScopeWrappers(
    */
   const scrubWriteResult = (result: any): any => {
     if (!result || typeof result !== "object") return result;
-    if (Array.isArray(result)) return result.map(scrubNoteForScope);
+    if (Array.isArray(result)) return result.map(scrubWriteNote);
     if ("error" in result) return result;
     if (Array.isArray((result as any).notes)) {
-      return { ...result, notes: (result as any).notes.map(scrubNoteForScope) };
+      return { ...result, notes: (result as any).notes.map(scrubWriteNote) };
     }
-    if ("id" in result && "tags" in result) return scrubNoteForScope(result);
+    if ("id" in result && "tags" in result) return scrubWriteNote(result);
     return result;
+  };
+
+  /**
+   * Neutralise out-of-scope tags NAMED IN THE QUERY (vault#675) before core
+   * ever runs. Without this a scoped session could ask `query-notes { tag:
+   * "project-manhattan" }` and read the answer off hit/miss — a co-tagged
+   * note is in scope via its OTHER tag, so it survived the result filter
+   * below and confirmed the guessed name. Rewriting the input (rather than
+   * emptying the output) keeps the response byte-identical to the same call
+   * naming a tag that doesn't exist, in every shape this tool returns —
+   * including the `aggregate` rollup and the `next_cursor` envelope, which
+   * an output-side patch could not reproduce. `exclude_tags` is rewritten on
+   * the same terms (core skips an exclude clause that can't match, so it
+   * excludes nothing — again exactly a nonexistent tag). Aliases mirror
+   * core's `exclude_tags ?? excludeTags ?? exclude_tag` resolution order.
+   */
+  const QUERY_TAG_PARAMS = ["tag", "exclude_tags", "excludeTags", "exclude_tag"] as const;
+  const scopeQueryTagParams = (params: any, allowed: Set<string> | null): any => {
+    if (!params || typeof params !== "object") return params;
+    let next = params;
+    for (const key of QUERY_TAG_PARAMS) {
+      if (params[key] === undefined) continue;
+      const scoped = scopeQueryTagParam(params[key], allowed, rawTags);
+      if (scoped === params[key]) continue;
+      if (next === params) next = { ...params };
+      next[key] = scoped;
+    }
+    return next;
   };
 
   wrapReadTool(tools, "query-notes", async (orig, params) => {
     const allowed = await getAllowed();
-    const result = await orig(params);
+    const result = await orig(scopeQueryTagParams(params, allowed));
     if (!allowed) return result;
     // `aggregate` mode returns `[{group, value}]` rollup rows — no `.tags`
     // to post-filter (and `noteWithinTagScope` would wrongly drop every
@@ -863,7 +944,27 @@ function overrideVaultInfo(
           `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
         );
       }
-      config.description = params.description as string;
+      // vault#669: runtime type guard — the `as string` cast below was a
+      // compile-time claim guarding nothing, so a write/admin caller could
+      // persist a non-string `description` (or crash serializeVaultConfig
+      // with `description.split is not a function`) and poison the NEXT
+      // MCP `initialize` (projectionToMarkdown's `description.trim()`).
+      // Reject non-string/non-null here as a structured invalid-params
+      // error: a duck-typed `error_type` throw, which src/mcp-http.ts's
+      // generic branch turns into JSON-RPC -32602 INVALID_PARAMS carrying
+      // structured `data` — the same shape core's own validation leaves
+      // take, no new error family. `null` stays legal: it clears the
+      // description. Cross-door parity with cloud#263 (closes the bun
+      // half of cloud#87).
+      if (params.description !== null && typeof params.description !== "string") {
+        throw Object.assign(new Error("description must be a string or null"), {
+          error_type: "invalid_description",
+          field: "description",
+          got: params.description,
+          hint: "pass a string, or null to clear the description",
+        });
+      }
+      config.description = params.description as string | null;
       writeVaultConfig(config);
     }
 

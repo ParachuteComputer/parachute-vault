@@ -318,15 +318,18 @@ unknown).
   every note once. On a large vault this can take a few seconds to
   low-single-digit minutes; the server logs progress and search stays
   unavailable only for the duration of that one pass.
-- **`unresolved_wikilinks` `relationship`-column self-heal
-  (`core/src/wikilinks.ts`) — lazy, not tied to `SCHEMA_VERSION`.** A vault
-  whose `unresolved_wikilinks` table predates the structured-link resolution
-  work (rc.8, #555) gets it rebuilt with a widened 3-column primary key
-  (`source_id, target_path, relationship`) the first time the table is
-  touched (a pending wikilink or structured-link forward-reference) rather
-  than on boot. Existing pending rows backfill as `relationship = 'wikilink'`
-  (the only kind that could have been queued pre-rc.8). Also wrapped in a
-  transaction for the same crash-safety reason as `migrateToV25`.
+- **`migrateToV28` (schema v27→28) — `unresolved_wikilinks` `relationship`
+  column self-heal (`core/src/schema.ts`, body in `core/src/wikilinks.ts`).**
+  The pre-#555 2-column `unresolved_wikilinks` rebuild (widened 3-column PK
+  `source_id, target_path, relationship`, existing rows backfilled as
+  `relationship = 'wikilink'`) now runs at `initSchema` instead of lazily on
+  first touch. **Gated — this does not rewrite every vault on open.** No
+  table (the common case: never queued a dangling link) → no-op, no CREATE.
+  Already-3-column table → no-op. Only a pre-#555 2-column table is rebuilt,
+  atomically, and that table is typically tiny (pending forward-refs, not
+  notes). Subsequent opens are a PRAGMA no-op. Lazy table *creation* is
+  unchanged: a vault that has never had an unresolved link still has no
+  `unresolved_wikilinks` table.
 
 ### Breaking changes
 

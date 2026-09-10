@@ -1053,8 +1053,9 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   // Presence: has_broken_links (vault#555) — a dangling outbound wikilink or
   // structured `links` target that never resolved. The `unresolved_wikilinks`
   // table is created lazily (see wikilinks.ts:ensureUnresolvedTable) only when
-  // a link actually goes unresolved — a vault where nothing ever has won't
-  // have the table at all. Check existence first rather than reference it
+  // a link actually goes unresolved — migrateToV28 heals a pre-#555 2-column
+  // table at boot but does NOT create the table on a vault that never queued
+  // one. Check existence first rather than reference it
   // unconditionally: a read-only query filter shouldn't have the side effect
   // of creating a table, and a bare `EXISTS`/`NOT EXISTS` against a missing
   // table would throw "no such table" instead of the correct empty answer.
@@ -1072,6 +1073,28 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
         opts.hasBrokenLinks
           ? `EXISTS (SELECT 1 FROM unresolved_wikilinks ubl WHERE ubl.source_id = n.id)`
           : `NOT EXISTS (SELECT 1 FROM unresolved_wikilinks ubl WHERE ubl.source_id = n.id)`,
+      );
+    }
+  }
+
+  // Presence: has_ambiguous_links (vault#581) — an outbound `[[wikilink]]` or
+  // structured `links`/`reference` target that matched ≥2 notes, so no link
+  // was created. Same lazily-created-table dance as `has_broken_links` above
+  // (`ambiguous_wikilinks` is only created once a link actually goes
+  // ambiguous), and for the same reasons: a read-only filter must not create
+  // the table, and a bare EXISTS against a missing one throws instead of
+  // answering "none".
+  if (opts.hasAmbiguousLinks !== undefined) {
+    const ambiguousTableExists = db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ambiguous_wikilinks'",
+    ).get() !== null;
+    if (!ambiguousTableExists) {
+      if (opts.hasAmbiguousLinks) conditions.push("0 = 1");
+    } else {
+      conditions.push(
+        opts.hasAmbiguousLinks
+          ? `EXISTS (SELECT 1 FROM ambiguous_wikilinks ual WHERE ual.source_id = n.id)`
+          : `NOT EXISTS (SELECT 1 FROM ambiguous_wikilinks ual WHERE ual.source_id = n.id)`,
       );
     }
   }
@@ -1694,6 +1717,7 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
     hasTags: opts.hasTags,
     hasLinks: opts.hasLinks,
     hasBrokenLinks: opts.hasBrokenLinks,
+    hasAmbiguousLinks: opts.hasAmbiguousLinks,
     path: opts.path,
     pathPrefix: opts.pathPrefix,
     excludePathPrefix: opts.excludePathPrefix,
@@ -2767,6 +2791,8 @@ export function mergeTags(
     const deleteNoteTagsStmt = db.prepare("DELETE FROM note_tags WHERE tag_name = ?");
     const deleteTagStmt = db.prepare("DELETE FROM tags WHERE name = ?");
     const countStmt = db.prepare("SELECT COUNT(*) as c FROM note_tags WHERE tag_name = ?");
+    const sourceNoteIdsStmt = db.prepare("SELECT note_id FROM note_tags WHERE tag_name = ?");
+    const affectedIds = new Set<string>();
 
     for (const source of uniqueSources) {
       const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(source);
@@ -2775,6 +2801,11 @@ export function mergeTags(
         continue;
       }
       const before = (countStmt.get(source) as { c: number }).c;
+      // Collect BEFORE the delete so we can bump updated_at on every note
+      // whose tags actually change (vault#567).
+      for (const row of sourceNoteIdsStmt.all(source) as { note_id: string }[]) {
+        affectedIds.add(row.note_id);
+      }
       retagStmt.run(target, source);
       deleteNoteTagsStmt.run(source);
       // Dropping the tag row drops its identity (description, fields,
@@ -2782,6 +2813,24 @@ export function mergeTags(
       // for a merge: the source's identity is consumed by the target.
       deleteTagStmt.run(source);
       merged[source] = before;
+    }
+
+    // vault#567: a tags-only `update-note` already bumps `updated_at` so
+    // cursor/sync consumers see the retag. `merge-tags` used to skip the
+    // bump (flood-avoidance), which made the equivalent bulk retag
+    // invisible to since-last-check loops. Bump every note that actually
+    // lost a source tag; notes that never carried a merged-away source
+    // are left untouched. `updated_at_ms` moves with `updated_at`
+    // (vault#586) so the cursor keyset surfaces the change.
+    if (affectedIds.size > 0) {
+      const now = new Date().toISOString();
+      const nowMs = timestampToMs(now) ?? Date.now();
+      const bumpStmt = db.prepare(
+        "UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?",
+      );
+      for (const id of affectedIds) {
+        bumpStmt.run(now, nowMs, id);
+      }
     }
   });
 

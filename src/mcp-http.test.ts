@@ -19,10 +19,20 @@
  * do — `McpError` is only ever constructed inside `mcp-http.ts` itself).
  */
 import { describe, test, expect } from "bun:test";
+import { Database } from "bun:sqlite";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { handleMcp, mcpDomainError } from "./mcp-http.ts";
-import type { McpToolDef } from "../core/src/mcp.ts";
+import { generateMcpTools, type McpToolDef } from "../core/src/mcp.ts";
+import { SqliteStore } from "../core/src/store.ts";
 import type { AuthResult } from "./auth.ts";
+
+interface ToolErrorResponse {
+  error: {
+    code: number;
+    message: string;
+    data: Record<string, unknown>;
+  };
+}
 
 function toolsWith(execute: (params: Record<string, unknown>) => unknown): () => McpToolDef[] {
   return () => [
@@ -62,6 +72,29 @@ async function callBoom(execute: (params: Record<string, unknown>) => unknown): 
   });
   const res = await handleMcp(req, toolsWith(execute), "test-server", "v", fullAuth(), "");
   return res.json();
+}
+
+async function callNoteToolWithoutId(
+  name: "update-note" | "delete-note",
+): Promise<ToolErrorResponse> {
+  const db = new Database(":memory:");
+  try {
+    const store = new SqliteStore(db);
+    const req = new Request("http://localhost:1940/vault/v/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name, arguments: {} },
+      }),
+    });
+    const res = await handleMcp(req, () => generateMcpTools(store), "test-server", "v", fullAuth(), "");
+    return (await res.json()) as ToolErrorResponse;
+  } finally {
+    db.close();
+  }
 }
 
 describe("MCP SDK McpError — confirms the mechanics this fix depends on", () => {
@@ -149,4 +182,21 @@ describe("handleMcp JSON-RPC error mapping — end to end (vault#555 fix 6)", ()
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toContain("plain unstructured failure");
   });
+});
+
+describe("note mutation tools require an id (vault#705)", () => {
+  for (const name of ["update-note", "delete-note"] as const) {
+    test(`${name} without id returns structured invalid params, never a TypeError`, async () => {
+      const body = await callNoteToolWithoutId(name);
+
+      expect(body.error.code).toBe(ErrorCode.InvalidParams);
+      expect(body.error.data).toMatchObject({
+        error_type: "missing_required_field",
+        field: "id",
+        hint: expect.stringContaining("path"),
+      });
+      expect(body.error.message).not.toContain("TypeError");
+      expect(body.error.message).not.toContain("idOrPath.match");
+    });
+  }
 });

@@ -188,6 +188,17 @@ export interface QueryOpts {
    * had a broken link) — `true` matches nothing, `false` is a no-op.
    */
   hasBrokenLinks?: boolean;
+  /**
+   * Presence filter on the `ambiguous_wikilinks` table (vault#581):
+   * `true` → only notes with at least one AMBIGUOUS outbound link (a
+   * `[[wikilink]]` or structured `links` target that matched ≥2 notes, so
+   * no link was created and none was guessed at); `false` → only notes with
+   * none. Disjoint from `hasBrokenLinks`: a dangling target matched NOTHING,
+   * an ambiguous one matched too much. Safe on a vault where the
+   * `ambiguous_wikilinks` table has never been created (no link has ever
+   * been ambiguous) — `true` matches nothing, `false` is a no-op.
+   */
+  hasAmbiguousLinks?: boolean;
   path?: string;        // exact path match (case-insensitive)
   pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
   /**
