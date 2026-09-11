@@ -1,0 +1,58 @@
+{
+  "MCP": {
+    "path": [
+      "work-src",
+      "hidden-dup"
+    ],
+    "relationships": [
+      "wikilink"
+    ],
+    "nodes": [
+      {
+        "id": "work-src",
+        "path": "work-src"
+      },
+      {
+        "id": "hidden-dup",
+        "path": "p1/Dup"
+      }
+    ],
+    "edges": [
+      {
+        "source": "work-src",
+        "target": "hidden-dup",
+        "relationship": "wikilink",
+        "sourcePath": "work-src",
+        "targetPath": "p1/Dup"
+      }
+    ]
+  },
+  "REST": {
+    "path": [
+      "work-src",
+      "hidden-dup"
+    ],
+    "relationships": [
+      "wikilink"
+    ],
+    "nodes": [
+      {
+        "id": "work-src",
+        "path": "work-src"
+      },
+      {
+        "id": "hidden-dup",
+        "path": "p1/Dup"
+      }
+    ],
+    "edges": [
+      {
+        "source": "work-src",
+        "target": "hidden-dup",
+        "relationship": "wikilink",
+        "sourcePath": "work-src",
+        "targetPath": "p1/Dup"
+      }
+    ]
+  }
+}

@@ -32,6 +32,7 @@ import {
   getUnresolvedLinksForNote,
   getUnresolvedLinksForNotes,
   listZeroVisibleAmbiguousAsUnresolved,
+  listResolvedToInvisibleAsUnresolved,
   narrowByVisibleBrokenness,
   sqlHasBrokenLinks,
   getAmbiguousLinksForNote,
@@ -1026,7 +1027,7 @@ export function parseNotesQueryOpts(url: URL, tagScope: TagScopeCtx = NO_TAG_SCO
     expand,
     excludeTags: parseQueryList(url, "exclude_tag"),
     hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
-    hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
+    hasLinks: linkOps.sqlHasLinks(parseBoolOrUndef(parseQuery(url, "has_links")), tagScope.raw !== null),
     // Presence filter on dangling outbound wikilinks/structured links
     // (vault#555) — see core/src/types.ts QueryOpts.hasBrokenLinks.
     // vault#239: for a TAG-SCOPED reader NEITHER polarity is safe to push
@@ -1376,7 +1377,7 @@ async function handleNotesInner(
         // linkCount injected after filterMetadata on purpose — same as
         // links/attachments above; filterMetadata only touches `metadata`.
         if (parseBool(parseQuery(url, "include_link_count"), false)) {
-          result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
+          result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), ambiguityVisibilityFor(db, tagScope)).get(note.id) ?? 0;
         }
         return json(result);
       }
@@ -1451,7 +1452,26 @@ async function handleNotesInner(
               embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
             );
           }
-          const filtered = filterNotesByTagScope(semanticResult.notes, tagScope.allowed, tagScope.raw);
+          let filtered = filterNotesByTagScope(semanticResult.notes, tagScope.allowed, tagScope.raw);
+          // Apply the same scoped presence filters as the structured list.
+          filtered = narrowByVisibleAmbiguity(
+            db,
+            filtered,
+            parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+            ambiguityVisibilityFor(db, tagScope),
+          );
+          filtered = narrowByVisibleBrokenness(
+            db,
+            filtered,
+            parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+            ambiguityVisibilityFor(db, tagScope),
+          );
+          filtered = linkOps.narrowByVisibleLinks(
+            db,
+            filtered,
+            parseBoolOrUndef(parseQuery(url, "has_links")),
+            ambiguityVisibilityFor(db, tagScope),
+          );
           const includeContent = parseBool(parseQuery(url, "include_content"), false);
           const contentRange = parseContentRangeQuery(url, includeContent);
           if (contentRange.error) return contentRange.error;
@@ -1477,7 +1497,7 @@ async function handleNotesInner(
             output = output.map((n: any) => filterMetadata(n, inclMeta));
           }
           if (parseBool(parseQuery(url, "include_link_count"), false)) {
-            const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
+            const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url), ambiguityVisibilityFor(db, tagScope));
             for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
           }
           return jsonWithWarnings(output, semanticWarnings);
@@ -1646,7 +1666,26 @@ async function handleNotesInner(
         // Tag-scope: drop any result the token isn't permitted to see. Filter
         // happens after the store query so an empty post-filter list still
         // returns 200 [] (consistent with "no matches"), not 403.
-        const results = filterNotesByTagScope(rawResults, tagScope.allowed, tagScope.raw);
+        let results = filterNotesByTagScope(rawResults, tagScope.allowed, tagScope.raw);
+        // Apply the same scoped presence filters as the structured list.
+        results = narrowByVisibleAmbiguity(
+          db,
+          results,
+          parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+          ambiguityVisibilityFor(db, tagScope),
+        );
+        results = narrowByVisibleBrokenness(
+          db,
+          results,
+          parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+          ambiguityVisibilityFor(db, tagScope),
+        );
+        results = linkOps.narrowByVisibleLinks(
+          db,
+          results,
+          parseBoolOrUndef(parseQuery(url, "has_links")),
+          ambiguityVisibilityFor(db, tagScope),
+        );
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
         const contentRange = parseContentRangeQuery(url, includeContent);
         if (contentRange.error) return contentRange.error;
@@ -1680,6 +1719,7 @@ async function handleNotesInner(
             db,
             output.map((n: any) => n.id),
             parseLinkCountDirection(url),
+            ambiguityVisibilityFor(db, tagScope),
           );
           for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
         }
@@ -1805,6 +1845,12 @@ async function handleNotesInner(
               db,
               visible,
               parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+              ambiguityVisibilityFor(db, tagScope),
+            );
+            visible = linkOps.narrowByVisibleLinks(
+              db,
+              visible,
+              parseBoolOrUndef(parseQuery(url, "has_links")),
               ambiguityVisibilityFor(db, tagScope),
             );
             // Always run the rollup, even on an empty visible set: ungrouped
@@ -1980,6 +2026,12 @@ async function handleNotesInner(
         parseBoolOrUndef(parseQuery(url, "has_broken_links")),
         ambiguityVisibilityFor(db, tagScope),
       );
+      results = linkOps.narrowByVisibleLinks(
+        db,
+        results,
+        parseBoolOrUndef(parseQuery(url, "has_links")),
+        ambiguityVisibilityFor(db, tagScope),
+      );
 
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
       const contentRange = parseContentRangeQuery(url, includeContent);
@@ -2059,6 +2111,7 @@ async function handleNotesInner(
           db,
           output.map((n: any) => n.id),
           parseLinkCountDirection(url),
+          ambiguityVisibilityFor(db, tagScope),
         );
         for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
       }
@@ -2826,7 +2879,7 @@ async function handleNotesInner(
       result.attachments = await store.getAttachments(note.id);
     }
     if (parseBool(parseQuery(url, "include_link_count"), false)) {
-      result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
+      result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), ambiguityVisibilityFor(db, tagScope)).get(note.id) ?? 0;
     }
     return json(result);
   }
@@ -4264,9 +4317,16 @@ export function handleUnresolvedWikilinks(
   // target); the two tables are disjoint by construction, so this only
   // guards against a stale row.
   const seen = new Set(filtered.map((r) => `${r.source_id}\u0000${r.relationship}\u0000${r.target_path.toLowerCase()}`));
-  const collapsed = listZeroVisibleAmbiguousAsUnresolved(db, ambiguityVisibilityFor(db, tagScope)!, limit)
-    .filter((row) => inScope(row)
-      && !seen.has(`${row.source_id}\u0000${row.relationship}\u0000${row.target_path.toLowerCase()}`));
+  const visible = ambiguityVisibilityFor(db, tagScope)!;
+  const collapsed = [
+    ...listZeroVisibleAmbiguousAsUnresolved(db, visible, limit),
+    ...listResolvedToInvisibleAsUnresolved(db, visible, limit),
+  ].filter((row) => {
+    const key = `${row.source_id}\u0000${row.relationship}\u0000${row.target_path.toLowerCase()}`;
+    if (!inScope(row) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 
   const merged = [...filtered, ...collapsed].slice(0, limit);
   return Response.json({ unresolved: merged, count: merged.length });

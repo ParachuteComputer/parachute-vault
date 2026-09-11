@@ -299,3 +299,32 @@ describe("query-notes MCP surface: include_link_count", () => {
     for (const n of ordered) expect(typeof n.linkCount).toBe("number");
   });
 });
+
+
+describe("vault#714 scoped link degree", () => {
+  async function seedScope() {
+    for (const id of ["a", "b", "hidden"]) await store.createNote(id, { id });
+    await store.createLink("a", "b", "visible");
+    await store.createLink("a", "hidden", "hidden-out");
+    await store.createLink("hidden", "a", "hidden-in");
+  }
+  for (const [direction, expected] of [["both", 1], ["outbound", 1], ["inbound", 0]] as const) {
+    it(`vault#714 scoped ${direction}`, async () => {
+      await seedScope();
+      expect(getLinkCounts(db, ["a"], direction, (id) => id !== "hidden").get("a")).toBe(expected);
+    });
+  }
+  it("vault#714 visible self-loop remains degree two", async () => {
+    await seedScope(); await store.createLink("b", "b", "self");
+    expect(getLinkCounts(db, ["b"], "both", (id) => id === "b").get("b")).toBe(2);
+  });
+  it("vault#714 absent predicate preserves global degree", async () => {
+    await seedScope();
+    expect(getLinkCounts(db, ["a"], "both")).toEqual(new Map([["a", 3]]));
+    expect(getLinkCounts(db, ["a"], "both", undefined)).toEqual(getLinkCounts(db, ["a"], "both"));
+  });
+  it("vault#714 repeated ids and typed rows retain row-count semantics", async () => {
+    await seedScope(); await store.createLink("a", "b", "second");
+    expect(getLinkCounts(db, ["a", "a"], "both", (id) => id !== "hidden").get("a")).toBe(2);
+  });
+});
