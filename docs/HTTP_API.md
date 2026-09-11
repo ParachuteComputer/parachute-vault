@@ -845,6 +845,11 @@ Query params:
     `ambiguous_links: [{target, relationship, candidate_count}]` field, `[]`
     when none (vault#581). Same one-batched-query-per-page shape as
     `include_broken_links`.
+  - `include_link_count=true` — add `linkCount`, the inbound + outbound
+    edge-row count (a self-loop counts as 2), without hydrating link objects.
+    `link_count_direction=both|outbound|inbound` selects the counted direction
+    (default `both`). For tag-scoped tokens, an edge counts only when both
+    endpoints are visible, in all three directions. Unscoped counts are unchanged.
   - `include_attachments=true` — fold each note's attachments into the
     result rows.
   - `include_metadata=...` — comma-separated allowlist of metadata keys;
@@ -868,7 +873,14 @@ Query params:
   - `exclude_tag=foo` — exclude notes carrying this tag. Comma-list form
     (`exclude_tag=foo,bar`) and repeated params (`exclude_tag=foo&exclude_tag=bar`)
     both accumulate.
-  - `has_tags=true|false`, `has_links=true|false`.
+  - `has_tags=true|false`.
+  - `has_links=true|false` — presence of an inbound or outbound link. For a
+    tag-scoped token, both endpoints must be visible: `true` selects notes
+    with at least one such edge, `false` selects notes with none. Both
+    polarities are decided after the page is drawn, so a scoped page can
+    come back shorter than `limit` while more results remain. The filter
+    does not participate in a scoped cursor's query hash. Unscoped behavior
+    is unchanged.
   - `has_broken_links=true|false` — presence filter on dangling outbound
     links (vault#555): `true` returns only notes with at least one
     unresolved `[[wikilink]]` or structured `links` target; `false` returns
@@ -881,8 +893,12 @@ Query params:
     **Tag-scoped tokens** get the answer computed on the notes they can see
     (vault#239): a target whose candidates are ALL outside the token's scope
     matches nothing in that token's sub-vault, so it counts as broken for it
-    even though the vault-wide record calls it ambiguous. Without that, the
-    note would only become "broken" once the last invisible candidate was
+    even though the vault-wide record calls it ambiguous or its content wikilink
+    resolves to an invisible note (vault#714). Resolved structured links to
+    invisible notes are suppressed from degree/presence/links but are not
+    named in `broken_links`: storage retains only the target id, not the
+    original caller string, and the hidden target's path must not be disclosed.
+    Without that, the note would only become "broken" once the last invisible candidate was
     deleted — an oracle for a naming collision the token cannot see. Both
     polarities are decided after the page is drawn (the filter is not pushed
     into SQL for a scoped token), so a scoped page can come back shorter than
@@ -1190,8 +1206,9 @@ Query params:
     fix — this previously listed `created_at`/`updated_at` as example valid
     values; `created_at` is not a metadata field, so it still errors). Two
     special values need no `indexed: true` declaration: `link_count` sorts by
-    link DEGREE (see `include_link_count` below), and `updated_at` (vault#585)
-    sorts on the integer `updated_at_ms` mirror column — correct on
+    global link DEGREE (see `include_link_count` above), even under tag scope;
+    that ordering may disagree with the scoped `linkCount` field.
+    `updated_at` (vault#585) sorts on the integer `updated_at_ms` mirror column — correct on
     non-canonical/imported timestamps, unlike a plain TEXT sort — with `id`
     as the tiebreaker instead of `created_at`.
   - `limit=N` — default 50. Must be a non-negative integer; `limit=-1` or a
@@ -2236,7 +2253,13 @@ A **tag-scoped token** sees only rows whose SOURCE note is in its scope, and
 broken in ITS sub-vault but ambiguous vault-wide — a target whose candidates
 are all out of scope (vault#239) — for the same reason `has_broken_links`
 does: otherwise the row would appear here only once the last invisible
-candidate was deleted.
+candidate was deleted. Resolved-to-invisible content wikilinks are folded
+in too (vault#714), using the source's own bracket target, never the hidden
+note's path. Resolved structured links cannot be reconstructed and are omitted.
+This fold-in is bounded and non-exhaustive: it scans at most
+`min(2000, max(200, limit * 20))` resolved edge rows in source/target order,
+stops at `limit` folded rows, and shares the final deduplicated `limit` slice
+with the unresolved and ambiguous rows. Unscoped listing is unchanged.
 
 #### `GET /vault/{name}/api/health` — `vault:read`
 Per-vault liveness ping. `{status: "ok", vault: "<name>"}`.

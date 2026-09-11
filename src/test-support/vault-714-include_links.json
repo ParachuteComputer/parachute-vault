@@ -1,0 +1,86 @@
+{
+  "MCP": {
+    "id": "work-src",
+    "content": "src [[Dup]]",
+    "path": "work-src",
+    "extension": "md",
+    "metadata": {},
+    "createdAt": "2026-01-01T00:00:00.000Z",
+    "updatedAt": "2026-01-01T00:00:00.000Z",
+    "createdBy": null,
+    "createdVia": null,
+    "lastUpdatedBy": null,
+    "lastUpdatedVia": null,
+    "tags": [
+      "work"
+    ],
+    "links": [
+      {
+        "sourceId": "work-src",
+        "targetId": "hidden-dup",
+        "relationship": "wikilink",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "sourceNote": {
+          "id": "work-src",
+          "path": "work-src",
+          "createdAt": "2026-01-01T00:00:00.000Z",
+          "updatedAt": "2026-01-01T00:00:00.000Z",
+          "tags": [
+            "work"
+          ]
+        },
+        "targetNote": {
+          "id": "hidden-dup",
+          "path": "p1/Dup",
+          "createdAt": "2026-01-01T00:00:00.000Z",
+          "updatedAt": "2026-01-01T00:00:00.000Z",
+          "tags": [
+            "personal"
+          ]
+        }
+      }
+    ]
+  },
+  "REST": {
+    "id": "work-src",
+    "content": "src [[Dup]]",
+    "path": "work-src",
+    "extension": "md",
+    "metadata": {},
+    "createdAt": "2026-01-01T00:00:00.000Z",
+    "updatedAt": "2026-01-01T00:00:00.000Z",
+    "createdBy": null,
+    "createdVia": null,
+    "lastUpdatedBy": null,
+    "lastUpdatedVia": null,
+    "tags": [
+      "work"
+    ],
+    "links": [
+      {
+        "sourceId": "work-src",
+        "targetId": "hidden-dup",
+        "relationship": "wikilink",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "sourceNote": {
+          "id": "work-src",
+          "path": "work-src",
+          "createdAt": "2026-01-01T00:00:00.000Z",
+          "updatedAt": "2026-01-01T00:00:00.000Z",
+          "tags": [
+            "work"
+          ]
+        },
+        "targetNote": {
+          "id": "hidden-dup",
+          "path": "p1/Dup",
+          "createdAt": "2026-01-01T00:00:00.000Z",
+          "updatedAt": "2026-01-01T00:00:00.000Z",
+          "tags": [
+            "personal"
+          ]
+        }
+      }
+    ]
+  }
+}

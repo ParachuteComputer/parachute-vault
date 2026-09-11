@@ -1,0 +1,27 @@
+{
+  "REST": {
+    "nodes": [
+      {
+        "id": "hidden-dup",
+        "path": "p1/Dup",
+        "tags": [
+          "personal"
+        ]
+      },
+      {
+        "id": "work-src",
+        "path": "work-src",
+        "tags": [
+          "work"
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "source": "work-src",
+        "target": "hidden-dup",
+        "relationship": "wikilink"
+      }
+    ]
+  }
+}

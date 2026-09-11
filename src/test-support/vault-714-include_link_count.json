@@ -1,0 +1,348 @@
+{
+  "MCP": [
+    {
+      "id": "work-src",
+      "content": "src [[Dup]]",
+      "path": "work-src",
+      "extension": "md",
+      "metadata": {},
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "createdBy": null,
+      "createdVia": null,
+      "lastUpdatedBy": null,
+      "lastUpdatedVia": null,
+      "tags": [
+        "work"
+      ],
+      "linkCount": 1
+    },
+    [
+      {
+        "id": "hidden-dup",
+        "path": "p1/Dup",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "personal"
+        ],
+        "metadata": {},
+        "byteSize": 12,
+        "preview": "personal dup",
+        "displayTitle": "personal dup",
+        "linkCount": 1
+      },
+      {
+        "id": "work-src",
+        "path": "work-src",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "work"
+        ],
+        "metadata": {},
+        "byteSize": 11,
+        "preview": "src [[Dup]]",
+        "displayTitle": "src [[Dup]]",
+        "linkCount": 1
+      }
+    ],
+    {
+      "id": "work-src",
+      "content": "src [[Dup]]",
+      "path": "work-src",
+      "extension": "md",
+      "metadata": {},
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "createdBy": null,
+      "createdVia": null,
+      "lastUpdatedBy": null,
+      "lastUpdatedVia": null,
+      "tags": [
+        "work"
+      ],
+      "linkCount": 1
+    },
+    [
+      {
+        "id": "hidden-dup",
+        "path": "p1/Dup",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "personal"
+        ],
+        "metadata": {},
+        "byteSize": 12,
+        "preview": "personal dup",
+        "displayTitle": "personal dup",
+        "linkCount": 0
+      },
+      {
+        "id": "work-src",
+        "path": "work-src",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "work"
+        ],
+        "metadata": {},
+        "byteSize": 11,
+        "preview": "src [[Dup]]",
+        "displayTitle": "src [[Dup]]",
+        "linkCount": 1
+      }
+    ],
+    {
+      "id": "work-src",
+      "content": "src [[Dup]]",
+      "path": "work-src",
+      "extension": "md",
+      "metadata": {},
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "createdBy": null,
+      "createdVia": null,
+      "lastUpdatedBy": null,
+      "lastUpdatedVia": null,
+      "tags": [
+        "work"
+      ],
+      "linkCount": 0
+    },
+    [
+      {
+        "id": "hidden-dup",
+        "path": "p1/Dup",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "personal"
+        ],
+        "metadata": {},
+        "byteSize": 12,
+        "preview": "personal dup",
+        "displayTitle": "personal dup",
+        "linkCount": 1
+      },
+      {
+        "id": "work-src",
+        "path": "work-src",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "work"
+        ],
+        "metadata": {},
+        "byteSize": 11,
+        "preview": "src [[Dup]]",
+        "displayTitle": "src [[Dup]]",
+        "linkCount": 0
+      }
+    ]
+  ],
+  "REST": [
+    {
+      "id": "work-src",
+      "content": "src [[Dup]]",
+      "path": "work-src",
+      "extension": "md",
+      "metadata": {},
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "createdBy": null,
+      "createdVia": null,
+      "lastUpdatedBy": null,
+      "lastUpdatedVia": null,
+      "tags": [
+        "work"
+      ],
+      "linkCount": 1
+    },
+    [
+      {
+        "id": "hidden-dup",
+        "path": "p1/Dup",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "personal"
+        ],
+        "metadata": {},
+        "byteSize": 12,
+        "preview": "personal dup",
+        "displayTitle": "personal dup",
+        "linkCount": 1
+      },
+      {
+        "id": "work-src",
+        "path": "work-src",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "work"
+        ],
+        "metadata": {},
+        "byteSize": 11,
+        "preview": "src [[Dup]]",
+        "displayTitle": "src [[Dup]]",
+        "linkCount": 1
+      }
+    ],
+    {
+      "id": "work-src",
+      "content": "src [[Dup]]",
+      "path": "work-src",
+      "extension": "md",
+      "metadata": {},
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "createdBy": null,
+      "createdVia": null,
+      "lastUpdatedBy": null,
+      "lastUpdatedVia": null,
+      "tags": [
+        "work"
+      ],
+      "linkCount": 1
+    },
+    [
+      {
+        "id": "hidden-dup",
+        "path": "p1/Dup",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "personal"
+        ],
+        "metadata": {},
+        "byteSize": 12,
+        "preview": "personal dup",
+        "displayTitle": "personal dup",
+        "linkCount": 0
+      },
+      {
+        "id": "work-src",
+        "path": "work-src",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "work"
+        ],
+        "metadata": {},
+        "byteSize": 11,
+        "preview": "src [[Dup]]",
+        "displayTitle": "src [[Dup]]",
+        "linkCount": 1
+      }
+    ],
+    {
+      "id": "work-src",
+      "content": "src [[Dup]]",
+      "path": "work-src",
+      "extension": "md",
+      "metadata": {},
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "createdBy": null,
+      "createdVia": null,
+      "lastUpdatedBy": null,
+      "lastUpdatedVia": null,
+      "tags": [
+        "work"
+      ],
+      "linkCount": 0
+    },
+    [
+      {
+        "id": "hidden-dup",
+        "path": "p1/Dup",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "personal"
+        ],
+        "metadata": {},
+        "byteSize": 12,
+        "preview": "personal dup",
+        "displayTitle": "personal dup",
+        "linkCount": 1
+      },
+      {
+        "id": "work-src",
+        "path": "work-src",
+        "extension": "md",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "createdBy": null,
+        "createdVia": null,
+        "lastUpdatedBy": null,
+        "lastUpdatedVia": null,
+        "tags": [
+          "work"
+        ],
+        "metadata": {},
+        "byteSize": 11,
+        "preview": "src [[Dup]]",
+        "displayTitle": "src [[Dup]]",
+        "linkCount": 0
+      }
+    ]
+  ]
+}
