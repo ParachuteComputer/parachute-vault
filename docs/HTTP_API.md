@@ -62,6 +62,26 @@ That's the whole happy path. Everything else in this doc is detail.
   and context fields (`path`, `note_id`, `current_updated_at`, …).
 - **CORS**: every endpoint sends `Access-Control-Allow-Origin: *` so static
   sites on any origin can call the API. Writes still require a valid token.
+- **Two doors, one doc.** This file is the shared HTTP contract. Self-hosted
+  (bun, `parachute-vault`) and hosted (cloud, `parachute-cloud`) do not yet
+  parse the same query/write params. The table below is the lag list: a
+  param is "honored" only when that door's parser reads it. A cloud client
+  following this doc without checking the table will hit a silent drop or a
+  400. Precedent for door qualification is the "Wave 1, bun-only" line on
+  attachment tickets below. **Every cloud parity PR that lands or removes a
+  param from this list updates this table.**
+
+| Param | Self-hosted (bun) | Hosted (cloud) | Note |
+|---|---|---|---|
+| `has_broken_links` | honored | silently ignored | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
+| `include_broken_links` | honored | silently ignored | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
+| `exclude_path_prefix` | honored | silently ignored | — |
+| repeated `?tag=a&tag=b` (also `exclude_tag`, `exclude_path_prefix`) | accumulates (`getAll` + comma-list) | first occurrence only (`searchParams.get`) | vault#659 on bun |
+| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | silently ignored (no parser) | [cloud#286](https://github.com/ParachuteComputer/parachute-cloud/issues/286) (400-body when the pin can serve it) |
+| `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | ignored — path conflict stays 409 | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
+| `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | ignored — full note objects | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
+| `search_mode` | honored (`literal`/`advanced`) | 200 + `unsupported_param` warning | cloud v1 is literal-only |
+| `sort` under `?search=` | honored | 200 + `unsupported_param` warning | cloud v1 always ranks by relevance |
 
 ## Authentication
 
