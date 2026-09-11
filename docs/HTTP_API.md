@@ -77,7 +77,7 @@ That's the whole happy path. Everything else in this doc is detail.
 | `include_broken_links` | honored | silently ignored | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
 | `exclude_path_prefix` | honored | silently ignored | — |
 | repeated `?tag=a&tag=b` (also `exclude_tag`, `exclude_path_prefix`) | accumulates (`getAll` + comma-list) | first occurrence only (`searchParams.get`) | vault#659 on bun |
-| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | silently ignored (no parser) | [cloud#286](https://github.com/ParachuteComputer/parachute-cloud/issues/286) (400-body when the pin can serve it) |
+| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | 400 `unsupported_param` (`field: "aggregate"`, no REST parser; MCP `query-notes` serves it) | [cloud#286](https://github.com/ParachuteComputer/parachute-cloud/issues/286) (B train) |
 | `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | ignored — path conflict stays 409 | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
 | `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | ignored — full note objects | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
 | `search_mode` | honored (`literal`/`advanced`) | 200 + `unsupported_param` warning | cloud v1 is literal-only |
