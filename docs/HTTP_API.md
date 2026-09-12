@@ -77,7 +77,7 @@ That's the whole happy path. Everything else in this doc is detail.
 | `include_broken_links` | honored | silently ignored | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
 | `exclude_path_prefix` | honored | silently ignored | — |
 | repeated `?tag=a&tag=b` (also `exclude_tag`, `exclude_path_prefix`) | accumulates (`getAll` + comma-list) | first occurrence only (`searchParams.get`) | vault#659 on bun |
-| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | 400 `unsupported_param` (`field: "aggregate"`, no REST parser; MCP `query-notes` serves it) | [cloud#286](https://github.com/ParachuteComputer/parachute-cloud/issues/286) (B train) |
+| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | honored; same four exclusions as bun (`search`, `semantic`, `cursor`, `near` → 400 `invalid_query`) | [cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291) (B2) |
 | `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | ignored — path conflict stays 409 | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
 | `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | ignored — full note objects | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
 | `search_mode` | honored (`literal`/`advanced`) | 200 + `unsupported_param` warning | cloud v1 is literal-only |
@@ -1189,16 +1189,14 @@ Query params:
     `400 invalid_query` (`field: "aggregate"`). Bun REST used to silently
     ignore `aggregate[...]` under `search=` and return note rows; the bun
     door now rejects.
-  - **Cloud-door coverage (vault#626).** Cloud's **MCP** `query-notes`
-    serves `aggregate` already — that surface is core-driven, so it
-    inherits the rollup with no cloud-side code. Cloud's **REST** door has
-    no `aggregate` parser: it used to drop `aggregate[...]` silently and
-    answer with note rows, and now answers `400` with
-    `error_type: "unsupported_param"`, `field: "aggregate"` rather than
-    handing a rollup parser the wrong envelope (parachute-cloud#134 B.4).
-    The ungrouped filtered total reaches BOTH cloud surfaces when cloud
-    promotes the vault-core commit it pins in `scripts/vault-source.env` —
-    the pin currently predates the core change.
+  - **Cloud-door coverage (vault#626).** Both cloud doors serve the
+    rollup: MCP `query-notes` uses the core-driven aggregate surface, and
+    REST parses `aggregate[...]` since cloud B2
+    ([cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291)).
+    REST enforces the same four exclusions as bun: `search`, `semantic`,
+    `cursor`, and `near` combined with aggregation return
+    `400 invalid_query` (`field: "aggregate"`). The promoted vault-core
+    pin also supplies the ungrouped filtered total to both cloud surfaces.
   - **Tag-scope respected.** A tag-scoped token's rollup is computed only
     over notes it can see — exactly like a normal query — AND, under
     `group_by: "tag"`, group NAMES themselves are scrubbed to the token's
