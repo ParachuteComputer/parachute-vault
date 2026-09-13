@@ -73,15 +73,19 @@ That's the whole happy path. Everything else in this doc is detail.
 
 | Param | Self-hosted (bun) | Hosted (cloud) | Note |
 |---|---|---|---|
-| `has_broken_links` | honored | silently ignored | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
-| `include_broken_links` | honored | silently ignored | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
-| `exclude_path_prefix` | honored | silently ignored | — |
-| repeated `?tag=a&tag=b` (also `exclude_tag`, `exclude_path_prefix`) | accumulates (`getAll` + comma-list) | first occurrence only (`searchParams.get`) | vault#659 on bun |
+| `has_broken_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
+| `has_ambiguous_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
+| `include_broken_links` | honored | honored | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7) |
+| `include_ambiguous_links` | honored | honored | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7) |
+| `exclude_path_prefix` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
+| repeated `?tag=a&tag=b` (also `exclude_tag`, `exclude_path_prefix`) | accumulates (`getAll` + comma-list) | accumulates (`getAll` + comma-list) | vault#659 on bun; [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
 | `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | honored; same four exclusions as bun (`search`, `semantic`, `cursor`, `near` → 400 `invalid_query`) | [cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291) (B2) |
-| `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | ignored — path conflict stays 409 | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
-| `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | ignored — full note objects | [cloud#125](https://github.com/ParachuteComputer/parachute-cloud/issues/125) (B train) |
+| `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | honored (`error`/`ignore`/`update`/`replace`); `existed` returned only in the three engaged modes | [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
+| `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | honored — `{created, ids, failed}`; `created` excludes collision hits, `failed` is always `[]` | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7), [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
 | `search_mode` | honored (`literal`/`advanced`) | 200 + `unsupported_param` warning | cloud v1 is literal-only |
 | `sort` under `?search=` | honored | 200 + `unsupported_param` warning | cloud v1 always ranks by relevance |
+| `{idOrPath}` note addressing (H1-title fallback) | honored | honored — every REST note address, incl. `find-path`'s `source`/`target` | [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9) |
+| `unresolved_link` / `ambiguous_link` write warnings (POST/PATCH `/notes`) | honored — in the response body as `warnings` | honored — in the response body as `warnings`, never the `X-Parachute-Warnings` header | [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9); a `links.remove` miss never queues on either door |
 
 ## Authentication
 
@@ -1441,6 +1445,7 @@ attachment rule as the structured-query list below.
 > note's displayed title differs from its path/basename (the same
 > resolution `find-path`'s `source`/`target`, `update-note`/`delete-note`
 > `id`, and `[[wikilink]]`/structured-`links` targets already use).
+> Identical on the self-hosted and hosted doors since [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9).
 
 Folding options:
 
