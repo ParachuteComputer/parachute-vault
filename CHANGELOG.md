@@ -4,6 +4,12 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+- **Note version history core (refs #524, PR 1 of 5).** Schema 28 → 29 adds `note_versions` and content-addressed `note_blobs`. Updates, append/prepend, deletes, tag renames and linked-note rename cascades capture prior state atomically. History defaults to enabled with a 20-version floor, a 100-version ceiling and 180-day age bound, configurable per vault under `history:`; deleted history is retained until explicit erase by default. Four REST routes list/read/restore/erase versions, MCP `query-notes` gains read-only `versions`, and unscoped doctor reports retained deleted history. Strict-schema restore rejection leaves history unchanged; the migration bypass remains logged.
+
+  The launch plan switches off live git-mirror export and keeps the repo as a **static archive**, the only pre-v29 record. The importer and retirement itself are PR 3. **PR 1 changes no mirror code**: `parachute-vault history`, `MirrorManager` and `/.parachute/mirror/history` are unchanged and still work.
+
 ## [0.7.9-rc.4] - 2026-09-13
 
 **A scoped reader's link graph stops moving with edges it cannot see, a stable can no longer skip its rc, and the hosted-door support table catches up with cloud.** The seven commits on `next` since rc.3 (#715, #718, #720, #722, #732), plus the merge of the 0.7.9-rc.3 promotion back into the line. No schema change — still 28.

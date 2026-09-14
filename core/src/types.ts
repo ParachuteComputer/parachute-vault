@@ -7,6 +7,7 @@ import type { ValidationStatus } from "./schema-defaults.js";
 import type { ConformanceReport } from "./conformance.js";
 import type { FindPathResult } from "./links.js";
 import type { DoctorReport, DoctorScanOpts } from "./doctor.js";
+import type { HistoryOp, VersionRow } from "./history.js";
 
 // ---- Re-exports ----
 
@@ -481,7 +482,28 @@ export interface Store {
    */
   getNoteByPath(path: string, extension?: string): Promise<Note | null>;
   getNotes(ids: string[]): Promise<Note[]>;
-  updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; extension?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[] }): Promise<Note>;
+  updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; extension?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean;
+      /**
+       * State-transition compare-and-set (vault#299 Part B). DECLARED here as
+       * of vault#524 — it always arrived at runtime (src/routes.ts:3214 sets
+       * it on a `const updates: any = {}` at :3167 and passes it at :3257, and
+       * noteOps.updateNote has read it at notes.ts:708 since #299) but it was
+       * never on the declared type, so an object LITERAL carrying it did not
+       * compile. Declaring it is what lets a core test construct the shape
+       * directly (P1, P11b) instead of laundering it through `any`.
+       */
+      state_transition?: { field: string; from: unknown; to: unknown };
+      /**
+       * INTERNAL — the `op` stamped on the version row this write captures
+       * (vault#524). Set ONLY by Store.restoreNoteVersion, to "restore".
+       * noteOps.updateNote ignores it (it reads named fields, never
+       * Object.keys), so it never reaches SQL. Do NOT accept it from REST or
+       * MCP: src/routes.ts's PATCH handler builds `updates` field by field and
+       * must not copy it out of the request body, and core/src/mcp.ts's
+       * update-note executor must not either. §10.24 pins that.
+       */
+      historyOp?: HistoryOp;
+      actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[] }): Promise<Note>;
   /**
    * Set a note's `created_at` and `updated_at` explicitly. Import-only:
    * used by the portable-md round-trip path to restore timestamps from
@@ -497,7 +519,14 @@ export interface Store {
    * content. Returns counts for caller logging.
    */
   syncAllWikilinks(): Promise<{ synced: number; totalAdded: number; totalRemoved: number }>;
-  deleteNote(id: string): Promise<void>;
+  /** vault#524: deletion captures a tombstone unless a blow-away import opts out. */
+  deleteNote(id: string, opts?: { actor?: string | null; via?: string | null; captureHistory?: boolean }): Promise<void>;
+  listNoteVersions(id: string, opts?: { limit?: number; offset?: number }): Promise<VersionRow[]>;
+  getNoteVersion(id: string, versionIx: number): Promise<(VersionRow & { content: string | null }) | null>;
+  restoreNoteVersion(id: string, versionIx: number, opts: { actor?: string | null; via?: string | null; if_updated_at?: string }): Promise<Note>;
+  eraseNoteHistory(id: string): Promise<{ versionsDeleted: number; blobsDeleted: number }>;
+  sweepDeletedHistory(): { notesSwept: number; versionsDeleted: number; blobsDeleted: number };
+  deletedHistoryStats(): Promise<{ notes: number; versions: number; bytes: number; overflow_tombstones: number }>;
   queryNotes(opts: QueryOpts): Promise<Note[]>;
   /**
    * Cursor-paginated `queryNotes` (vault#313). Returns the same notes plus
@@ -601,6 +630,7 @@ export interface Store {
   renameTag(
     oldName: string,
     newName: string,
+    opts?: { actor?: string; via?: string },
   ): Promise<
     | {
         renamed: number;

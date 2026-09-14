@@ -31,6 +31,7 @@ import {
   type SearchMode,
 } from "./search-query.js";
 import { generateUlid } from "./ulid.js";
+import { captureVersion, readPriorNoteRow, DEFAULT_HISTORY_POLICY, type HistoryPolicy } from "./history.js";
 
 /**
  * Write-attribution context (vault#298) — the two axes of provenance threaded
@@ -2390,7 +2391,7 @@ export type RenameTagResult =
  * (the store wrapper) bust both `_tagHierarchy` and `_schemaConfig`
  * after the cascade returns.
  */
-export function renameTag(db: Database, oldName: string, newName: string): RenameTagResult {
+export function renameTag(db: Database, oldName: string, newName: string, attr?: { actor?: string | null; via?: string | null }, policy: HistoryPolicy = DEFAULT_HISTORY_POLICY): RenameTagResult {
   // Normalize the TARGET so a rename can never create a `#`-prefixed tag. The
   // SOURCE (`oldName`) is left LITERAL on purpose — it's the transitional escape
   // hatch that lets the `#legacy/*` → `legacy/*` data migration find the
@@ -2590,6 +2591,8 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
       for (const row of candidates) {
         const next = rewriteNoteBody(row.content, renames);
         if (next === row.content) continue;
+        const prior = readPriorNoteRow(db, row.id);
+        if (prior) captureVersion(db, prior, { actor: attr?.actor ?? null, via: attr?.via ?? null, op: "tag-rename", policy });
         updateStmt.run(next, now, nowMs, row.id);
         notesRewritten++;
       }
@@ -2612,6 +2615,8 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
       for (const row of candidates) {
         const next = rewriteTagConfigPath(row.path, renames);
         if (next === row.path) continue;
+        const prior = readPriorNoteRow(db, row.id);
+        if (prior) captureVersion(db, prior, { actor: attr?.actor ?? null, via: attr?.via ?? null, op: "tag-rename", policy });
         updateStmt.run(next, now, nowMs, row.id);
         pathsRenamed++;
       }

@@ -11,6 +11,8 @@
  * and the Request, and returns a Response.
  */
 
+import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
+import { ULID_REGEX } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
@@ -179,6 +181,103 @@ export { assetsDir };
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function conflictResponse(e: any): Response | null {
+  if (e instanceof NotFoundError) return json({ error: e.message, error_type: "not_found" }, 404);
+  // Duck-type on `code` rather than `instanceof ConflictError`: this
+  // error originates in the core package and survives any future
+  // bundling / module-boundary split more robustly than a prototype check.
+  if (e && e.code === "CONFLICT") {
+    return json(
+      {
+        // New structured shape — what agents should key on.
+        error_type: "conflict",
+        current_updated_at: e.current_updated_at ?? null,
+        your_updated_at: e.expected_updated_at,
+        path: e.note_path ?? null,
+        note_id: e.note_id,
+        message: e.message,
+        hint: "re-read the note (GET) and re-apply your change against its current `updated_at`, or pass `force: true` to overwrite",
+        // Legacy fields — kept for the lens VaultConflictError shim and
+        // any other pre-launch callers. Safe to drop post-launch.
+        error: "conflict",
+        expected_updated_at: e.expected_updated_at,
+      },
+      409,
+    );
+  }
+  // State-transition compare-and-set conflict (vault#299 Part B). A
+  // DISTINCT error vocabulary from `conflict` (settled lead #3): the
+  // field VALUE didn't match `from`, not the updated_at token. 409.
+  if (e && e.code === "TRANSITION_CONFLICT") {
+    return json(
+      {
+        error_type: "transition_conflict",
+        error: "transition_conflict",
+        note_id: e.note_id,
+        path: e.note_path ?? null,
+        field: e.field,
+        expected_from: e.expected_from,
+        to: e.to,
+        current: e.current ?? null,
+        message: e.message,
+        hint: "re-read the note's current value for this field and retry the transition from its actual current state",
+      },
+      409,
+    );
+  }
+  // Strict-schema rejection (vault#299 Part A). One error carrying ALL
+  // per-field violations (settled lead #1). 422 Unprocessable Entity —
+  // the note exists / request is well-formed but violates the contract.
+  if (e && e.code === "SCHEMA_VALIDATION") {
+    return json(
+      {
+        error_type: "schema_validation",
+        error: "schema_validation",
+        violations: e.violations ?? [],
+        message: e.message,
+        hint: "fix every field listed in `violations` and retry — none of this write was applied",
+      },
+      422,
+    );
+  }
+  // Path-rename collision — schema's UNIQUE(path) tripped. Issue #126.
+  if (e && e.code === "PATH_CONFLICT") {
+    return json(
+      {
+        error_type: "path_conflict",
+        error: "path_conflict",
+        path: e.path,
+        message: e.message,
+        hint: "pass a different `path`, or omit it to leave the existing path unchanged",
+      },
+      409,
+    );
+  }
+  if (e && e.code === "INVALID_EXTENSION") {
+    return json(
+      { error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message },
+      400,
+    );
+  }
+  // Bad `path` value (vault#589 / FIX 2) — NUL byte or `..` segment.
+  if (e && e.code === "INVALID_PATH") {
+    return json(
+      { error_type: "invalid_path", error: "invalid_path", path: e.path, reason: e.reason, message: e.message },
+      400,
+    );
+  }
+  if (e && e.code === "HISTORY_NOT_FOUND") return json({ error: e.message, error_type: "not_found" }, 404);
+  if (e && e.code === "HISTORY_OVERFLOW") return json({
+    error_type: "history_overflow", note_id: e.note_id, byte_size: e.byte_size, limit: e.limit, message: e.message,
+    hint: "this note exceeds the 2 MB version-history ceiling, so it cannot be updated while history is enabled; delete it, or shrink it out-of-band, or disable history for this vault",
+  }, 413);
+  if (e && e.code === "HISTORY_UNRECOVERABLE") return json({
+    error_type: "history_unrecoverable", note_id: e.note_id, version_ix: e.version_ix, message: e.message,
+    hint: "this version is an overflow tombstone — the note's size and deletion were recorded but its content never was",
+  }, 409);
+  return null;
+}
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });
@@ -2823,6 +2922,69 @@ async function handleNotesInner(
     return handleRetryTranscription(store, note, vault);
   }
 
+  const verMatch = sub.match(/^\/versions\/([^/]+)$/);
+  if (sub === "/versions" || verMatch || sub === "/restore") {
+    const note = await resolveNote(store, idOrPath);
+    if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+      return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+    if (!note && (tagScope.raw !== null || !ULID_REGEX.test(idOrPath) ||
+      !(await store.listNoteVersions(idOrPath, { limit: 1 })).length)) {
+      return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+    const id = note?.id ?? idOrPath;
+    if (sub === "/versions") {
+      if (method === "GET") {
+        const parsedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+        const limit = Number.isNaN(parsedLimit) ? 50 : Math.min(200, Math.max(0, parsedLimit));
+        const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0);
+        const versions = await store.listNoteVersions(id, { limit, offset });
+        const total = (store.db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(id) as { n: number }).n;
+        return json({ versions, total });
+      }
+      if (method === "DELETE") {
+        const result = await store.eraseNoteHistory(id);
+        return json({ erased: true, id, versions_deleted: result.versionsDeleted, blobs_deleted: result.blobsDeleted });
+      }
+    } else if (verMatch && method === "GET") {
+      const ix = Number(verMatch[1]);
+      if (!/^\d+$/.test(verMatch[1]!) || !Number.isInteger(ix) || ix < 0) return json({ error: "Invalid version_ix", error_type: "invalid_request" }, 400);
+      const version = await store.getNoteVersion(id, ix);
+      return version ? json(version) : json({ error: "Not found", error_type: "not_found" }, 404);
+    } else if (sub === "/restore" && method === "POST") {
+      const parsed = await parseJsonBody(req);
+      if (!parsed.ok) return parsed.response;
+      const body = parsed.body;
+      if (body.version_ix === undefined) return json({ error: "version_ix is required", error_type: "missing_required_field" }, 400);
+      if (!Number.isInteger(body.version_ix) || (body.version_ix as number) < 0) return json({ error: "Invalid version_ix", error_type: "invalid_request" }, 400);
+      try {
+        const version = await store.getNoteVersion(id, body.version_ix as number);
+        if (!version) throw new HistoryNotFoundError(id, body.version_ix as number);
+        gateStrictWrite(store, writeCtx, {
+          path: note ? note.path : latestTombstone(db, id)?.path,
+          tags: note?.tags ?? [], metadata: version.metadata,
+        });
+        const restored = await store.restoreNoteVersion(id, body.version_ix as number, {
+          actor: writeCtx.actor, via: writeCtx.via,
+          ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
+        });
+        let validated: any = attachValidationStatus(store, db, restored);
+        validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
+        if (validated.validation_status) {
+          const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
+          if (vs === undefined) { const { validation_status: _d, ...rest } = validated; validated = rest; }
+          else validated = { ...validated, validation_status: vs };
+        }
+        return json({ ...validated, restored_from: body.version_ix, recreated: !note });
+      } catch (e: any) {
+        const r = conflictResponse(e);
+        if (r) return r;
+        throw e;
+      }
+    }
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+  }
+
   if (sub !== "") return json({ error: "Not found", error_type: "not_found" }, 404);
 
   // GET /notes/:idOrPath — single note
@@ -3357,90 +3519,8 @@ async function handleNotesInner(
       lean.created = false;
       return json(lean);
     } catch (e: any) {
-      if (e instanceof NotFoundError) return json({ error: e.message, error_type: "not_found" }, 404);
-      // Duck-type on `code` rather than `instanceof ConflictError`: this
-      // error originates in the core package and survives any future
-      // bundling / module-boundary split more robustly than a prototype check.
-      if (e && e.code === "CONFLICT") {
-        return json(
-          {
-            // New structured shape — what agents should key on.
-            error_type: "conflict",
-            current_updated_at: e.current_updated_at ?? null,
-            your_updated_at: e.expected_updated_at,
-            path: e.note_path ?? null,
-            note_id: e.note_id,
-            message: e.message,
-            hint: "re-read the note (GET) and re-apply your change against its current `updated_at`, or pass `force: true` to overwrite",
-            // Legacy fields — kept for the lens VaultConflictError shim and
-            // any other pre-launch callers. Safe to drop post-launch.
-            error: "conflict",
-            expected_updated_at: e.expected_updated_at,
-          },
-          409,
-        );
-      }
-      // State-transition compare-and-set conflict (vault#299 Part B). A
-      // DISTINCT error vocabulary from `conflict` (settled lead #3): the
-      // field VALUE didn't match `from`, not the updated_at token. 409.
-      if (e && e.code === "TRANSITION_CONFLICT") {
-        return json(
-          {
-            error_type: "transition_conflict",
-            error: "transition_conflict",
-            note_id: e.note_id,
-            path: e.note_path ?? null,
-            field: e.field,
-            expected_from: e.expected_from,
-            to: e.to,
-            current: e.current ?? null,
-            message: e.message,
-            hint: "re-read the note's current value for this field and retry the transition from its actual current state",
-          },
-          409,
-        );
-      }
-      // Strict-schema rejection (vault#299 Part A). One error carrying ALL
-      // per-field violations (settled lead #1). 422 Unprocessable Entity —
-      // the note exists / request is well-formed but violates the contract.
-      if (e && e.code === "SCHEMA_VALIDATION") {
-        return json(
-          {
-            error_type: "schema_validation",
-            error: "schema_validation",
-            violations: e.violations ?? [],
-            message: e.message,
-            hint: "fix every field listed in `violations` and retry — none of this write was applied",
-          },
-          422,
-        );
-      }
-      // Path-rename collision — schema's UNIQUE(path) tripped. Issue #126.
-      if (e && e.code === "PATH_CONFLICT") {
-        return json(
-          {
-            error_type: "path_conflict",
-            error: "path_conflict",
-            path: e.path,
-            message: e.message,
-            hint: "pass a different `path`, or omit it to leave the existing path unchanged",
-          },
-          409,
-        );
-      }
-      if (e && e.code === "INVALID_EXTENSION") {
-        return json(
-          { error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message },
-          400,
-        );
-      }
-      // Bad `path` value (vault#589 / FIX 2) — NUL byte or `..` segment.
-      if (e && e.code === "INVALID_PATH") {
-        return json(
-          { error_type: "invalid_path", error: "invalid_path", path: e.path, reason: e.reason, message: e.message },
-          400,
-        );
-      }
+      const r = conflictResponse(e);
+      if (r) return r;
       throw e;
     }
   }
@@ -3454,7 +3534,7 @@ async function handleNotesInner(
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
-    await store.deleteNote(note.id);
+    await store.deleteNote(note.id, { actor: writeCtx.actor, via: writeCtx.via });
     return json({ deleted: true, id: note.id });
   }
 
@@ -3471,6 +3551,7 @@ export async function handleTags(
   store: Store,
   subpath = "",
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -3619,7 +3700,7 @@ export async function handleTags(
     // other surface). The old fail-closed token-reference check has been
     // removed; the cascade rewrites the JSON allowlist atomically. See
     // notes.ts:renameTag for the surfaces touched.
-    const result = await store.renameTag(oldName, newName);
+    const result = await store.renameTag(oldName, newName, { actor: writeCtx.actor ?? undefined, via: writeCtx.via ?? undefined });
     if ("error" in result) {
       if (result.error === "not_found") {
         return json({ error: "not_found", error_type: "tag_not_found", tag: oldName }, 404);

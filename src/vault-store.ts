@@ -5,6 +5,7 @@
  * implementation to avoid duplicating wikilink hooks and other behavior.
  */
 
+import { readVaultConfig } from "./config.ts";
 import { SqliteStore } from "../core/src/store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import type { Store } from "../core/src/types.ts";
@@ -106,12 +107,15 @@ export function getVaultStore(name: string): SqliteStore {
     // because) semantic search is off — no second read of the resolution.
     const embeddingProvider = getSharedEmbeddingProvider();
     store = new SqliteStore(db, {
+      history: readVaultConfig(name)?.history,
       hooks: defaultHookRegistry,
       embeddingProvider,
       embeddingDisabledReason: embeddingProvider ? undefined : EMBEDDINGS_DISABLED_REASON,
     });
     stores.set(name, store);
     storeToVault.set(store, name);
+    try { store.sweepDeletedHistory(); }
+    catch (error) { console.warn(`[vault] deleted history sweep failed for ${name}:`, error); }
   }
   return store;
 }

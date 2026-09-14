@@ -184,7 +184,7 @@ function requireNoteReference(value: unknown): string {
  * match required. Same [[wikilink]] semantics as `resolveWikilink`; exact
  * id/path always wins first.
  */
-function resolveNote(db: Database, idOrPath: string): Note | null {
+export function resolveNote(db: Database, idOrPath: string): Note | null {
   // Try ID match first (fast, indexed)
   const byId = noteOps.getNote(db, idOrPath);
   if (byId) return byId;
@@ -691,6 +691,24 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // query work. Null when neither param is present — response shape
         // stays byte-identical to the no-pagination behavior.
         const contentRange = parseContentRange(params.content_offset, params.content_length);
+
+        if (params.versions) {
+          for (const key of ["search", "near", "cursor", "aggregate", "semantic", "id"] as const) {
+            if (params[key] !== undefined) throw new QueryError(`versions is incompatible with ${key}`, "INVALID_QUERY", {
+              error_type: "invalid_query", field: "versions", hint: `drop ${key} when using versions`,
+            });
+          }
+          const v = params.versions as { note_id: string; version_ix?: number; limit?: number; offset?: number };
+          const note = requireNote(db, requireNoteReference(v.note_id));
+          if (typeof v.version_ix === "number") {
+            const version = await store.getNoteVersion(note.id, v.version_ix);
+            if (!version) return { error: `Version not found: "${v.note_id}"@${v.version_ix}`, error_type: "not_found", id: v.note_id, version_ix: v.version_ix };
+            return version;
+          }
+          const versions = await store.listNoteVersions(note.id, { limit: Math.max(0, Math.min(v.limit ?? 50, 200)), offset: v.offset ?? 0 });
+          const total = (db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(note.id) as { n: number }).n;
+          return { versions, total };
+        }
 
         // --- Single note by ID/path ---
         if (params.id) {
@@ -2280,7 +2298,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       name: "delete-note",
       execute: async (params) => {
         const note = requireNote(db, requireNoteReference(params.id));
-        await store.deleteNote(note.id);
+        await store.deleteNote(note.id, { actor: writeActor, via: writeVia });
         return { deleted: true, id: note.id };
       },
     },
@@ -2494,7 +2512,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             field: "new_name",
           });
         }
-        const result = await store.renameTag(oldName, newName);
+        const result = await store.renameTag(oldName, newName, { actor: writeActor ?? undefined, via: writeVia ?? undefined });
         if ("error" in result) {
           if (result.error === "not_found") {
             throw structuredError(`rename-tag: tag "${oldName}" not found`, {

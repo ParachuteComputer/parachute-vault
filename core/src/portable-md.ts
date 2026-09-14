@@ -1961,7 +1961,7 @@ async function importVaultReplay(
       const batch = await store.queryNotes({ sort: "asc", limit: EXPORT_BATCH_SIZE });
       if (batch.length === 0) break;
       for (const note of batch) {
-        await store.deleteNote(note.id);
+        await store.deleteNote(note.id, { captureHistory: false });
         stats.notes_wiped++;
       }
     }

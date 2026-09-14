@@ -5,9 +5,9 @@
  * tools operate on that vault and vault-info picks up its config directly.
  */
 
-import { generateMcpTools } from "../core/src/mcp.ts";
+import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
-import { getNoteTags, getVaultMap } from "../core/src/notes.ts";
+import { getNote, getNoteTags, getVaultMap } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
 import {
@@ -565,6 +565,16 @@ function applyTagScopeWrappers(
         );
       }
       return result;
+    }
+    if (result && typeof result === "object" && (
+      ("versions" in result && Array.isArray((result as any).versions) && "total" in result)
+      || ("version_ix" in result && "content" in result)
+      || ("version_ix" in result && "error" in result)
+    )) {
+      const id = (params as any).versions.note_id;
+      const note = resolveNote(store.db, id);
+      return note && noteWithinTagScope(note, allowed, rawTags)
+        ? result : { error: "Note not found", error_type: "not_found", id };
     }
     // Possible response shapes (vault#550 added the `warnings` variants):
     //   - Array (legacy list, no cursor, no warnings)
