@@ -659,6 +659,10 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         const requestedHasBroken = params.has_broken_links as boolean | undefined;
         const sqlHasBroken = sqlHasBrokenLinks(requestedHasBroken, Boolean(ambiguityVisible));
 
+        // vault#714: degree and presence use the same visible-edge count.
+        const requestedHasLinks = params.has_links as boolean | undefined;
+        const sqlLinks = linkOps.sqlHasLinks(requestedHasLinks, Boolean(ambiguityVisible));
+
         // --- Link expansion config (shared across single + list paths) ---
         const expandLinks = params.expand_links === true;
         const expandMode = (params.expand_mode as ExpandMode) ?? "full";
@@ -742,7 +746,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // links/attachments above; filterMetadata only touches `metadata`.
           if (params.include_link_count) {
             const dir = normalizeLinkCountDirection(params.link_count_direction);
-            result.linkCount = linkOps.getLinkCounts(db, [note.id], dir).get(note.id) ?? 0;
+            result.linkCount = linkOps.getLinkCounts(db, [note.id], dir, ambiguityVisible).get(note.id) ?? 0;
           }
           return result;
         }
@@ -877,7 +881,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             expand,
             excludeTags: aggExcludeTags,
             hasTags: params.has_tags as boolean | undefined,
-            hasLinks: params.has_links as boolean | undefined,
+            hasLinks: sqlLinks,
             hasBrokenLinks: sqlHasBroken,
             hasAmbiguousLinks: sqlHasAmbiguous,
             path: params.path as string | undefined,
@@ -911,15 +915,20 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // reader's own view of each row before aggregating.
           // vault#239: the `has_broken_links` rollup is the same oracle for
           // the same reason — re-decide brokenness on the sub-vault too.
-          const aggVisibleIds = narrowByVisibleBrokenness(
+          const aggVisibleIds = linkOps.narrowByVisibleLinks(
             db,
-            narrowByVisibleAmbiguity(
+            narrowByVisibleBrokenness(
               db,
-              aggAllMatches.filter(aggregateVisibility),
-              requestedHasAmbiguous,
+              narrowByVisibleAmbiguity(
+                db,
+                aggAllMatches.filter(aggregateVisibility),
+                requestedHasAmbiguous,
+                ambiguityVisible,
+              ),
+              requestedHasBroken,
               ambiguityVisible,
             ),
-            requestedHasBroken,
+            requestedHasLinks,
             ambiguityVisible,
           ).map((n) => n.id);
           // Always run the rollup, even on an empty visible set: ungrouped
@@ -1017,7 +1026,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             expand,
             excludeTags,
             hasTags: params.has_tags as boolean | undefined,
-            hasLinks: params.has_links as boolean | undefined,
+            hasLinks: sqlLinks,
             hasBrokenLinks: sqlHasBroken,
             hasAmbiguousLinks: sqlHasAmbiguous,
             path: params.path as string | undefined,
@@ -1101,7 +1110,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               expand,
               excludeTags,
               hasTags: params.has_tags as boolean | undefined,
-              hasLinks: params.has_links as boolean | undefined,
+              hasLinks: sqlLinks,
               hasBrokenLinks: sqlHasBroken,
               hasAmbiguousLinks: sqlHasAmbiguous,
               path: params.path as string | undefined,
@@ -1171,7 +1180,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             expand,
             excludeTags,
             hasTags: params.has_tags as boolean | undefined,
-            hasLinks: params.has_links as boolean | undefined,
+            hasLinks: sqlLinks,
             hasBrokenLinks: sqlHasBroken,
             hasAmbiguousLinks: sqlHasAmbiguous,
             path: params.path as string | undefined,
@@ -1240,6 +1249,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // lifted for a scoped reader, so the real predicate is applied here
         // on that reader's own sub-vault. No-op unscoped.
         results = narrowByVisibleBrokenness(db, results, requestedHasBroken, ambiguityVisible);
+        results = linkOps.narrowByVisibleLinks(db, results, requestedHasLinks, ambiguityVisible);
 
         // --- Format output ---
         const includeContent = params.include_content === true; // default false for list
@@ -1307,7 +1317,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // survives. Don't casually swap the order.
         if (params.include_link_count) {
           const dir = normalizeLinkCountDirection(params.link_count_direction);
-          const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), dir);
+          const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), dir, ambiguityVisible);
           for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
         }
 

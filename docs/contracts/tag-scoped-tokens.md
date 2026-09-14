@@ -139,6 +139,22 @@ Composition falls out of that single rule, with no special cases: `tag=X` return
 
 > **Behavior change for scoped clients.** A tag-scoped token can no longer query by a shared "channel" tag outside its allowlist and receive its own in-scope notes back. That pattern was the oracle. It is also already unusable in practice post-#568: such a tag is absent from the token's `list-tags`, `vault-info`, and from the `.tags` of every note it can read — so from inside the scope the tag does not exist, and querying it now agrees.
 
+**Resolved link edges are a subset of the global graph** (vault#714 PR1).
+An edge counts or satisfies `has_links` only when both endpoints are visible,
+for inbound, outbound, and both directions; a visible self-loop has degree 2.
+A content wikilink with no visible resolution is broken even when its persisted
+edge resolves to a hidden note. Its target comes from the source's own brackets.
+Resolved structured links are suppressed but not named as broken: their original
+caller string is no longer stored. Both `has_links` polarities are narrowed after
+pagination, so a scoped page can be shorter than `limit` while more matches
+remain, and the filter is absent from a scoped cursor's query hash.
+
+Known deviations: `order_by: link_count` still uses global degree and may disagree
+with the scoped `linkCount` field. PR1 does not synthesize edges: deleting a hidden
+competing candidate can still make an edge appear (direction 1, deferred to PR2).
+A stale hidden-target edge with a visible same-named candidate is suppressed but
+is not broken. Unscoped SQL and responses remain unchanged.
+
 **Tag string is the authority.** A note's `note_tags` rows are what the auth check evaluates against. The `tags` row carries the schema (description, fields, relationships, parent_names) but doesn't gate the auth check directly. A tag string `#health/food` on a note participates in scope evaluation regardless of whether `health/food` has a `tags.parent_names` entry pointing at `health` (the string-form `/`-prefix hierarchy is sufficient — see §Storage details mechanism 2).
 
 ## Lifecycle
@@ -194,7 +210,6 @@ The following extensions are explicitly deferred. Each is sound; none block Phas
 | **Scope by metadata** | Token carries metadata-conditions (e.g., `source: "prism"`). Composes with tag-scope. Filed as `parachute-patterns#25`. | Phase 2+ of the agents-as-channels arc. |
 | **Time-bounded per-tag scope** | `scoped_tags: [{tag: "health", until: "2026-12-31"}]` — different tags have different lifetimes. | When token-level expiry isn't enough granularity. |
 | **Path / folder / name split** | Disentangle the three roles `path` currently plays (storage location, wikilink target, hierarchy hint). Filed as [`vault#238`](https://github.com/ParachuteComputer/parachute-vault/issues/238). | Design exploration — touches more than tag-scope; will resurface when surface-direction or richer ACLs need it. |
-| **Wikilinks + tag-scope interaction** | When a scoped token traverses a wikilink to an out-of-scope target, today's behavior is silent filtering (the link appears unresolved). Filed as [`vault#239`](https://github.com/ParachuteComputer/parachute-vault/issues/239). | When a real workflow surfaces friction with partial-graph reads. |
 
 ## Adoption
 

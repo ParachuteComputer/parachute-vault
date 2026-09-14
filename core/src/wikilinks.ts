@@ -492,6 +492,42 @@ export function listZeroVisibleAmbiguousAsUnresolved(
   return out;
 }
 
+/**
+ * Resolved-to-invisible content wikilinks, shaped for the scoped unresolved
+ * listing (vault#714). Bounded and non-exhaustive: scan at most 2000 edges,
+ * fetch content only for sources with a hidden target, and stop at limit.
+ * Structured links cannot recover their original caller string from links;
+ * never disclose the hidden target's stored path as a replacement.
+ */
+export function listResolvedToInvisibleAsUnresolved(
+  db: Database,
+  visible: (noteId: string) => boolean,
+  limit = 50,
+): UnresolvedWikilink[] {
+  if (limit <= 0) return [];
+  const rows = db.prepare(
+    "SELECT source_id, target_id, relationship FROM links ORDER BY source_id, target_id LIMIT ?",
+  ).all(Math.min(2000, Math.max(200, limit * 20))) as { source_id: string; target_id: string; relationship: string }[];
+  const sources = new Set<string>();
+  const out: UnresolvedWikilink[] = [];
+  for (const row of rows) {
+    if (visible(row.target_id) || sources.has(row.source_id)) continue;
+    sources.add(row.source_id);
+    const note = db.prepare("SELECT path, content FROM notes WHERE id = ?").get(row.source_id) as { path: string | null; content: string } | null;
+    if (!note) continue;
+    const seen = new Set<string>();
+    for (const { target } of parseWikilinks(note.content)) {
+      if (visibleResolutionCount(db, target, WIKILINK_REL, visible) > 0) continue;
+      const key = target.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ source_id: row.source_id, source_path: note.path ?? undefined, target_path: target, relationship: WIKILINK_REL });
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
 /** One note's dangling outbound link, as surfaced on a note read (vault#555). */
 export interface BrokenLink {
   target: string;
@@ -522,7 +558,10 @@ export interface BrokenLink {
  *
  * Cost: one extra query plus one re-resolution per ambiguous row, and only
  * for scoped readers — the same profile the ambiguity surface accepts, on a
- * table that is rare by nature. An unscoped reader does no extra work.
+ * table that is rare by nature. Scoped reads also scan outbound edges for
+ * the requested page, fetching content only for sources with hidden targets
+ * and re-resolving their own bracket text (vault#714). An unscoped reader
+ * does no extra work.
  */
 export function getUnresolvedLinksForNotes(
   db: Database,
@@ -572,6 +611,34 @@ export function getUnresolvedLinksForNotes(
       if (seen.has(key)) continue;
       seen.add(key);
       result.get(row.source_id)?.push({ target: row.target_path, relationship });
+    }
+
+    // vault#714: the persisted edge may resolve only to a hidden note.
+    // Reparse the source's own brackets, never the hidden target's path.
+    const hiddenTargetSources = new Set<string>();
+    for (const chunk of chunkForInClause(noteIds)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const links = db.prepare(
+        `SELECT source_id, target_id FROM links WHERE source_id IN (${placeholders})`,
+      ).all(...chunk) as { source_id: string; target_id: string }[];
+      for (const link of links) {
+        if (!visible(link.target_id)) hiddenTargetSources.add(link.source_id);
+      }
+    }
+    for (const chunk of chunkForInClause([...hiddenTargetSources])) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const notes = db.prepare(
+        `SELECT id, content FROM notes WHERE id IN (${placeholders})`,
+      ).all(...chunk) as { id: string; content: string }[];
+      for (const note of notes) {
+        for (const { target } of parseWikilinks(note.content)) {
+          if (visibleResolutionCount(db, target, WIKILINK_REL, visible) > 0) continue;
+          const key = `${note.id}\u0000${WIKILINK_REL}\u0000${target.toLowerCase()}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          result.get(note.id)?.push({ target, relationship: WIKILINK_REL });
+        }
+      }
     }
   }
   return result;

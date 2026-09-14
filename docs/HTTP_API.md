@@ -62,6 +62,30 @@ That's the whole happy path. Everything else in this doc is detail.
   and context fields (`path`, `note_id`, `current_updated_at`, …).
 - **CORS**: every endpoint sends `Access-Control-Allow-Origin: *` so static
   sites on any origin can call the API. Writes still require a valid token.
+- **Two doors, one doc.** This file is the shared HTTP contract. Self-hosted
+  (bun, `parachute-vault`) and hosted (cloud, `parachute-cloud`) do not yet
+  parse the same query/write params. The table below is the lag list: a
+  param is "honored" only when that door's parser reads it. A cloud client
+  following this doc without checking the table will hit a silent drop or a
+  400. Precedent for door qualification is the "Wave 1, bun-only" line on
+  attachment tickets below. **Every cloud parity PR that lands or removes a
+  param from this list updates this table.**
+
+| Param | Self-hosted (bun) | Hosted (cloud) | Note |
+|---|---|---|---|
+| `has_broken_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
+| `has_ambiguous_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
+| `include_broken_links` | honored | honored | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7) |
+| `include_ambiguous_links` | honored | honored | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7) |
+| `exclude_path_prefix` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
+| repeated `?tag=a&tag=b` (also `exclude_tag`, `exclude_path_prefix`) | accumulates (`getAll` + comma-list) | accumulates (`getAll` + comma-list) | vault#659 on bun; [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
+| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | honored; same four exclusions as bun (`search`, `semantic`, `cursor`, `near` → 400 `invalid_query`) | [cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291) (B2) |
+| `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | honored (`error`/`ignore`/`update`/`replace`); `existed` returned only in the three engaged modes | [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
+| `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | honored — `{created, ids, failed}`; `created` excludes collision hits, `failed` is always `[]` | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7), [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
+| `search_mode` | honored (`literal`/`advanced`) | 200 + `unsupported_param` warning | cloud v1 is literal-only |
+| `sort` under `?search=` | honored | 200 + `unsupported_param` warning | cloud v1 always ranks by relevance |
+| `{idOrPath}` note addressing (H1-title fallback) | honored | honored — every REST note address, incl. `find-path`'s `source`/`target` | [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9) |
+| `unresolved_link` / `ambiguous_link` write warnings (POST/PATCH `/notes`) | honored — in the response body as `warnings` | honored — in the response body as `warnings`, never the `X-Parachute-Warnings` header | [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9); a `links.remove` miss never queues on either door |
 
 ## Authentication
 
@@ -845,6 +869,11 @@ Query params:
     `ambiguous_links: [{target, relationship, candidate_count}]` field, `[]`
     when none (vault#581). Same one-batched-query-per-page shape as
     `include_broken_links`.
+  - `include_link_count=true` — add `linkCount`, the inbound + outbound
+    edge-row count (a self-loop counts as 2), without hydrating link objects.
+    `link_count_direction=both|outbound|inbound` selects the counted direction
+    (default `both`). For tag-scoped tokens, an edge counts only when both
+    endpoints are visible, in all three directions. Unscoped counts are unchanged.
   - `include_attachments=true` — fold each note's attachments into the
     result rows.
   - `include_metadata=...` — comma-separated allowlist of metadata keys;
@@ -868,7 +897,14 @@ Query params:
   - `exclude_tag=foo` — exclude notes carrying this tag. Comma-list form
     (`exclude_tag=foo,bar`) and repeated params (`exclude_tag=foo&exclude_tag=bar`)
     both accumulate.
-  - `has_tags=true|false`, `has_links=true|false`.
+  - `has_tags=true|false`.
+  - `has_links=true|false` — presence of an inbound or outbound link. For a
+    tag-scoped token, both endpoints must be visible: `true` selects notes
+    with at least one such edge, `false` selects notes with none. Both
+    polarities are decided after the page is drawn, so a scoped page can
+    come back shorter than `limit` while more results remain. The filter
+    does not participate in a scoped cursor's query hash. Unscoped behavior
+    is unchanged.
   - `has_broken_links=true|false` — presence filter on dangling outbound
     links (vault#555): `true` returns only notes with at least one
     unresolved `[[wikilink]]` or structured `links` target; `false` returns
@@ -881,8 +917,12 @@ Query params:
     **Tag-scoped tokens** get the answer computed on the notes they can see
     (vault#239): a target whose candidates are ALL outside the token's scope
     matches nothing in that token's sub-vault, so it counts as broken for it
-    even though the vault-wide record calls it ambiguous. Without that, the
-    note would only become "broken" once the last invisible candidate was
+    even though the vault-wide record calls it ambiguous or its content wikilink
+    resolves to an invisible note (vault#714). Resolved structured links to
+    invisible notes are suppressed from degree/presence/links but are not
+    named in `broken_links`: storage retains only the target id, not the
+    original caller string, and the hidden target's path must not be disclosed.
+    Without that, the note would only become "broken" once the last invisible candidate was
     deleted — an oracle for a naming collision the token cannot see. Both
     polarities are decided after the page is drawn (the filter is not pushed
     into SQL for a scoped token), so a scoped page can come back shorter than
@@ -1153,16 +1193,14 @@ Query params:
     `400 invalid_query` (`field: "aggregate"`). Bun REST used to silently
     ignore `aggregate[...]` under `search=` and return note rows; the bun
     door now rejects.
-  - **Cloud-door coverage (vault#626).** Cloud's **MCP** `query-notes`
-    serves `aggregate` already — that surface is core-driven, so it
-    inherits the rollup with no cloud-side code. Cloud's **REST** door has
-    no `aggregate` parser: it used to drop `aggregate[...]` silently and
-    answer with note rows, and now answers `400` with
-    `error_type: "unsupported_param"`, `field: "aggregate"` rather than
-    handing a rollup parser the wrong envelope (parachute-cloud#134 B.4).
-    The ungrouped filtered total reaches BOTH cloud surfaces when cloud
-    promotes the vault-core commit it pins in `scripts/vault-source.env` —
-    the pin currently predates the core change.
+  - **Cloud-door coverage (vault#626).** Both cloud doors serve the
+    rollup: MCP `query-notes` uses the core-driven aggregate surface, and
+    REST parses `aggregate[...]` since cloud B2
+    ([cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291)).
+    REST enforces the same four exclusions as bun: `search`, `semantic`,
+    `cursor`, and `near` combined with aggregation return
+    `400 invalid_query` (`field: "aggregate"`). The promoted vault-core
+    pin also supplies the ungrouped filtered total to both cloud surfaces.
   - **Tag-scope respected.** A tag-scoped token's rollup is computed only
     over notes it can see — exactly like a normal query — AND, under
     `group_by: "tag"`, group NAMES themselves are scrubbed to the token's
@@ -1190,8 +1228,9 @@ Query params:
     fix — this previously listed `created_at`/`updated_at` as example valid
     values; `created_at` is not a metadata field, so it still errors). Two
     special values need no `indexed: true` declaration: `link_count` sorts by
-    link DEGREE (see `include_link_count` below), and `updated_at` (vault#585)
-    sorts on the integer `updated_at_ms` mirror column — correct on
+    global link DEGREE (see `include_link_count` above), even under tag scope;
+    that ordering may disagree with the scoped `linkCount` field.
+    `updated_at` (vault#585) sorts on the integer `updated_at_ms` mirror column — correct on
     non-canonical/imported timestamps, unlike a plain TEXT sort — with `id`
     as the tiebreaker instead of `created_at`.
   - `limit=N` — default 50. Must be a non-negative integer; `limit=-1` or a
@@ -1406,6 +1445,7 @@ attachment rule as the structured-query list below.
 > note's displayed title differs from its path/basename (the same
 > resolution `find-path`'s `source`/`target`, `update-note`/`delete-note`
 > `id`, and `[[wikilink]]`/structured-`links` targets already use).
+> Identical on the self-hosted and hosted doors since [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9).
 
 Folding options:
 
@@ -2236,7 +2276,13 @@ A **tag-scoped token** sees only rows whose SOURCE note is in its scope, and
 broken in ITS sub-vault but ambiguous vault-wide — a target whose candidates
 are all out of scope (vault#239) — for the same reason `has_broken_links`
 does: otherwise the row would appear here only once the last invisible
-candidate was deleted.
+candidate was deleted. Resolved-to-invisible content wikilinks are folded
+in too (vault#714), using the source's own bracket target, never the hidden
+note's path. Resolved structured links cannot be reconstructed and are omitted.
+This fold-in is bounded and non-exhaustive: it scans at most
+`min(2000, max(200, limit * 20))` resolved edge rows in source/target order,
+stops at `limit` folded rows, and shares the final deduplicated `limit` slice
+with the unresolved and ambiguous rows. Unscoped listing is unchanged.
 
 #### `GET /vault/{name}/api/health` — `vault:read`
 Per-vault liveness ping. `{status: "ok", vault: "<name>"}`.

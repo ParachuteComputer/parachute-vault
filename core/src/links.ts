@@ -267,12 +267,16 @@ export function getLinksHydratedForNotes(
  * most two index scans regardless of page size. The IN-list is chunked to
  * stay under SQLite's bound-variable limit on very large pages.
  *
+ * With a visibility predicate, callers supply visible note ids and only rows
+ * whose other endpoint is visible count. The indexed selects return neighbour
+ * ids instead of grouped counts; absent the predicate, SQL is unchanged.
  * Returns 0 for ids with no links (every requested id is present in the map).
  */
 export function getLinkCounts(
   db: Database,
   noteIds: string[],
   direction: "both" | "outbound" | "inbound" = "both",
+  visible?: (noteId: string) => boolean,
 ): Map<string, number> {
   const counts = new Map<string, number>();
   if (noteIds.length === 0) return counts;
@@ -289,6 +293,28 @@ export function getLinkCounts(
   // (bun:sqlite tolerates 999+, DO SQLite rejects >100). See sql-in.ts.
   for (const chunk of chunkForInClause(ids)) {
     const placeholders = chunk.map(() => "?").join(", ");
+
+    // Scoped callers supply visible page-note ids. Count a row only when
+    // its other endpoint is visible too; a visible self-loop still adds 2.
+    if (visible) {
+      if (wantOutbound) {
+        const rows = db.prepare(
+          `SELECT source_id AS id, target_id AS other FROM links WHERE source_id IN (${placeholders})`,
+        ).all(...chunk) as { id: string; other: string }[];
+        for (const row of rows) {
+          if (visible(row.other)) counts.set(row.id, counts.get(row.id)! + 1);
+        }
+      }
+      if (wantInbound) {
+        const rows = db.prepare(
+          `SELECT target_id AS id, source_id AS other FROM links WHERE target_id IN (${placeholders})`,
+        ).all(...chunk) as { id: string; other: string }[];
+        for (const row of rows) {
+          if (visible(row.other)) counts.set(row.id, counts.get(row.id)! + 1);
+        }
+      }
+      continue;
+    }
 
     if (wantOutbound) {
       const rows = db.prepare(
@@ -312,6 +338,23 @@ export function getLinkCounts(
   }
 
   return counts;
+}
+
+/** Lift both has_links polarities from SQL under scope (vault#714). */
+export function sqlHasLinks(wanted: boolean | undefined, scoped: boolean): boolean | undefined {
+  return scoped ? undefined : wanted;
+}
+
+/** Presence and degree share one oracle; narrowing can shorten a scoped page. */
+export function narrowByVisibleLinks<T extends { id: string }>(
+  db: Database,
+  notes: T[],
+  wanted: boolean | undefined,
+  visible: ((noteId: string) => boolean) | undefined,
+): T[] {
+  if (wanted === undefined || !visible || notes.length === 0) return notes;
+  const counts = getLinkCounts(db, notes.map((n) => n.id), "both", visible);
+  return notes.filter((n) => (counts.get(n.id)! > 0) === wanted);
 }
 
 // ---- Deeper Link Queries ----

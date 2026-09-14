@@ -4,7 +4,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, rmSync, existsSync, writeFileSync } from "fs";
+import { mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
@@ -34,6 +34,138 @@ afterEach(() => {
   db.close();
   rmSync(tmpDir, { recursive: true, force: true });
 });
+
+
+// vault#714: one deterministic fixture through the real scoped MCP wrapper and
+// REST handlers. The unscoped JSON fixture was captured on 20d0f6f before fixes.
+async function edgeSuppressionFixture(door: "MCP" | "REST", name: string, scoped = true, shape = "F1", semantic = false) {
+  const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+  const { writeVaultConfig } = await import("./config.ts");
+  const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+  const vaultName = `tagscope-edge-${name.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
+  let fixtureStore = store;
+  if (door === "MCP") {
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: "2026-01-01T00:00:00.000Z" });
+    fixtureStore = getVaultStore(vaultName);
+  }
+  const note = (id: string, path: string, content: string, tag: string) =>
+    fixtureStore.createNote(content, { id, path, tags: [tag], created_at: "2026-01-01T00:00:00.000Z" });
+  const hidden = await note("hidden-dup", "p1/Dup", "personal dup", "personal");
+  if (shape === "F1") {
+    const competing = await note("visible-dup", "wdup/Dup", "work dup", "work");
+    await note("work-src", "work-src", "src [[Dup]]", "work");
+    await fixtureStore.deleteNote(competing.id);
+  } else {
+    await note("work-src", "work-src", "src", "work");
+    if (shape === "structured") await fixtureStore.createLink("work-src", hidden.id, "references");
+    if (shape === "F2") {
+      await note("work-tgt", "work-tgt", "target", "work");
+      await note("hidden-in", "p2/In", "see [[work-tgt]]", "personal");
+    }
+    if (shape === "F3") {
+      await note("work-tgt", "work-tgt", "target", "work");
+      await note("hidden-mid", "p3/Mid", "mid", "personal");
+      await fixtureStore.createLink("work-src", "hidden-mid", "references");
+      await fixtureStore.createLink("hidden-mid", "work-tgt", "references");
+    }
+  }
+  if (semantic) {
+    // Exercise the real semantic engine with deterministic local vectors.
+    fixtureStore = new BunStore(fixtureStore.db, { embeddingProvider: {
+      name: "mock", model: "vault-714-test", dims: 4,
+      available: async () => ({ ok: true }),
+      embed: async (input) => ({ vectors: input.texts.map(() => new Float32Array([1, 0, 0, 0])), model: "vault-714-test", dims: 4 }),
+    } });
+    const { encodeVector } = await import("../core/src/embedding/vector-codec.ts");
+    for (const n of await fixtureStore.queryNotes({})) {
+      fixtureStore.db.prepare("INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, 0, ?, 4, ?, ?, ?)")
+        .run(n.id, encodeVector(new Float32Array([1, 0, 0, 0])), "vault-714-test", "hash", "2026-01-01T00:00:00.000Z");
+    }
+  }
+  fixtureStore.db.prepare("UPDATE notes SET updated_at = created_at").run();
+  fixtureStore.db.prepare("UPDATE links SET created_at = ?").run("2026-01-01T00:00:00.000Z");
+  const authForTags = (tags: string[]) => ({
+    scopes: ["vault:read", "vault:write", "vault:admin"], legacyDerived: false, scoped_tags: tags,
+  });
+  const tools = door === "MCP" ? generateScopedMcpTools(vaultName, scoped ? authForTags(["work"]) as any : undefined) : [];
+  const scope: TagScopeCtx = scoped
+    ? { allowed: await expandTokenTagScope(fixtureStore, ["work"]), raw: ["work"] }
+    : { allowed: null, raw: null };
+  const restQuery = (params: Record<string, any>) => {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (typeof value === "object") {
+        for (const [k, v] of Object.entries(value)) search.set(`${key}[${k}]`, String(v));
+      } else search.set(key, String(value));
+    }
+    return handleNotes(mkReq("GET", `/notes?${search}`), fixtureStore, "", "v", scope);
+  };
+  const query = async (params: Record<string, any>): Promise<any> => door === "MCP"
+    ? tools.find((t) => t.name === "query-notes")!.execute(params)
+    : (await restQuery(params)).json();
+  const find = async (target: string): Promise<any> => door === "MCP"
+    ? tools.find((t) => t.name === "find-path")!.execute({ source: "work-src", target })
+    : (await handleFindPath(mkReq("GET", `/find-path?source=work-src&target=${encodeURIComponent(target)}`), fixtureStore, scope)).json();
+  const unresolved = async (): Promise<any> => handleUnresolvedWikilinks(mkReq("GET", "/unresolved-wikilinks"), fixtureStore, scope).json();
+  const leak = (resp: unknown) => {
+    const json = JSON.stringify(resp);
+    for (const secret of [hidden.id, "p1/Dup", "hidden-mid", "p3/Mid", "hidden-in", "p2/In"]) expect(json).not.toContain(secret);
+  };
+  return { door, query, find, unresolved, leak, hidden, store: fixtureStore, scope, close: closeAllStores };
+}
+
+type EdgeFixture = Awaited<ReturnType<typeof edgeSuppressionFixture>>;
+const edgeScopedPins: { name: string; shape?: string; run: (f: EdgeFixture) => Promise<void> }[] = [
+  { name: "both degree suppresses hidden outbound", run: async (f) => {
+    const r = await f.query({ id: "work-src", include_link_count: true }); f.leak(r); expect(r.linkCount).toBe(0);
+    const list = await f.query({ include_link_count: true }); f.leak(list); expect(list[0].linkCount).toBe(0);
+  } },
+  { name: "outbound degree suppresses hidden target", run: async (f) => {
+    const r = await f.query({ id: "work-src", include_link_count: true, link_count_direction: "outbound" }); f.leak(r); expect(r.linkCount).toBe(0);
+  } },
+  { name: "inbound degree suppresses hidden source", shape: "F2", run: async (f) => {
+    const r = await f.query({ id: "work-tgt", include_link_count: true, link_count_direction: "inbound" }); f.leak(r); expect(r.linkCount).toBe(0);
+  } },
+  { name: "has_links true excludes hidden-only edge", run: async (f) => {
+    const r = await f.query({ has_links: true }); f.leak(r); expect(r.map((n: any) => n.id)).not.toContain("work-src");
+  } },
+  { name: "has_links false includes hidden-only edge", run: async (f) => {
+    const r = await f.query({ has_links: false }); f.leak(r); expect(r.map((n: any) => n.id)).toContain("work-src");
+  } },
+  { name: "has_links aggregate counts visible edges", run: async (f) => {
+    const r = await f.query({ has_links: true, aggregate: { op: "count" } }); f.leak(r); expect(r).toEqual([{ group: null, value: 0 }]);
+  } },
+  { name: "content link to hidden target is broken", run: async (f) => {
+    const r = await f.query({ id: "work-src", include_broken_links: true }); f.leak(r); expect(r.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    // A visible same-named candidate prevents brokenness, but PR1 must not
+    // synthesize an edge to it. Force the stale resolved-row state explicitly.
+    await f.store.createNote("visible dup", { id: "visible-dup", path: "wdup/Dup", tags: ["work"] });
+    f.store.db.prepare("DELETE FROM links WHERE source_id = ?").run("work-src");
+    await f.store.createLink("work-src", f.hidden.id, "wikilink");
+    const stale = await f.query({ id: "work-src", include_broken_links: true, include_link_count: true, include_links: true });
+    f.leak(stale); expect(stale.broken_links).toEqual([]); expect(stale.linkCount).toBe(0); expect(stale.links).toEqual([]);
+  } },
+  { name: "has_broken_links true includes hidden target", run: async (f) => {
+    const r = await f.query({ has_broken_links: true }); f.leak(r); expect(r.map((n: any) => n.id)).toContain("work-src");
+  } },
+  { name: "has_broken_links false excludes hidden target", run: async (f) => {
+    const r = await f.query({ has_broken_links: false }); f.leak(r); expect(r.map((n: any) => n.id)).not.toContain("work-src");
+  } },
+  { name: "structured hidden edge suppressed without naming it broken", shape: "structured", run: async (f) => {
+    const r = await f.query({ id: "work-src", include_link_count: true, include_broken_links: true, include_links: true }); f.leak(r);
+    expect(r.broken_links).toEqual([]); expect(r.links).toEqual([]); expect(r.linkCount).toBe(0);
+    expect(await f.query({ has_links: true })).toEqual([]);
+    expect((await f.query({ has_links: false })).map((n: any) => n.id)).toContain("work-src");
+  } },
+  { name: "confirming include_links and near stay walled", run: async (f) => {
+    const r = await f.query({ id: "work-src", include_links: true }); f.leak(r); expect(r.links).toEqual([]);
+    const near = await f.query({ near: { note_id: "work-src", depth: 1 } }); f.leak(near);
+    if (f.door === "MCP") { const path = await f.find("p1/Dup"); f.leak(path); expect(path).toBeNull(); }
+  } },
+  { name: "confirming hidden intermediate path stays null", shape: "F3", run: async (f) => {
+    const r = await f.find("work-tgt"); f.leak(r); expect(r).toBeNull();
+  } },
+];
 
 describe("BunStore", async () => {
   test("creates and retrieves a note", async () => {
@@ -1174,6 +1306,13 @@ describe("scoped MCP wrapper", async () => {
   // unscoped path (auth.scoped_tags === null) remains identical to the
   // baseline scoped MCP tests above; here we only assert the *scoped*
   // path's deltas.
+
+  for (const pin of edgeScopedPins) {
+    test(`vault#714 MCP: ${pin.name}`, async () => {
+      const f = await edgeSuppressionFixture("MCP", `MCP-${pin.name}`, true, pin.shape);
+      try { await pin.run(f); } finally { f.close(); }
+    });
+  }
 
   function authForTags(tags: string[]) {
     return {
@@ -4903,6 +5042,71 @@ describe("REST transport hardening — malformed/wrong-shape/oversize JSON bodie
 // security assertion MUST fail without the fix.
 // ---------------------------------------------------------------------------
 describe("HTTP tag-scope confidentiality (security review)", async () => {
+  for (const pin of edgeScopedPins) {
+    test(`vault#714 REST: ${pin.name}`, async () => {
+      const f = await edgeSuppressionFixture("REST", `REST-${pin.name}`, true, pin.shape);
+      try { await pin.run(f); } finally { f.close(); }
+    });
+  }
+
+  test("vault#714 REST: resolved hidden wikilink appears in unresolved listing", async () => {
+    const f = await edgeSuppressionFixture("REST", "unresolved");
+    try {
+      const r = await f.unresolved(); f.leak(r);
+      expect(r.unresolved).toEqual([{ source_id: "work-src", source_path: "work-src", target_path: "Dup", relationship: "wikilink" }]);
+      expect(r.count).toBe(1);
+    } finally { f.close(); }
+  });
+  test("vault#714 REST: confirming graph and hidden endpoint not-found identity", async () => {
+    const f = await edgeSuppressionFixture("REST", "graph-endpoint");
+    try {
+      const graph = await f.query({ format: "graph", include_links: true }); f.leak(graph); expect(graph.edges).toEqual([]);
+      // Same caller string before/after deletion, so the entire body must match.
+      const req = () => mkReq("GET", "/find-path?source=work-src&target=Dup");
+      const hidden = await handleFindPath(req(), f.store, f.scope);
+      expect(hidden.status).toBe(404);
+      const before = await hidden.text(); f.leak(JSON.parse(before));
+      expect(JSON.parse(before)).toEqual({ error: 'Note not found: "Dup"', error_type: "not_found", note_id: "Dup" });
+      await f.store.deleteNote(f.hidden.id);
+      const absent = await handleFindPath(req(), f.store, f.scope);
+      expect(absent.status).toBe(404); expect(await absent.text()).toBe(before);
+    } finally { f.close(); }
+  });
+
+  for (const semantic of [false, true]) {
+    for (const wanted of [false, true]) {
+      test(`vault#714 REST: ${semantic ? "semantic" : "search"} has_links=${wanted}`, async () => {
+        const f = await edgeSuppressionFixture("REST", `search-${semantic}-${wanted}`, true, "F1", semantic);
+        try {
+          const mode = semantic ? { semantic: true, near_text: "src" } : { search: "src" };
+          const r = await f.query({ ...mode, has_links: wanted }); f.leak(r);
+          expect(r.map((n: any) => n.id)).toEqual(wanted ? [] : ["work-src"]);
+        } finally { f.close(); }
+      });
+    }
+  }
+  test("vault#714 REST: search has_ambiguous_links narrows hidden collision", async () => {
+    const f = await edgeSuppressionFixture("REST", "search-ambiguity");
+    try {
+      await f.store.createNote("work dup", { id: "visible-dup", path: "wdup/Dup", tags: ["work"] });
+      await f.store.deleteNote("work-src");
+      await f.store.createNote("src [[Dup]]", { id: "work-src", path: "work-src", tags: ["work"] });
+      const r = await f.query({ search: "src", has_ambiguous_links: true }); f.leak(r);
+      expect(r).toEqual([]);
+    } finally { f.close(); }
+  });
+  test("vault#714 REST: search has_broken_links false excludes hidden-only candidates", async () => {
+    const f = await edgeSuppressionFixture("REST", "search-broken");
+    try {
+      // Existing #712 ambiguous-to-broken behavior, independent of PR1's fold.
+      await f.store.createNote("another hidden dup", { path: "p2/Dup", tags: ["personal"] });
+      await f.store.deleteNote("work-src");
+      await f.store.createNote("src [[Dup]]", { id: "work-src", path: "work-src", tags: ["work"] });
+      const r = await f.query({ search: "src", has_broken_links: false }); f.leak(r);
+      expect(r).toEqual([]);
+    } finally { f.close(); }
+  });
+
   // Build a TagScopeCtx the same way routing.ts does, so handlers see the
   // exact shape a real tag-scoped request produces.
   async function scopeCtx(roots: string[]): Promise<TagScopeCtx> {
@@ -9159,3 +9363,41 @@ describe("handleVault: front-door structural map", async () => {
   });
 });
 
+
+
+describe("vault#714 unscoped full-response controls", () => {
+  const surfaces = ["include_links", "include_link_count", "has_links", "include_broken_links", "near", "find-path", "unresolved-wikilinks", "graph"];
+  for (const surface of surfaces) {
+    test(`vault#714 UNSCOPED: ${surface}`, async () => {
+      const actual: Record<string, unknown> = {};
+      for (const door of ["MCP", "REST"] as const) {
+        if (door === "MCP" && ["unresolved-wikilinks", "graph"].includes(surface)) continue;
+        const f = await edgeSuppressionFixture(door, `control-${surface}`, false);
+        try {
+          if (surface === "find-path") actual[door] = await f.find("p1/Dup");
+          else if (surface === "unresolved-wikilinks") actual[door] = await f.unresolved();
+          else if (surface === "graph") actual[door] = await f.query({ format: "graph", include_links: true });
+          else if (surface === "near") actual[door] = await f.query({ near: { note_id: "work-src", depth: 1 } });
+          else if (surface === "has_links") actual[door] = await Promise.all([
+            f.query({ has_links: true }), f.query({ has_links: false }),
+            f.query({ has_links: true, aggregate: { op: "count" } }),
+          ]);
+          else if (surface === "include_broken_links") actual[door] = await Promise.all([
+            f.query({ id: "work-src", include_broken_links: true }),
+            f.query({ has_broken_links: true }), f.query({ has_broken_links: false }),
+          ]);
+          else if (surface === "include_link_count") actual[door] = await Promise.all(
+            ["both", "outbound", "inbound"].flatMap((direction) => [
+              f.query({ id: "work-src", include_link_count: true, link_count_direction: direction }),
+              f.query({ include_link_count: true, link_count_direction: direction }),
+            ]),
+          );
+          else actual[door] = await f.query({ id: "work-src", include_links: true });
+        } finally { f.close(); }
+      }
+      const fixture = new URL(`./test-support/vault-714-${surface}.json`, import.meta.url);
+      // Full JSON captured on unmodified production base 20d0f6f (Step 0).
+      expect(JSON.parse(JSON.stringify(actual))).toEqual(JSON.parse(readFileSync(fixture, "utf8")));
+    });
+  }
+});
