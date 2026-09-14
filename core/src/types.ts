@@ -1,4 +1,3 @@
-import type { HistoryOp, VersionRow } from "./history.js";
 import type { Database } from "bun:sqlite";
 import type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 import type { PrunedField } from "./indexed-fields.js";
@@ -8,6 +7,7 @@ import type { ValidationStatus } from "./schema-defaults.js";
 import type { ConformanceReport } from "./conformance.js";
 import type { FindPathResult } from "./links.js";
 import type { DoctorReport, DoctorScanOpts } from "./doctor.js";
+import type { HistoryOp, VersionRow } from "./history.js";
 
 // ---- Re-exports ----
 

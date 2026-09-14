@@ -1,4 +1,3 @@
-import { historyTablesPresent, deletedHistoryStats } from "./history.js";
 /**
  * `vault doctor` — read-only taxonomy/metadata integrity scan (vault#552).
  *
@@ -48,6 +47,7 @@ import { historyTablesPresent, deletedHistoryStats } from "./history.js";
  * out-of-scope activity.
  */
 
+import { historyTablesPresent, deletedHistoryStats } from "./history.js";
 import { Database } from "bun:sqlite";
 import { loadTagHierarchy, findHierarchyCycles } from "./tag-hierarchy.js";
 import { listIndexedFields } from "./indexed-fields.js";

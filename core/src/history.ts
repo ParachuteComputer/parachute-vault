@@ -41,7 +41,10 @@ export function resolveHistoryPolicy(
 ): HistoryPolicy {
   const p = { ...DEFAULT_HISTORY_POLICY, ...partial };
   // The floor is the retention promise: clamp the ceiling up, never down.
-  p.max_versions = Math.max(p.max_versions, p.min_versions);
+  p.max_versions = Math.max(1, p.max_versions, p.min_versions);
+  p.max_age_days = Math.min(p.max_age_days, 36500);
+  if (p.deleted_retention_days !== null)
+    p.deleted_retention_days = Math.min(p.deleted_retention_days, 36500);
   return p;
 }
 export const VERSION_MAX_BYTES = 2_000_000;

@@ -1,4 +1,3 @@
-import { captureVersion, readPriorNoteRow, DEFAULT_HISTORY_POLICY, type HistoryPolicy } from "./history.js";
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats, VaultMap, AggregateSpec, AggregateRow, SemanticSearchResult } from "./types.js";
 import { decodeVector, dot } from "./embedding/vector-codec.js";
@@ -32,6 +31,7 @@ import {
   type SearchMode,
 } from "./search-query.js";
 import { generateUlid } from "./ulid.js";
+import { captureVersion, readPriorNoteRow, DEFAULT_HISTORY_POLICY, type HistoryPolicy } from "./history.js";
 
 /**
  * Write-attribution context (vault#298) — the two axes of provenance threaded

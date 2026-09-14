@@ -1491,7 +1491,7 @@ Versions are **not** full-text searchable.
   (`vault:read`) returns one version with its content; missing versions are 404.
 - `POST /vault/{name}/api/notes/{idOrPath}/restore` (`vault:write`)
   accepts `{version_ix, if_updated_at?}` and returns the note with
-  `restored_from` and `recreated`. A stale token is 409 `conflict`.
+  `restored_from`, `recreated`, and `created` (true for re-creation). A stale token is 409 `conflict`.
 - `DELETE /vault/{name}/api/notes/{idOrPath}/versions` is **`vault:admin`
   and irreversible**. It returns `{erased:true, id, versions_deleted,
   blobs_deleted}` without deleting a live note.
@@ -1511,7 +1511,12 @@ note nor history. The existing `vault:migrate` bypass applies and is logged.
 A `version_ix` is a stable bookmark **only within a lineage** (an erase
 restarts it at 0). Deleted-note history is readable only by an unscoped REST
 session using the note's id and is **not readable over MCP at all**. Scoped
-sessions get the ordinary 404 for deleted notes.
+sessions get the ordinary 404 for deleted notes. A later tag grant exposes
+earlier versions too, just as it exposes the live note.
+
+Malformed version indices return 400 `invalid_request`; restore without
+`version_ix` returns 400 `missing_required_field`. Insufficient permission
+returns 403 `insufficient_scope`.
 
 A note over 2 MB cannot be updated while history is on (413
 `history_overflow`) but can always be deleted, leaving an overflow tombstone
@@ -1519,7 +1524,8 @@ whose content is unrecoverable. Reading that version returns `content:null`
 and `encoding:"overflow"`; restoring it is 409 `history_unrecoverable`.
 
 The defaults are enabled, a 20-version floor, a 100-version ceiling and
-180-day maximum age above the floor. Delete tombstones are exempt from this
+180-day maximum age above the floor. The ceiling is at least 1 and at least
+the floor; both age settings are capped at 36,500 days. Delete tombstones are exempt from this
 pruning. `history.deleted_retention_days: null` retains deleted-note history
 until explicit erasure; a number enables sweeping on open. A `history:`
 config change in the vault's **`vault.yaml`** takes effect at the next daemon

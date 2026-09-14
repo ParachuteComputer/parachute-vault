@@ -40,7 +40,8 @@ versions do not preserve tag membership or the link tables themselves.
 `encoding` is the seam for PR 2. Ordinary rows use NULL and reference a whole
 blob. The only non-NULL value written in v29 is `overflow`: an oversized
 note's deletion records size, metadata and existence with a NULL hash, but
-no recoverable content. Updates of prior content larger than 2,000,000 UTF-8
+no recoverable content. A restore marker copied from that tombstone retains
+`overflow` and its NULL hash, even on a recreated live note. Updates of prior content larger than 2,000,000 UTF-8
 bytes fail atomically; deletion is never blocked by that ceiling.
 
 Legacy NULL content normalizes to the empty string for hashing, so
@@ -51,7 +52,7 @@ preserve the distinction between SQL NULL and empty content.
 
 Defaults: enabled, minimum 20 versions, maximum 100, maximum age 180 days;
 the floor wins over both age and ceiling, and maximum is clamped upward to
-the minimum. Pruning never renumbers surviving indices and never removes a
+the minimum and at least 1. Both age settings are capped at 36,500 days. Pruning never renumbers surviving indices and never removes a
 delete tombstone. Repeated delete/recreate cycles therefore accumulate
 unprunable tombstones until explicit erasure or deleted-history sweeping.
 `deleted_retention_days: null` disables that sweep without even querying;

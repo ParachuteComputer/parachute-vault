@@ -5,9 +5,9 @@
  * tools operate on that vault and vault-info picks up its config directly.
  */
 
-import { generateMcpTools } from "../core/src/mcp.ts";
+import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
-import { getNote, getNoteByPath, getNoteByTitle, getNoteTags, getVaultMap } from "../core/src/notes.ts";
+import { getNote, getNoteTags, getVaultMap } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
 import {
@@ -566,12 +566,12 @@ function applyTagScopeWrappers(
       }
       return result;
     }
-    if ((params as any).versions) {
+    if (result && typeof result === "object" && (
+      ("versions" in result && Array.isArray((result as any).versions) && "total" in result)
+      || ("version_ix" in result && "content" in result)
+    )) {
       const id = (params as any).versions.note_id;
-      const explicit = typeof id === "string" ? id.match(/^(.*)\.([a-zA-Z0-9]+)$/) : null;
-      const note = getNote(store.db, id)
-        ?? (explicit ? getNoteByPath(store.db, explicit[1]!, explicit[2]!) : null)
-        ?? getNoteByPath(store.db, id) ?? getNoteByTitle(store.db, id);
+      const note = resolveNote(store.db, id);
       return note && noteWithinTagScope(note, allowed, rawTags)
         ? result : { error: "Note not found", error_type: "not_found", id };
     }

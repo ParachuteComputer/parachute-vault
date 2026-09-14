@@ -60,7 +60,7 @@ async function call(
   );
   return { status: response.status, body: (await response.json()) as any };
 }
-function query(tags: string[] | null = null) {
+function query(tags: string[] | null = null, tool = "query-notes") {
   return generateScopedMcpTools("history", {
     permission: "full",
     scopes: ["vault:history:read"],
@@ -70,7 +70,7 @@ function query(tags: string[] | null = null) {
     caller_jti: null,
     actor: "tester",
     via: "api",
-  }).find((t) => t.name === "query-notes")!.execute;
+  }).find((t) => t.name === tool)!.execute;
 }
 async function fixture() {
   const n = await store.createNote("zero", { path: "p", tags: ["journal"] });
@@ -87,6 +87,12 @@ test("P5 REST restore rejects stale optimistic tokens without capture", async ()
   });
   expect(r.status).toBe(409);
   expect(r.body.error_type).toBe("conflict");
+  const nonString = await call(n.id, "/restore", "POST", {
+    version_ix: 0,
+    if_updated_at: 12345,
+  });
+  expect(nonString.status).toBe(409);
+  expect(nonString.body.error_type).toBe("conflict");
   expect(await store.listNoteVersions(n.id)).toEqual(before);
   expect((await store.getNote(n.id))!.content).toBe("two");
 });
@@ -127,7 +133,10 @@ test("P15 REST list/get and MCP project the same ordered versions", async () => 
     rest = await call(n.id, "/versions?limit=1&offset=1");
   expect(rest.status).toBe(200);
   expect(rest.body.total).toBe(2);
-  expect((await call(n.id, "/versions?limit=0")).body).toEqual({versions: [], total: 2});
+  expect((await call(n.id, "/versions?limit=0")).body).toEqual({
+    versions: [],
+    total: 2,
+  });
   expect(rest.body.versions).toHaveLength(1);
   expect(rest.body.versions[0].version_ix).toBe(0);
   expect(rest.body.versions[0]).not.toHaveProperty("content");
@@ -135,13 +144,17 @@ test("P15 REST list/get and MCP project the same ordered versions", async () => 
     versions: { note_id: n.id, limit: 1, offset: 1 },
   });
   expect(mcp).toEqual(rest.body);
+  expect(await query()({ versions: { note_id: n.id, limit: -1 } })).toEqual({
+    versions: [],
+    total: 2,
+  });
   const one = await call(n.id, "/versions/0");
   expect(one.body.content).toBe("zero");
   expect(await query()({ versions: { note_id: n.id, version_ix: 0 } })).toEqual(
     one.body,
   );
   expect((await call(n.id, "/versions/999")).status).toBe(404);
-  for (const ix of ["-1", "1.5", "oops"])
+  for (const ix of ["-1", "1.5", "oops", "0x0"])
     expect((await call(n.id, `/versions/${ix}`)).status).toBe(400);
   expect((await call(n.id, "/restore", "POST", {})).body.error_type).toBe(
     "missing_required_field",
@@ -150,7 +163,7 @@ test("P15 REST list/get and MCP project the same ordered versions", async () => 
     (await call(n.id, "/restore", "POST", { version_ix: -1 })).status,
   ).toBe(400);
 });
-for (const mode of ["aggregate", "near", "search", "cursor", "semantic"])
+for (const mode of ["aggregate", "near", "search", "cursor", "semantic", "id"])
   test(`P15 MCP versions excludes ${mode}`, async () => {
     const n = await fixture();
     const values: Record<string, unknown> = {
@@ -159,10 +172,11 @@ for (const mode of ["aggregate", "near", "search", "cursor", "semantic"])
       search: "zero",
       cursor: "invalid",
       semantic: true,
+      id: n.id,
     };
     await expect(
       query()({ versions: { note_id: n.id }, [mode]: values[mode] }),
-    ).rejects.toMatchObject({ field: "versions" });
+    ).rejects.toMatchObject({ error_type: "invalid_query", field: "versions" });
   });
 test("P16 doctor reports deleted-history upper bounds without mutation or scoped leakage", async () => {
   const a = await store.createNote("same"),
@@ -170,9 +184,30 @@ test("P16 doctor reports deleted-history upper bounds without mutation or scoped
   await store.deleteNote(a.id);
   await store.deleteNote(b.id);
   const before = store.db
-    .prepare("SELECT * FROM note_versions ORDER BY note_id")
+    .prepare(
+      "SELECT note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, op, content_len, encoding FROM note_versions ORDER BY note_id",
+    )
     .all();
   const report = runDoctorScan(store.db);
+  expect(
+    report.findings.find((f) => f.type === "deleted_note_history"),
+  ).toMatchObject({
+    severity: "info",
+    subject: "2 deleted note(s)",
+    detail: expect.stringContaining("upper bound"),
+  });
+  const mcp: any = await query(null, "doctor")({});
+  expect(
+    mcp.findings.find((f: any) => f.type === "deleted_note_history"),
+  ).toMatchObject({
+    severity: "info",
+    subject: "2 deleted note(s)",
+    detail: expect.stringContaining("upper bound"),
+  });
+  const scopedDoctor: any = await query(["journal"], "doctor")({});
+  expect(
+    scopedDoctor.findings.some((f: any) => f.type === "deleted_note_history"),
+  ).toBe(false);
   expect(
     report.findings.filter((f) => f.type === "deleted_note_history"),
   ).toHaveLength(1);
@@ -182,7 +217,11 @@ test("P16 doctor reports deleted-history upper bounds without mutation or scoped
     }).findings.some((f) => f.type === "deleted_note_history"),
   ).toBe(false);
   expect(
-    store.db.prepare("SELECT * FROM note_versions ORDER BY note_id").all(),
+    store.db
+      .prepare(
+        "SELECT note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, op, content_len, encoding FROM note_versions ORDER BY note_id",
+      )
+      .all(),
   ).toEqual(before);
   expect(await store.deletedHistoryStats()).toMatchObject({
     notes: 2,
@@ -212,6 +251,32 @@ test("P18 MCP protects the new object result from out-of-scope disclosure", asyn
     ((await query()({ versions: { note_id: y.id, version_ix: 0 } })) as any)
       .content,
   ).toBe("Y_SECRET_SENTINEL");
+  for (const tags of [["journal"], null]) {
+    const error = await query(tags)({
+      id: y.id,
+      versions: { note_id: x.id },
+    }).catch((e) => e);
+    expect(error).toMatchObject({
+      error_type: "invalid_query",
+      field: "versions",
+      hint: "drop id when using versions",
+    });
+    expect(JSON.stringify(error)).not.toContain("Y_SECRET_SENTINEL");
+  }
+  const contentDenied: any = await query(["journal"])({
+    versions: { note_id: y.id, version_ix: 0 },
+  });
+  expect(contentDenied.error_type).toBe("not_found");
+  expect(JSON.stringify(contentDenied)).not.toContain("Y_SECRET_SENTINEL");
+  const empty = await store.createNote("EMPTY_SECRET_SENTINEL", {
+    tags: ["work"],
+  });
+  const emptyDenied: any = await query(["journal"])({
+    versions: { note_id: empty.id },
+  });
+  expect(emptyDenied.error_type).toBe("not_found");
+  expect(emptyDenied).not.toHaveProperty("versions");
+  expect(JSON.stringify(emptyDenied)).not.toContain("EMPTY_SECRET_SENTINEL");
   await store.deleteNote(y.id);
   for (const tags of [["journal"], null])
     await expect(
@@ -402,7 +467,7 @@ test("P7e/P15 full routing requires admin for irreversible erasure", async () =>
   try {
     const n = await fixture();
     await store.deleteNote(n.id);
-    const request = async (verb: string, tagRename = false) => {
+    const request = async (verb: string, tagRename = false, doctor = false) => {
       const token = await new SignJWT({
         scope: `vault:history:${verb}`,
         client_id: "history-test",
@@ -415,12 +480,14 @@ test("P7e/P15 full routing requires admin for irreversible erasure", async () =>
         .setExpirationTime("1m")
         .setJti(`history-${verb}`)
         .sign(privateKey);
-      const path = tagRename
-        ? "/vault/history/api/tags/old/rename"
-        : `/vault/history/api/notes/${n.id}/versions`;
+      const path = doctor
+        ? "/vault/history/api/doctor"
+        : tagRename
+          ? "/vault/history/api/tags/old/rename"
+          : `/vault/history/api/notes/${n.id}/versions`;
       const r = await route(
         new Request(`http://localhost${path}`, {
-          method: tagRename ? "POST" : "DELETE",
+          method: doctor ? "GET" : tagRename ? "POST" : "DELETE",
           headers: {
             Authorization: `Bearer ${token}`,
             "Content-Type": "application/json",
@@ -431,6 +498,17 @@ test("P7e/P15 full routing requires admin for irreversible erasure", async () =>
       );
       return { status: r.status, body: (await r.json()) as any };
     };
+    const other = await store.createNote("other");
+    await store.deleteNote(other.id);
+    const doctor = await request("read", false, true);
+    expect(doctor.status).toBe(200);
+    expect(
+      doctor.body.findings.find((f: any) => f.type === "deleted_note_history"),
+    ).toMatchObject({
+      severity: "info",
+      subject: "2 deleted note(s)",
+      detail: expect.stringContaining("upper bound"),
+    });
     const denied = await request("write");
     expect(denied.status).toBe(403);
     expect(denied.body.required_scope).toBe("vault:admin");

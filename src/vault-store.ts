@@ -1,4 +1,3 @@
-import { readVaultConfig } from "./config.ts";
 /**
  * Vault store management — opens and caches per-vault SQLite stores.
  *
@@ -6,6 +5,7 @@ import { readVaultConfig } from "./config.ts";
  * implementation to avoid duplicating wikilink hooks and other behavior.
  */
 
+import { readVaultConfig } from "./config.ts";
 import { SqliteStore } from "../core/src/store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import type { Store } from "../core/src/types.ts";

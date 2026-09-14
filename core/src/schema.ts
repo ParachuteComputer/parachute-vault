@@ -158,9 +158,11 @@ CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content
 -- VERSION_MAX_BYTES: the row records that the note WAS deleted and how big it
 -- was, with content_hash NULL because the bytes were never blobbed. A delete
 -- must never be blocked by history (see history.ts captureVersion step 5).
+-- A restore marker copied from that tombstone also retains overflow encoding
+-- and a NULL hash, including after the note has been recreated.
 --
 -- content_hash IS NULLABLE, and it is nullable ONLY for that overflow
--- tombstone. Every consumer that reads it must filter NULL explicitly —
+-- tombstone or its copied restore marker. Every consumer must filter NULL —
 -- in particular gcBlobs's \`NOT IN (SELECT content_hash ...)\` MUST carry
 -- \`WHERE content_hash IS NOT NULL\`, or one NULL in the subquery makes the
 -- whole NOT IN evaluate to NULL and the sweep silently deletes nothing.
@@ -1847,9 +1849,11 @@ function migrateToV29(db: Database): void {
 -- VERSION_MAX_BYTES: the row records that the note WAS deleted and how big it
 -- was, with content_hash NULL because the bytes were never blobbed. A delete
 -- must never be blocked by history (see history.ts captureVersion step 5).
+-- A restore marker copied from that tombstone also retains overflow encoding
+-- and a NULL hash, including after the note has been recreated.
 --
 -- content_hash IS NULLABLE, and it is nullable ONLY for that overflow
--- tombstone. Every consumer that reads it must filter NULL explicitly —
+-- tombstone or its copied restore marker. Every consumer must filter NULL —
 -- in particular gcBlobs's \`NOT IN (SELECT content_hash ...)\` MUST carry
 -- \`WHERE content_hash IS NOT NULL\`, or one NULL in the subquery makes the
 -- whole NOT IN evaluate to NULL and the sweep silently deletes nothing.

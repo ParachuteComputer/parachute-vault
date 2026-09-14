@@ -83,10 +83,18 @@ describe("vault#524 history retention and blob integrity", () => {
     expect(() =>
       db.prepare("DELETE FROM note_blobs WHERE hash=?").run(hash),
     ).toThrow(/FOREIGN KEY/);
+    db.prepare("UPDATE note_versions SET superseded_at=? WHERE note_id=?").run(
+      "2000-01-01T00:00:00.000Z",
+      a.id,
+    );
     history!.pruneVersions(
       db,
       a.id,
-      history!.resolveHistoryPolicy({ min_versions: 0, max_versions: 0 }),
+      history!.resolveHistoryPolicy({
+        min_versions: 0,
+        max_versions: 1,
+        max_age_days: 1,
+      }),
     );
     expect(count("note_versions")).toBe(1);
     expect(count("note_blobs")).toBe(1);
@@ -195,5 +203,27 @@ describe("vault#524 history retention and blob integrity", () => {
     for (let i = 0; i < 150; i++)
       await store.updateNote(n.id, { content: String(i) });
     expect(count("note_versions")).toBe(100);
+  });
+  it("P21 zero ceiling keeps the newest version and absurd ages cannot break writes", async () => {
+    const policy = history!.resolveHistoryPolicy({
+      min_versions: 0,
+      max_versions: 0,
+      max_age_days: 200000000,
+      deleted_retention_days: 200000000,
+    });
+    expect(policy).toMatchObject({
+      max_versions: 1,
+      max_age_days: 36500,
+      deleted_retention_days: 36500,
+    });
+    store = new BunSqliteStore(db, { history: policy });
+    const n = await store.createNote("first");
+    await store.updateNote(n.id, { content: "second" });
+    await store.updateNote(n.id, { content: "third" });
+    expect(await store.listNoteVersions(n.id)).toHaveLength(1);
+    expect((await store.getNoteVersion(n.id, 1))!.content).toBe("second");
+    await store.deleteNote(n.id);
+    history!.sweepDeletedHistory(db, policy);
+    expect(await store.getNote(n.id)).toBeNull();
   });
 });

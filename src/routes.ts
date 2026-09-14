@@ -1,5 +1,3 @@
-import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
-import { ULID_REGEX } from "../core/src/ulid.js";
 /**
  * REST API route handlers for the multi-vault server.
  *
@@ -13,6 +11,8 @@ import { ULID_REGEX } from "../core/src/ulid.js";
  * and the Request, and returns a Response.
  */
 
+import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
+import { ULID_REGEX } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
@@ -2948,7 +2948,7 @@ async function handleNotesInner(
       }
     } else if (verMatch && method === "GET") {
       const ix = Number(verMatch[1]);
-      if (!Number.isInteger(ix) || ix < 0) return json({ error: "Invalid version_ix", error_type: "invalid_request" }, 400);
+      if (!/^\d+$/.test(verMatch[1]!) || !Number.isInteger(ix) || ix < 0) return json({ error: "Invalid version_ix", error_type: "invalid_request" }, 400);
       const version = await store.getNoteVersion(id, ix);
       return version ? json(version) : json({ error: "Not found", error_type: "not_found" }, 404);
     } else if (sub === "/restore" && method === "POST") {
@@ -2966,7 +2966,7 @@ async function handleNotesInner(
         });
         const restored = await store.restoreNoteVersion(id, body.version_ix as number, {
           actor: writeCtx.actor, via: writeCtx.via,
-          ...(typeof body.if_updated_at === "string" ? { if_updated_at: body.if_updated_at } : {}),
+          ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
         });
         let validated: any = attachValidationStatus(store, db, restored);
         validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
@@ -2975,7 +2975,7 @@ async function handleNotesInner(
           if (vs === undefined) { const { validation_status: _d, ...rest } = validated; validated = rest; }
           else validated = { ...validated, validation_status: vs };
         }
-        return json({ ...validated, restored_from: body.version_ix, recreated: !note });
+        return json({ ...validated, restored_from: body.version_ix, recreated: !note, created: !note });
       } catch (e: any) {
         const r = conflictResponse(e);
         if (r) return r;
