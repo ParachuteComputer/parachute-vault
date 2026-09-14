@@ -1,3 +1,4 @@
+import { readVaultConfig } from "./config.ts";
 /**
  * Vault store management — opens and caches per-vault SQLite stores.
  *
@@ -106,12 +107,15 @@ export function getVaultStore(name: string): SqliteStore {
     // because) semantic search is off — no second read of the resolution.
     const embeddingProvider = getSharedEmbeddingProvider();
     store = new SqliteStore(db, {
+      history: readVaultConfig(name)?.history,
       hooks: defaultHookRegistry,
       embeddingProvider,
       embeddingDisabledReason: embeddingProvider ? undefined : EMBEDDINGS_DISABLED_REASON,
     });
     stores.set(name, store);
     storeToVault.set(store, name);
+    try { store.sweepDeletedHistory(); }
+    catch (error) { console.warn(`[vault] deleted history sweep failed for ${name}:`, error); }
   }
   return store;
 }

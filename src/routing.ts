@@ -1101,11 +1101,13 @@ export async function route(
     ((req.method === "PUT" || req.method === "DELETE") && /^\/tags\/[^/]+$/.test(apiSubpath)) ||
     (req.method === "POST" &&
       (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/rename$/.test(apiSubpath)));
-  const requiredVerb = isReadOnlyPost ? "read" : isTagSchemaMutation ? "admin" : verbForMethod(req.method);
+  // Erasing note history is irreversible and requires admin (vault#524).
+  const isNoteHistoryErase = req.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiSubpath);
+  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase) ? "admin" : verbForMethod(req.method);
   if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
     const requiredApiScope = isReadOnlyPost
       ? SCOPE_READ
-      : isTagSchemaMutation
+      : (isTagSchemaMutation || isNoteHistoryErase)
         ? SCOPE_ADMIN
         : scopeForMethod(req.method);
     return Response.json(
@@ -1173,7 +1175,7 @@ export async function route(
       { status: 410 },
     );
   }
-  if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope);
+  if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope, writeCtx);
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
     return handleVault(

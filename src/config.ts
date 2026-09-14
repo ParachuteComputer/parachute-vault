@@ -233,6 +233,14 @@ export interface VaultConfig {
   auto_transcribe?: {
     enabled?: boolean;
   };
+  /** Note history policy; read once when the vault store opens (vault#524). */
+  history?: {
+    enabled?: boolean;
+    min_versions?: number;
+    max_versions?: number;
+    max_age_days?: number;
+    deleted_retention_days?: number | null;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +544,13 @@ function serializeVaultConfig(config: VaultConfig): string {
     lines.push(`audio_retention: ${config.audio_retention}`);
   }
 
+  // Per-vault history policy: serialize only explicitly configured fields.
+  if (config.history) {
+    lines.push("history:");
+    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days"] as const) {
+      if (config.history[key] !== undefined) lines.push(`  ${key}: ${config.history[key]}`);
+    }
+  }
   // Per-vault auto-transcribe override. Serialized as a nested block so future
   // fields can grow under it (mirrors the GlobalConfig shape). Only emitted
   // when `enabled` is explicitly set — an unset vault falls back to global.
@@ -693,6 +708,21 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
         config.auto_transcribe = { enabled: m[1]! === "true" };
         break;
       }
+    }
+  }
+
+  const historyStart = yaml.match(/^history:\s*$/m);
+  if (historyStart) {
+    const after = yaml.slice((historyStart.index ?? 0) + historyStart[0].length);
+    config.history = {};
+    for (const line of after.split("\n")) {
+      if (line.match(/^\S/) && line.trim().length > 0) break;
+      const enabled = line.match(/^\s+enabled:\s*(true|false)\s*$/);
+      if (enabled) config.history.enabled = enabled[1] === "true";
+      const number = line.match(/^\s+(min_versions|max_versions|max_age_days):\s*(\d+)\s*$/);
+      if (number) config.history[number[1] as "min_versions" | "max_versions" | "max_age_days"] = Number(number[2]);
+      const deleted = line.match(/^\s+deleted_retention_days:\s*(null|\d+)\s*$/);
+      if (deleted) config.history.deleted_retention_days = deleted[1] === "null" ? null : Number(deleted[1]);
     }
   }
 

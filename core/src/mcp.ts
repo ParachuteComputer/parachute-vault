@@ -822,6 +822,24 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           expand = params.expand as TagExpandMode;
         }
 
+        if (params.versions) {
+          for (const key of ["search", "near", "cursor", "aggregate", "semantic"] as const) {
+            if (params[key] !== undefined) throw new QueryError(`versions is incompatible with ${key}`, "INVALID_QUERY", {
+              error_type: "invalid_query", field: "versions", hint: `drop ${key} when using versions`,
+            });
+          }
+          const v = params.versions as { note_id: string; version_ix?: number; limit?: number; offset?: number };
+          const note = requireNote(db, requireNoteReference(v.note_id));
+          if (typeof v.version_ix === "number") {
+            const version = await store.getNoteVersion(note.id, v.version_ix);
+            if (!version) return { error: `Version not found: "${note.id}"@${v.version_ix}`, error_type: "not_found", id: note.id };
+            return version;
+          }
+          const versions = await store.listNoteVersions(note.id, { limit: Math.min(v.limit ?? 50, 200), offset: v.offset ?? 0 });
+          const total = (db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(note.id) as { n: number }).n;
+          return { versions, total };
+        }
+
         // --- Aggregation / rollup mode (top new-feature ask from a UX round) ---
         // Mutually exclusive with `search`/`near`/`cursor`/`semantic` — a rollup returns
         // one row per group, not a paginated / graph-scoped / ranked note
@@ -2280,7 +2298,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       name: "delete-note",
       execute: async (params) => {
         const note = requireNote(db, requireNoteReference(params.id));
-        await store.deleteNote(note.id);
+        await store.deleteNote(note.id, { actor: writeActor, via: writeVia });
         return { deleted: true, id: note.id };
       },
     },
@@ -2494,7 +2512,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             field: "new_name",
           });
         }
-        const result = await store.renameTag(oldName, newName);
+        const result = await store.renameTag(oldName, newName, { actor: writeActor ?? undefined, via: writeVia ?? undefined });
         if ("error" in result) {
           if (result.error === "not_found") {
             throw structuredError(`rename-tag: tag "${oldName}" not found`, {

@@ -1,3 +1,4 @@
+import { historyTablesPresent, deletedHistoryStats } from "./history.js";
 /**
  * `vault doctor` — read-only taxonomy/metadata integrity scan (vault#552).
  *
@@ -58,7 +59,8 @@ export type DoctorFindingType =
   | "parent_names_cycle"
   | "mixed_type_indexed_field"
   | "orphaned_indexed_field_declarer"
-  | "dead_tag_metadata_reference";
+  | "dead_tag_metadata_reference"
+  | "deleted_note_history";
 
 export type DoctorSeverity = "error" | "warning" | "info";
 
@@ -126,6 +128,7 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
     ...scanMixedTypeIndexedFields(db, allowedTags),
     ...scanOrphanedIndexedFieldDeclarers(db, allowedTags),
     ...scanDeadTagMetadataReferences(db, allowedTags),
+    ...(allowedTags === null ? scanDeletedNoteHistory(db) : []),
   ];
 
   const errors = findings.filter((f) => f.severity === "error").length;
@@ -379,4 +382,17 @@ function scanDeadTagMetadataReferences(db: Database, allowedTags: Set<string> | 
     }
   }
   return findings;
+}
+
+/** Deleted rows have no tags to authorize against; callers omit this for scoped sessions. */
+function scanDeletedNoteHistory(db: Database): DoctorFinding[] {
+  if (!historyTablesPresent(db)) return [];
+  const stats = deletedHistoryStats(db);
+  if (stats.versions === 0) return [];
+  return [{ type: "deleted_note_history", severity: "info",
+    subject: `${stats.notes} deleted note(s)`,
+    detail: `${stats.versions} version row(s) retained for notes that no longer exist, holding ~${stats.bytes} bytes of blob content. Blobs shared with a live note's history are counted here as well, so this is an upper bound, not an exact figure.`
+      + (stats.overflow_tombstones > 0 ? ` ${stats.overflow_tombstones} of these are overflow tombstone(s): the note exceeded the 2 MB version ceiling, so its deletion, size and metadata were recorded but its content was not and cannot be restored.` : ``),
+    remedy: "Set `history.deleted_retention_days` in the vault's vault.yaml to sweep these automatically (null — the default — keeps them until an explicit erase), or erase one note's history permanently with DELETE /api/notes/<id>/versions.",
+  }];
 }

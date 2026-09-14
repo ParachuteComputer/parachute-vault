@@ -85,3 +85,23 @@ per-note reads stay snappy throughout. Beyond ~100k the levers, in order, are:
 (1) FTS index for content search, (2) cursor/streaming export to drop the
 full-corpus in-memory load. Concurrent-writer / WAL tuning and
 distributed/sharded vaults are explicitly out of scope (vault#326).
+
+## Note version history (v29, #524)
+
+The [v2 design](https://parachute.techne.coop/v/parachute/n/01M2GNER9X0KVTKX14GK98JNYC)
+estimates **35–37 MB** for `unforced` at 20/100/180d under full snapshots,
+about **15 MB** with content-addressing, against the mirror's **172.8 MB
+note-history portion**. These are design estimates, not measurements of the
+new database; the mirror's 1.16 GiB total also includes attachments.
+Nine notes account for 84% of all historical versions; the hottest has
+15,085. At one write per minute a ceiling of 100 covers **about 100 minutes,
+not 180 days**. The compactor (PR 2) is what changes that; PR 1 does not
+coalesce or compress versions. Metadata-only changes share the content blob
+from the second capture onward; changing content still creates new blobs.
+
+Every `skipUpdatedAt` metadata write now versions, so one audio upload
+produces 3–4 version rows. An additive (non-blow-away) re-import captures each
+upserted note: roughly 3,646 captures and 19 MB for `unforced`, outside any
+single transaction. Delete tombstones are not pruned by the ordinary version
+ceiling; repeated delete/recreate cycles can grow retained history until
+explicit erasure or a configured deleted-history sweep.
