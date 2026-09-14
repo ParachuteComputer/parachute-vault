@@ -30,9 +30,12 @@ read. Restore loads its source before capture/pruning can evict it.
 | Live restore | `restore` holding the prior live state |
 | Deleted-note restore | `restore` marker copying the tombstone |
 | Create | None |
-| Tag membership changes / link mutations alone | None |
+| Direct tag/link-table mutations with no note-row update | None |
 | Schema migrations, derived FTS/vector/index work | None |
 | Tag identity/metadata and reference-field maintenance | None unless it enters a captured note mutation |
+
+A REST tag/link write that also updates the note row captures that row, but
+versions do not preserve tag membership or the link tables themselves.
 
 `encoding` is the seam for PR 2. Ordinary rows use NULL and reference a whole
 blob. The only non-NULL value written in v29 is `overflow`: an oversized
