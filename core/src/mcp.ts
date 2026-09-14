@@ -702,7 +702,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const note = requireNote(db, requireNoteReference(v.note_id));
           if (typeof v.version_ix === "number") {
             const version = await store.getNoteVersion(note.id, v.version_ix);
-            if (!version) return { error: `Version not found: "${note.id}"@${v.version_ix}`, error_type: "not_found", id: note.id };
+            if (!version) return { error: `Version not found: "${v.note_id}"@${v.version_ix}`, error_type: "not_found", id: v.note_id, version_ix: v.version_ix };
             return version;
           }
           const versions = await store.listNoteVersions(note.id, { limit: Math.max(0, Math.min(v.limit ?? 50, 200)), offset: v.offset ?? 0 });

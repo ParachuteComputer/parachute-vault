@@ -2975,7 +2975,7 @@ async function handleNotesInner(
           if (vs === undefined) { const { validation_status: _d, ...rest } = validated; validated = rest; }
           else validated = { ...validated, validation_status: vs };
         }
-        return json({ ...validated, restored_from: body.version_ix, recreated: !note, created: !note });
+        return json({ ...validated, restored_from: body.version_ix, recreated: !note });
       } catch (e: any) {
         const r = conflictResponse(e);
         if (r) return r;

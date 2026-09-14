@@ -569,6 +569,7 @@ function applyTagScopeWrappers(
     if (result && typeof result === "object" && (
       ("versions" in result && Array.isArray((result as any).versions) && "total" in result)
       || ("version_ix" in result && "content" in result)
+      || ("version_ix" in result && "error" in result)
     )) {
       const id = (params as any).versions.note_id;
       const note = resolveNote(store.db, id);

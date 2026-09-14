@@ -283,6 +283,31 @@ test("P18 MCP protects the new object result from out-of-scope disclosure", asyn
       query(tags)({ versions: { note_id: y.id } }),
     ).rejects.toMatchObject({ error_type: "not_found" });
 });
+test("P18h missing versions do not disclose a scoped-out path's canonical id", async () => {
+  const ref = "private/history-target";
+  const n = await store.createNote("PRIVATE_CONTENT", {
+    path: ref,
+    tags: ["work"],
+    metadata: { secret: "PRIVATE_METADATA" },
+  });
+  await store.updateNote(n.id, { content: "later" });
+  const params = { versions: { note_id: ref, version_ix: 999 } };
+  const scoped = await query(["journal"])(params);
+  expect(scoped).toEqual({
+    error: "Note not found",
+    error_type: "not_found",
+    id: ref,
+  });
+  expect(JSON.stringify(scoped)).not.toContain(n.id);
+  const unscoped = await query()(params);
+  expect(unscoped).toEqual({
+    error: `Version not found: "${ref}"@999`,
+    error_type: "not_found",
+    id: ref,
+    version_ix: 999,
+  });
+  expect(JSON.stringify(unscoped)).not.toContain(n.id);
+});
 test("P19 overflow deletion remains possible but its tombstone cannot restore", async () => {
   const n = await store.createNote("x".repeat(2000001));
   expect((await call(n.id, "", "DELETE")).status).toBe(200);

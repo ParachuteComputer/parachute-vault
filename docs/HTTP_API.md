@@ -1491,7 +1491,7 @@ Versions are **not** full-text searchable.
   (`vault:read`) returns one version with its content; missing versions are 404.
 - `POST /vault/{name}/api/notes/{idOrPath}/restore` (`vault:write`)
   accepts `{version_ix, if_updated_at?}` and returns the note with
-  `restored_from`, `recreated`, and `created` (true for re-creation). A stale token is 409 `conflict`.
+  `restored_from` and `recreated`. A stale token is 409 `conflict`.
 - `DELETE /vault/{name}/api/notes/{idOrPath}/versions` is **`vault:admin`
   and irreversible**. It returns `{erased:true, id, versions_deleted,
   blobs_deleted}` without deleting a live note.
