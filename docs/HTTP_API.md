@@ -1514,6 +1514,9 @@ The doctor census checks structure, not content checksums; it is not a content a
 {"version_ix": 3, "if_updated_at": "2026-09-14T20:00:00.000Z"}
 ```
 
+Every version row includes `created_at`: the captured note creation time, identical
+across its captured rows and NULL on pre-v30 rows.
+
 Restore does not restore `path` on a live note: it restores content, metadata
 and extension without undoing a later move. Restore of a DELETED note
 re-creates it at the same id, at the tombstone's path, untagged, with

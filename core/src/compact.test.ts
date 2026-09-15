@@ -109,7 +109,8 @@ test("P8 bounded passes resume and converge; unbounded visits all", async () => 
     await seed(12, 20000, `more${i}`);
   const budget = store.compactHistory({ budgetMs: 1, maxNotes: null });
   expect(budget.stopped_by).toBe("budget");
-  expect(budget.notes_scanned).toBeLessThanOrEqual(1);
+  expect(budget.notes_scanned).toBe(1);
+  expect(budget.notes_compacted).toBe(1);
   const all = store.compactHistory({ budgetMs: null, maxNotes: null });
   expect(all.stopped_by).toBe("complete");
   expect(all.remaining_candidates).toBe(0);
@@ -217,7 +218,6 @@ test("P23 corrupt chain cannot rewrite a healthy whole; vault continues", async 
   const rows = await store.listNoteVersions(n.id);
   expect(codec).not.toBeNull();
   const [r, d, w] = rows;
-  const original = blobs();
   const content = (hash: string) => (db.prepare("SELECT content FROM note_blobs WHERE hash=?").get(hash) as any).content as string;
   const dt = content(d!.content_hash!), wt = content(w!.content_hash!), rt = content(r!.content_hash!);
   db.prepare("UPDATE note_blobs SET content=?,encoding='fossil-delta',delta_of=? WHERE hash=?").run(codec!.encodeDelta(wt, dt), w!.content_hash, d!.content_hash);
@@ -227,4 +227,22 @@ test("P23 corrupt chain cannot rewrite a healthy whole; vault continues", async 
   expect(blobs()).toEqual(before);
   expect(store.compactHistory({ maxNotes: null, budgetMs: null })).toMatchObject({ notes_failed: 1, notes_compacted: 1 });
   expect((await store.getNoteVersion(good.id, 0))!.content).toBe(good.content);
+});
+
+test("P10(i)/P21(f) explicit IDs and guard precedence cannot widen or stall a pass", async () => {
+  for (let i = 0; i < 3; i++) await seed(12, 20000, `guard${i}`);
+  const before = blobs();
+  expect(store.compactHistory({ noteId: "", budgetMs: null, maxNotes: null })).toMatchObject({ notes_scanned: 1, notes_compacted: 0 });
+  expect(blobs()).toEqual(before);
+  expect(store.compactHistory({ budgetMs: 0, maxNotes: 0 }).stopped_by).toBe("max_notes");
+  const clock = spyOn(performance, "now");
+  let tick = 0;
+  clock.mockImplementation(() => (tick += 10));
+  try {
+    expect(store.compactHistory({ budgetMs: 1, maxNotes: 1 })).toMatchObject({ notes_scanned: 1, notes_compacted: 1, stopped_by: "max_notes" });
+    expect(store.compactHistory({ budgetMs: 1, maxNotes: null })).toMatchObject({ notes_scanned: 1, notes_compacted: 1, stopped_by: "budget" });
+  } finally { clock.mockRestore(); }
+  const empty = new Database(":memory:");
+  try { expect(h.compactVault(empty, h.resolveHistoryPolicy(), { budgetMs: 0, maxNotes: 0 }).stopped_by).toBe("disabled"); }
+  finally { empty.close(); }
 });

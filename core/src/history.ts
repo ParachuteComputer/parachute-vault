@@ -107,6 +107,7 @@ export class HistoryOverflowError extends Error {
   }
 }
 export class HistoryUnrecoverableError extends Error {
+  readonly error_type = "history_unrecoverable";
   readonly code = "HISTORY_UNRECOVERABLE";
   constructor(
     readonly note_id: string,
@@ -627,18 +628,16 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
   maxNotes?: number | null;
 }): CompactSummary {
   const result: CompactSummary = { notes_scanned: 0, notes_compacted: 0, notes_failed: 0, blobs_deltified: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0, remaining_candidates: 0, duration_ms: 0, stopped_by: "complete" };
-  if (!policy.enabled || !policy.compact_enabled)
+  if (!historyTablesPresent(db) || !policy.enabled || !policy.compact_enabled)
     return { ...result, stopped_by: "disabled" };
   const budget = opts?.budgetMs === undefined ? policy.compact_budget_ms : opts.budgetMs;
   const max = opts?.maxNotes === undefined ? policy.compact_max_notes : opts.maxNotes;
-  if (budget !== null && budget <= 0)
-    return { ...result, stopped_by: "budget" };
   if (max !== null && max <= 0)
     return { ...result, stopped_by: "max_notes" };
-  if (!historyTablesPresent(db))
-    return { ...result, stopped_by: "disabled" };
+  if (budget !== null && budget <= 0)
+    return { ...result, stopped_by: "budget" };
   const started = performance.now();
-  const candidates = opts?.noteId ? [{ note_id: opts.noteId }] : db.prepare(`SELECT v.note_id, SUM(b.byte_size) AS stored,
+  const candidates = opts?.noteId !== undefined ? [{ note_id: opts.noteId }] : db.prepare(`SELECT v.note_id, SUM(b.byte_size) AS stored,
   (SELECT COUNT(*) FROM note_versions n WHERE n.note_id = v.note_id AND n.content_hash IS NOT NULL) AS versions,
   COALESCE(LENGTH(CAST(live_note.content AS BLOB)),
    (SELECT content_len FROM note_versions newest WHERE newest.note_id = v.note_id ORDER BY version_ix DESC LIMIT 1),0) AS live
@@ -650,12 +649,13 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
     note_id: string;
   }[];
   for (const candidate of candidates) {
-    if (budget !== null && performance.now() - started >= budget) {
-      result.stopped_by = "budget";
-      break;
-    }
     if (max !== null && result.notes_scanned >= max) {
       result.stopped_by = "max_notes";
+      break;
+    }
+    // Always attempt one candidate, even when the candidate scan used the budget.
+    if (result.notes_scanned > 0 && budget !== null && performance.now() - started >= budget) {
+      result.stopped_by = "budget";
       break;
     }
     result.notes_scanned++;

@@ -5250,7 +5250,7 @@ export async function handleHistoryCompact(req: Request, store: Store, tagScope:
   catch {
     return json({ error: "Invalid compaction request", error_type: "invalid_request" }, 400);
   }
-  if ((body.note_id !== undefined && typeof body.note_id !== "string") ||
+  if ((body.note_id !== undefined && (typeof body.note_id !== "string" || body.note_id.length === 0)) ||
     [body.budget_ms, body.max_notes].some(v => v !== undefined && (typeof v !== "number" || !Number.isInteger(v) || v < 1)))
     return json({ error: "Invalid compaction request", error_type: "invalid_request" }, 400);
   try {

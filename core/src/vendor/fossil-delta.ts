@@ -1,8 +1,9 @@
 // @ts-nocheck
-/*! (c) Dmitry Chestnykh, D. Richard Hipp | BSD 2-Clause | https://github.com/dchest/fossil-delta-js/ */
+/*! (c) Dmitry Chestnykh, D. Richard Hipp | BSD License | https://github.com/dchest/fossil-delta-js/ */
 // Vendored from fossil-delta@2.0.0 (npm sha512-rcvnd0xjV7KNkEbXhTCsjHhONvdami+WWhTYGf4ORkPk9ixkQDmVeII96F6wBD/6qa9zBjH15bOzSARKsQ/rKg==).
 // Upstream fossil-delta.ts sha256 29d795837d08ff9305e145d20611e721e52aa29969c10c39c8f9d3d51be67b6c.
-// CHANGES FROM UPSTREAM, and there are exactly four:
+// Local path: core/src/vendor/fossil-delta.ts. License: BSD 2-Clause.
+// CHANGES FROM UPSTREAM:
 //   1. createStringDelta / applyStringDelta / getStringDeltaTargetSize are
 //      DELETED. They decode raw delta bytes with TextDecoder (upstream
 //      :455-461, :466-477), which replaces any non-UTF-8 byte run with U+FFFD.
@@ -10,11 +11,9 @@
 //      createStringDelta round-trips throw `unknown delta operator` 189 times
 //      in 200 randomised cases. A pure APPEND on the same alphabet round-trips
 //      fine, which is why the trigger is the edit shape, not the alphabet.
-//      encodeDelta/decodeDelta below are the supported surface. (§1 probe C.)
-//   2. encodeDelta / decodeDelta added.
-//   3. This header.
-//   4. Isolated in vendor/fossil-delta.ts with a file-scoped TypeScript opt-out.
-//      Typed wrappers remain strict in ../delta.ts (spec §11.12).
+//   2. This provenance header.
+//   3. @ts-nocheck added as line 1: upstream does not typecheck under
+//      noUncheckedIndexedAccess / noFallthroughCasesInSwitch.
 // Why vendored rather than a dependency: core/package.json declares no
 // dependencies at all, core never imports a third-party library by house rule
 // (see BunSqliteStore.embeddingProvider's doc comment, core/src/store.ts:

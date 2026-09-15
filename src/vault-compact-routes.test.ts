@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeyPair, exportJWK, SignJWT } from "jose";
+import { handleMcp } from "./mcp-http.ts";
 import { route } from "./routing.ts";
 import { resetJwksCache, resetRevocationCache } from "./hub-jwt.ts";
 import { writeVaultConfig, readVaultConfig, vaultConfigPath } from "./config.ts";
@@ -83,7 +84,7 @@ test("P10 full routing gates methods, admin, tag scope and optional bodies", asy
     expect(denied.status).toBe(404);
     expect(denied.body.error_type).toBe("not_found");
   }
-  for (const body of [{ budget_ms: 0 }, { max_notes: 0 }, { note_id: 123 }, [], null, { budget_ms: 1.5 }]) {
+  for (const body of [{ budget_ms: 0 }, { max_notes: 0 }, { note_id: 123 }, { note_id: "" }, [], null, { budget_ms: 1.5 }]) {
     const bad = await call("/history/compact", "POST", body);
     expect(bad.status).toBe(400);
     expect(bad.body.error_type).toBe("invalid_request");
@@ -169,12 +170,26 @@ for (const corruption of ["missing", "unknown", "checksum"]) {
       expect(codec).not.toBeNull();
       expect(() => codec!.decodeDelta(damaged, blob.content)).toThrow("bad checksum");
       store.db.prepare("UPDATE note_blobs SET content=? WHERE hash=?").run(damaged, blob.delta_of);
-      expect(() => history.readBlobContent(store.db, v.content_hash!)).toThrow("bad_delta");
+      let failure: unknown;
+      try { history.readBlobContent(store.db, v.content_hash!); } catch (err) { failure = err; }
+      expect(failure).toBeInstanceOf(history.HistoryDeltaOrphanError);
+      expect((failure as history.HistoryDeltaOrphanError).reason).toBe("bad_delta");
     }
     const get = await call(`/notes/${n.id}/versions/0`);
     expect(get.status).toBe(409);
     expect(get.body.error_type).toBe("history_unrecoverable");
     expect(get.body.hint).toContain("delta");
+    // P13(h): exercise the actual JSON-RPC error mapper, not just tool.execute.
+    const auth = { permission: "full" as const, scopes: ["vault:compact:read"], legacyDerived: false, scoped_tags: null, vault_name: null, caller_jti: null, actor: "tester", via: "api" };
+    const request = new Request("http://localhost/vault/compact/mcp", {
+      method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "query-notes", arguments: { versions: { note_id: n.id, version_ix: 0 } } } }),
+    });
+    const response = await handleMcp(request, () => generateScopedMcpTools("compact", auth), "compact-test", "compact", auth, "");
+    const rpc = await response.json() as any;
+    expect(rpc.error.code).toBe(-32602);
+    expect(rpc.error.data.error_type).toBe(get.body.error_type);
+    expect(rpc.result).toBeUndefined();
     expect((await call(`/notes/${n.id}/restore`, "POST", { version_ix: 0 })).status).toBe(409);
     expect((await call(`/notes/${n.id}/versions`)).status).toBe(200);
     if (corruption !== "checksum") {
@@ -206,9 +221,9 @@ test("P21 boot synchronous bounded, cached and tolerant of throw", async () => {
     const before = snapshot();
     expect(getVaultStore("compact")).toBe(store);
     expect(snapshot()).toEqual(before);
-    expect(JSON.stringify(log.mock.calls)).toContain("remaining_candidates");
-    const summary = log.mock.calls.find(call => String(call[0]).includes("history compaction"))![1];
-    expect(summary).toMatchObject({ notes_scanned: 1, notes_compacted: 1, remaining_candidates: 2 });
+    const entry = log.mock.calls.find(call => String(call[0]).includes("history compaction"))!;
+    expect(entry).toHaveLength(1);
+    expect(entry[0]).toMatch(/^\[vault\] history compaction for compact: scanned 1, compacted 1, failed 0, deltified \d+, \d+->\d+ bytes in [\d.]+ms \(stopped_by max_notes, 2 candidate\(s\) remaining\)$/);
   }
   finally {
     log.mockRestore();

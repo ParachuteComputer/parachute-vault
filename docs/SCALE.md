@@ -124,14 +124,26 @@ not used: the measured markdown compression gain was 2.6×, versus the prototype
 compaction gain above, and asynchronous CompressionStream cannot run inside a
 Durable Object synchronous transaction.
 
-A later implementation run on the loaded mini measured these wall times (single
-samples, including SQL and encoding): 1 KB / 30 versions **115 ms**; 20 KB log /
-100 versions **2,597 ms**; 119,641-byte prose / 30 versions **178 ms**. Codec shares
-were 22, 2,247 and 118 ms respectively. The log fixture differs from the earlier
-four-shape probe; these results do not establish a universal log bound. The
-corresponding oldest-version read p95 values were 2.20, 3.34 and 18.54 ms.
-The exact candidate SELECT over 100 synthetic notes took 65.76 ms. No other test
-suite ran during these measurements, but the machine had other active processes.
-A production `unforced` database copy migrated from v28 in 1.73 s; it had no
+A clean re-measure on this mini (2026-09-15, no `bun test`, `vitest` or `tsc`
+processes reported by `pgrep` before the run) produced the following single
+samples. Wall time includes SQL and encoding; reads are of the oldest version.
+
+| Synthetic fixture | Compact wall time | Codec time | Blob bytes before → after | Read p95 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 KB, 30 versions | 8.96 ms | 5.90 ms | 38,740 → 3,239 | 0.22 ms |
+| 20 KB log, 100 versions | 495.21 ms | 462.55 ms | 2,093,105 → 108,214 | 0.71 ms |
+| 119,641-byte prose, 30 versions | 59.68 ms | 39.85 ms | 3,571,668 → 263,189 | 2.98 ms |
+
+The log sample exceeded the default 250 ms budget by **245 ms** (about 2×).
+An independent clean review run measured 212 ms for that fixture; the earlier
+loaded-mini run took 2,597 ms, **2,347 ms over budget** (about 10.4×). These are
+observations, not a universal bound. The integrity review also measured a
+1.84 MB × 9-version note at 5.2 seconds during boot, **4.95 seconds over budget**.
+A multi-MB note over the byte ceiling can therefore hold the first open for seconds.
+The first candidate is attempted even if selecting candidates consumes the budget;
+subsequent candidates honor the note cap first, then the elapsed-time budget.
+
+The exact candidate SELECT over 100 synthetic notes took 4.98 ms in this run.
+A production `unforced` database copy migrated from v28 in 580 ms; it had no
 history tables before migration and zero history blobs afterward. Production
 compaction savings therefore remain unmeasured.
