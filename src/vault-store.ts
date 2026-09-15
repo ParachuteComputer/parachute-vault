@@ -116,6 +116,13 @@ export function getVaultStore(name: string): SqliteStore {
     storeToVault.set(store, name);
     try { store.sweepDeletedHistory(); }
     catch (error) { console.warn(`[vault] deleted history sweep failed for ${name}:`, error); }
+    try {
+      // Synchronous like the sweep: bounds are checked between notes, so one
+      // note may overshoot. Cached opens do not repeat this maintenance pass.
+      const summary = store.compactHistory();
+      if (summary.notes_scanned > 0 || summary.remaining_candidates > 0) console.log(`[vault] history compaction for ${name}:`, summary);
+    } catch (error) { console.warn(`[vault] history compaction failed for ${name}:`, error); }
+
   }
   return store;
 }

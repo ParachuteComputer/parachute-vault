@@ -47,7 +47,7 @@
  * out-of-scope activity.
  */
 
-import { historyTablesPresent, deletedHistoryStats } from "./history.js";
+import { historyTablesPresent, deletedHistoryStats, historyStorageStats, topNotesByHistoryBytes } from "./history.js";
 import { Database } from "bun:sqlite";
 import { loadTagHierarchy, findHierarchyCycles } from "./tag-hierarchy.js";
 import { listIndexedFields } from "./indexed-fields.js";
@@ -60,7 +60,9 @@ export type DoctorFindingType =
   | "mixed_type_indexed_field"
   | "orphaned_indexed_field_declarer"
   | "dead_tag_metadata_reference"
-  | "deleted_note_history";
+  | "deleted_note_history"
+  | "history_storage"
+  | "history_delta_orphan";
 
 export type DoctorSeverity = "error" | "warning" | "info";
 
@@ -129,6 +131,8 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
     ...scanOrphanedIndexedFieldDeclarers(db, allowedTags),
     ...scanDeadTagMetadataReferences(db, allowedTags),
     ...(allowedTags === null ? scanDeletedNoteHistory(db) : []),
+    ...(allowedTags === null ? scanHistoryStorage(db) : []),
+    ...(allowedTags === null ? scanDeltaOrphans(db) : []),
   ];
 
   const errors = findings.filter((f) => f.severity === "error").length;
@@ -395,4 +399,24 @@ function scanDeletedNoteHistory(db: Database): DoctorFinding[] {
       + (stats.overflow_tombstones > 0 ? ` ${stats.overflow_tombstones} of these are overflow tombstone(s): the note exceeded the 2 MB version ceiling, so its deletion, size and metadata were recorded but its content was not and cannot be restored.` : ``),
     remedy: "Set `history.deleted_retention_days` in the vault's vault.yaml to sweep these automatically (null — the default — keeps them until an explicit erase), or erase one note's history permanently with DELETE /api/notes/<id>/versions.",
   }];
+}
+
+function scanHistoryStorage(db: Database): DoctorFinding[] {
+  if (!historyTablesPresent(db)) return [];
+  const s = historyStorageStats(db);
+  if (s.whole_blobs + s.delta_blobs === 0) return [];
+  const top = topNotesByHistoryBytes(db, 5);
+  return [{ type: "history_storage", severity: "info",
+    subject: `${s.whole_blobs + s.delta_blobs} history blob(s)`,
+    detail: `${s.whole_bytes} byte(s) stored whole across ${s.whole_blobs} blob(s) and ${s.delta_bytes} byte(s) stored as fossil deltas across ${s.delta_blobs} blob(s). Largest histories by stored bytes: ${top.map(t => `${t.note_id} (${t.bytes} bytes, ${t.versions} versions)`).join(", ")}.`,
+    remedy: "Run POST /api/history/compact (vault:admin) to compact now, or set history.max_bytes_per_note in the vault's vault.yaml to bound per-note history. Turning history.compact_enabled off also stops max_bytes_per_note being enforced." }];
+}
+function scanDeltaOrphans(db: Database): DoctorFinding[] {
+  if (!historyTablesPresent(db)) return [];
+  const s = historyStorageStats(db);
+  if (s.orphan_deltas + s.unknown_encoding_blobs === 0) return [];
+  return [{ type: "history_delta_orphan", severity: "error",
+    subject: `${s.orphan_deltas + s.unknown_encoding_blobs} unrecoverable history blob(s)`,
+    detail: `${s.orphan_deltas} blob(s) are stored as fossil deltas whose base blob is missing or is itself a delta, and ${s.unknown_encoding_blobs} carry an encoding this version does not know how to read, so the versions referencing them cannot be reconstructed. Reading one answers 409 history_unrecoverable; listing versions still works.`,
+    remedy: "Erase the affected note's history with DELETE /api/notes/<id>/versions, or restore the vault database from backup. This is a corruption finding, not a retention setting." }];
 }

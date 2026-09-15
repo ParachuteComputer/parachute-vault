@@ -85,6 +85,7 @@ import {
   handleStorage,
   handleViewNote,
   handleDoctor,
+  handleHistoryCompact,
   type TagScopeCtx,
   type WriteCtx,
 } from "./routes.ts";
@@ -1103,11 +1104,12 @@ export async function route(
       (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/rename$/.test(apiSubpath)));
   // Erasing note history is irreversible and requires admin (vault#524).
   const isNoteHistoryErase = req.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiSubpath);
-  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase) ? "admin" : verbForMethod(req.method);
+  const isHistoryCompact = req.method === "POST" && apiSubpath === "/history/compact";
+  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact) ? "admin" : verbForMethod(req.method);
   if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
     const requiredApiScope = isReadOnlyPost
       ? SCOPE_READ
-      : (isTagSchemaMutation || isNoteHistoryErase)
+      : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact)
         ? SCOPE_ADMIN
         : scopeForMethod(req.method);
     return Response.json(
@@ -1176,6 +1178,7 @@ export async function route(
     );
   }
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope, writeCtx);
+  if (isHistoryCompact) return handleHistoryCompact(req, store, tagScope);
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
     return handleVault(

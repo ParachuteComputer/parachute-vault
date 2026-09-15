@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow, SemanticSearchResult } from "./types.js";
-import { captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
+import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
 import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
@@ -825,6 +825,9 @@ export class BunSqliteStore implements Store {
   async getNoteVersion(id: string, versionIx: number) { return getVersion(this.db, id, versionIx); }
   async eraseNoteHistory(id: string) { return eraseHistory(this.db, id); }
   sweepDeletedHistory() { return sweepDeletedHistory(this.db, this.historyPolicy); }
+  async countNoteVersions(id: string) { return countNoteVersions(this.db, id); }
+  compactNote(id: string) { return compactNote(this.db, id, this.historyPolicy); }
+  compactHistory(opts?: { noteId?: string; budgetMs?: number | null; maxNotes?: number | null }) { return compactVault(this.db, this.historyPolicy, opts); }
   async deletedHistoryStats() { return deletedHistoryStats(this.db); }
   async restoreNoteVersion(id: string, versionIx: number, opts: { actor?: string | null; via?: string | null; if_updated_at?: string }): Promise<Note> {
     if (noteOps.getNote(this.db, id)) {
@@ -847,7 +850,7 @@ export class BunSqliteStore implements Store {
     return this.transaction(() => {
       const note = noteOps.createNote(this.db, v.content!, {
         id, path: tomb.path ?? undefined, metadata: v.metadata,
-        extension: v.extension ?? undefined, created_at: tomb.superseded_at,
+        extension: v.extension ?? undefined, created_at: v.created_at ?? tomb.superseded_at,
         actor: opts.actor ?? null, via: opts.via ?? null,
       });
       appendRestoreMarker(this.db, id, tomb, { actor: opts.actor ?? null, via: opts.via ?? null }, this.historyPolicy);
@@ -1813,4 +1816,4 @@ function historyOpFor(u: Parameters<Store["updateNote"]>[1]): HistoryOp {
   return "update";
 }
 export { HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES };
-export type { HistoryPolicy, HistoryOp, VersionRow };
+export type { HistoryPolicy, HistoryOp, VersionRow, CompactResult, CompactSummary };

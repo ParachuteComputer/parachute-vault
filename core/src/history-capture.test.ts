@@ -221,7 +221,7 @@ it("P20 re-create uses tombstone path/time, selected metadata, no tags", async (
     content: "one",
     metadata: { k: 1 },
     tags: [],
-    createdAt: tomb.superseded_at,
+    createdAt: n.createdAt,
   });
   const rows = await store.listNoteVersions(n.id);
   expect(rows[0]).toMatchObject({

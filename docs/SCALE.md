@@ -95,8 +95,8 @@ note-history portion**. These are design estimates, not measurements of the
 new database; the mirror's 1.16 GiB total also includes attachments.
 Nine notes account for 84% of all historical versions; the hottest has
 15,085. At one write per minute a ceiling of 100 covers **about 100 minutes,
-not 180 days**. The compactor (PR 2) is what changes that; PR 1 does not
-coalesce or compress versions. Metadata-only changes share the content blob
+not 180 days**. The v30 compactor reduces stored history with byte deltas; capture still stores
+whole bodies. Metadata-only changes share the content blob
 from the second capture onward; changing content still creates new blobs.
 
 Every `skipUpdatedAt` metadata write now versions, so one audio upload
@@ -105,3 +105,33 @@ upserted note: roughly 3,646 captures and 19 MB for `unforced`, outside any
 single transaction. Delete tombstones are not pruned by the ordinary version
 ceiling; repeated delete/recreate cycles can grow retained history until
 explicit erasure or a configured deleted-history sweep.
+
+### Compaction (v30)
+
+A prototype on this box reduced 5,705,987 to 369,015 blob bytes (**15.5×**)
+on two synthetic notes: a 20 KB log with 100 versions and 116 KB prose with
+30 versions. These are prototype measurements, not production-vault savings.
+The prototype measured 24 base64 bytes for a one-line log append versus about
+21 KB whole, and 11,168 delta bytes versus 2,872,822 whole for 24 prose versions.
+The specification's repeated measurements put prose compaction near 108 ms,
+99 log deltas at 14–74 ms across four shapes, and deltified reads at p95
+4.2–4.6 ms. Tail maxima varied between runs.
+
+Compaction runs synchronously at first vault open. Its time budget is checked
+between notes, so one note can overshoot. Incompressible candidates can recur
+and consume the note budget before smaller notes. Compression is deliberately
+not used: the measured markdown compression gain was 2.6×, versus the prototype
+compaction gain above, and asynchronous CompressionStream cannot run inside a
+Durable Object synchronous transaction.
+
+A later implementation run on the loaded mini measured these wall times (single
+samples, including SQL and encoding): 1 KB / 30 versions **115 ms**; 20 KB log /
+100 versions **2,597 ms**; 119,641-byte prose / 30 versions **178 ms**. Codec shares
+were 22, 2,247 and 118 ms respectively. The log fixture differs from the earlier
+four-shape probe; these results do not establish a universal log bound. The
+corresponding oldest-version read p95 values were 2.20, 3.34 and 18.54 ms.
+The exact candidate SELECT over 100 synthetic notes took 65.76 ms. No other test
+suite ran during these measurements, but the machine had other active processes.
+A production `unforced` database copy migrated from v28 in 1.73 s; it had no
+history tables before migration and zero history blobs afterward. Production
+compaction savings therefore remain unmeasured.

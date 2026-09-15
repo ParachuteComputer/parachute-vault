@@ -274,7 +274,7 @@ function conflictResponse(e: any): Response | null {
   }, 413);
   if (e && e.code === "HISTORY_UNRECOVERABLE") return json({
     error_type: "history_unrecoverable", note_id: e.note_id, version_ix: e.version_ix, message: e.message,
-    hint: "this version is an overflow tombstone — the note's size and deletion were recorded but its content never was",
+    hint: e.reason === "delta_orphan" ? "this version's stored delta cannot be rebuilt — its base blob is missing or corrupt; run GET /api/doctor for the `history_delta_orphan` finding" : "this version is an overflow tombstone — the note's size and deletion were recorded but its content never was",
   }, 409);
   return null;
 }
@@ -2939,7 +2939,7 @@ async function handleNotesInner(
         const limit = Number.isNaN(parsedLimit) ? 50 : Math.min(200, Math.max(0, parsedLimit));
         const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0);
         const versions = await store.listNoteVersions(id, { limit, offset });
-        const total = (store.db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(id) as { n: number }).n;
+        const total = await store.countNoteVersions(id);
         return json({ versions, total });
       }
       if (method === "DELETE") {
@@ -2949,8 +2949,14 @@ async function handleNotesInner(
     } else if (verMatch && method === "GET") {
       const ix = Number(verMatch[1]);
       if (!/^\d+$/.test(verMatch[1]!) || !Number.isInteger(ix) || ix < 0) return json({ error: "Invalid version_ix", error_type: "invalid_request" }, 400);
-      const version = await store.getNoteVersion(id, ix);
-      return version ? json(version) : json({ error: "Not found", error_type: "not_found" }, 404);
+      try {
+        const version = await store.getNoteVersion(id, ix);
+        return version ? json(version) : json({ error: "Not found", error_type: "not_found" }, 404);
+      } catch (e) {
+        const response = conflictResponse(e);
+        if (response) return response;
+        throw e;
+      }
     } else if (sub === "/restore" && method === "POST") {
       const parsed = await parseJsonBody(req);
       if (!parsed.ok) return parsed.response;
@@ -5222,4 +5228,38 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
   content = content.replace(new RegExp(`\\[\\[${escaped}\\|([^\\]]+)\\]\\]`, "gi"), "$1");
   content = content.replace(new RegExp(`\\[\\[${escaped}(#[^\\]]+)?\\]\\]`, "gi"), `${targetPath}$1`);
   return content;
+}
+
+/** POST /api/history/compact — unscoped administrators; absent bounds are unbounded. */
+export async function handleHistoryCompact(req: Request, store: Store, tagScope: TagScopeCtx = NO_TAG_SCOPE): Promise<Response> {
+  if (tagScope.raw !== null)
+    return json({ error: "Not found", error_type: "not_found" }, 404);
+  const declared = Number(req.headers.get("content-length"));
+  if (declared > MAX_JSON_BODY_BYTES)
+    return payloadTooLargeResponse(declared);
+  let body: Record<string, unknown>;
+  try {
+    const raw = await req.text();
+    if (new TextEncoder().encode(raw).length > MAX_JSON_BODY_BYTES)
+      return payloadTooLargeResponse(new TextEncoder().encode(raw).length);
+    const parsed = raw.trim() ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      throw new Error("object required");
+    body = parsed;
+  }
+  catch {
+    return json({ error: "Invalid compaction request", error_type: "invalid_request" }, 400);
+  }
+  if ((body.note_id !== undefined && typeof body.note_id !== "string") ||
+    [body.budget_ms, body.max_notes].some(v => v !== undefined && (typeof v !== "number" || !Number.isInteger(v) || v < 1)))
+    return json({ error: "Invalid compaction request", error_type: "invalid_request" }, 400);
+  try {
+    return json(store.compactHistory({ noteId: body.note_id as string | undefined, budgetMs: body.budget_ms as number | undefined ?? null, maxNotes: body.max_notes as number | undefined ?? null }));
+  }
+  catch (err) {
+    const conflict = conflictResponse(err);
+    if (conflict)
+      return conflict;
+    return json({ error: "Compaction failed", error_type: "compaction_failed", message: err instanceof Error ? err.message : String(err) }, 500);
+  }
 }
