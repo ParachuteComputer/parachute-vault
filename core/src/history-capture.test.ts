@@ -65,6 +65,7 @@ it("P5 live restore captures the prior body and preserves the source version", a
   const source = await store.getNoteVersion(n.id, 1),
     before = await store.getNote(n.id);
   const r = await store.restoreNoteVersion(n.id, 1, {
+    if_updated_at: before!.updatedAt!,
     actor: "restorer",
     via: "api",
   });
