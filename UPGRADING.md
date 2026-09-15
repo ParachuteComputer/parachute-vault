@@ -4,6 +4,30 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## Note history: schema v28 → v29 → v30
+
+The upgrade creates history tables (v29), then adds delta-storage columns and
+the captured note creation timestamp (v30). Existing notes are not backfilled
+into history; existing version rows keep a NULL captured creation timestamp.
+
+The first vault open runs a synchronous, budgeted history compaction pass.
+By default it also enforces `history.max_bytes_per_note: 8388608` (8 MiB),
+which can drop retained versions above the retention floor. The 250 ms budget
+is checked between notes; the first candidate is always attempted, and one
+large note can hold the open for seconds. Back up the vault before upgrading.
+
+To disable compaction and its byte-ceiling enforcement, set these flat keys
+under `history` in the vault configuration before opening the upgraded vault:
+
+```yaml
+history:
+  compact_enabled: false
+  max_bytes_per_note: null
+```
+
+Setting only `max_bytes_per_note: null` keeps compaction enabled while disabling
+the byte ceiling. Ordinary count/age retention still applies in either case.
+
 ## 0.7.2 → 0.7.3 — semantic search opt-in + `note_vectors` schema
 
 Mostly additive. One behavior change worth knowing about (semantic search

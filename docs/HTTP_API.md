@@ -75,6 +75,7 @@ Version history is the first self-hosted-first feature tracked in this table.
 
 | Param | Self-hosted (bun) | Hosted (cloud) | Note |
 |---|---|---|---|
+| `POST /api/history/compact` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524. |
 | `GET /notes/:id/versions` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
 | `GET /notes/:id/versions/:version_ix` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
 | `POST /notes/:id/restore` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
@@ -1496,14 +1497,31 @@ Versions are **not** full-text searchable.
   and irreversible**. It returns `{erased:true, id, versions_deleted,
   blobs_deleted}` without deleting a live note.
 
+- `POST /vault/{name}/api/history/compact` requires **`vault:admin`** and
+  returns a compaction summary, including `remaining_candidates` and
+  `notes_failed`. Optional JSON `{note_id, budget_ms, max_notes}` restricts the
+  run; absent bounds mean unbounded, while explicit zero bounds are 400
+  `invalid_request`. Tag-scoped callers and every other method receive 404.
+
+Older version bodies may be stored as deltas against a newer body. Reads are
+transparent: the content returned is always the full body. A deltified version's
+`encoding` is `"fossil-delta"` on the individual GET, but null in the list view,
+which does not resolve storage. A missing base or unknown encoding returns 409
+`history_unrecoverable`; unscoped doctor reports `history_delta_orphan`.
+The doctor census checks structure, not content checksums; it is not a content audit.
+
 ```json
 {"version_ix": 3, "if_updated_at": "2026-09-14T20:00:00.000Z"}
 ```
 
+Every version row includes `created_at`: the captured note creation time, identical
+across its captured rows and NULL on pre-v30 rows.
+
 Restore does not restore `path` on a live note: it restores content, metadata
 and extension without undoing a later move. Restore of a DELETED note
 re-creates it at the same id, at the tombstone's path, untagged, with
-`created_at` set to its deletion time. A path collision is 409 `path_conflict`.
+`created_at` restored from the captured original creation timestamp. Pre-v30 rows
+with a NULL timestamp fall back to the tombstone timestamp. A path collision is 409 `path_conflict`.
 Restore checks today's strict schemas using the current note's tags before
 writing; a rejected restore is 422 `schema_validation` and changes neither
 note nor history. The existing `vault:migrate` bypass applies and is logged.
@@ -1530,6 +1548,31 @@ pruning. `history.deleted_retention_days: null` retains deleted-note history
 until explicit erasure; a number enables sweeping on open. A `history:`
 config change in the vault's **`vault.yaml`** takes effect at the next daemon
 restart.
+
+Compaction adds these `history:` defaults:
+
+| Key | Default |
+|---|---:|
+| `compact_enabled` | `true` |
+| `compact_ratio` | `3` |
+| `compact_min_versions` | `10` |
+| `compact_run_length` | `24` |
+| `max_bytes_per_note` | `8388608` (8 MiB) |
+| `compact_budget_ms` | `250` |
+| `compact_max_notes` | `50` |
+
+History has three ceilings: count, age and `max_bytes_per_note`. The
+`min_versions` floor outranks all three, includes tombstones, and can leave a
+note over its byte ceiling. `max_bytes_per_note: null` disables the byte ceiling;
+numeric values, including zero, are clamped to at least 65,536 bytes.
+`compact_enabled: false` also disables byte-ceiling enforcement.
+Compaction runs synchronously at first vault open, with budgets checked between
+notes: one note can overshoot the time budget. Zero boot budget skips the pass.
+An incompressible note remains a candidate on subsequent opens and may precede
+other notes under the note budget because candidates are ordered by stored size.
+The unbounded admin route visits every candidate and completes even when some
+bodies cannot be reduced. Byte totals attribute directly referenced blobs to a
+note; shared blobs can count for multiple notes, and indirect bases are excluded.
 
 #### `PATCH /vault/{name}/api/notes/{idOrPath}` — `vault:write`
 Update content, path, metadata, extension, tags, or links. The body

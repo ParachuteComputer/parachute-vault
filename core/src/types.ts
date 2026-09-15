@@ -7,7 +7,7 @@ import type { ValidationStatus } from "./schema-defaults.js";
 import type { ConformanceReport } from "./conformance.js";
 import type { FindPathResult } from "./links.js";
 import type { DoctorReport, DoctorScanOpts } from "./doctor.js";
-import type { HistoryOp, VersionRow } from "./history.js";
+import type { CompactResult, CompactSummary, HistoryOp, VersionRow } from "./history.js";
 
 // ---- Re-exports ----
 
@@ -526,6 +526,9 @@ export interface Store {
   restoreNoteVersion(id: string, versionIx: number, opts: { actor?: string | null; via?: string | null; if_updated_at?: string }): Promise<Note>;
   eraseNoteHistory(id: string): Promise<{ versionsDeleted: number; blobsDeleted: number }>;
   sweepDeletedHistory(): { notesSwept: number; versionsDeleted: number; blobsDeleted: number };
+  countNoteVersions(id: string): Promise<number>;
+  compactNote(id: string): CompactResult;
+  compactHistory(opts?: { noteId?: string; budgetMs?: number | null; maxNotes?: number | null }): CompactSummary;
   deletedHistoryStats(): Promise<{ notes: number; versions: number; bytes: number; overflow_tombstones: number }>;
   queryNotes(opts: QueryOpts): Promise<Note[]>;
   /**
