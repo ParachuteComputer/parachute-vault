@@ -471,5 +471,3 @@ export function applyDelta<T extends ByteArray>(
   }
   throw new Error("unterminated delta");
 }
-
-
