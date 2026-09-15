@@ -4,7 +4,9 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.7.9-rc.5] - 2026-09-15
+
+**Note version history lands: schema 28 → 29 → 30 in one release.** The two commits on `next` since rc.4 are vault#524 PR 1 (#734, capture + retention + read/restore) and PR 2 (#740, the delta compactor and byte-aware ceiling). The first open after upgrading runs both migrations and a budgeted compaction pass; `UPGRADING.md` names the 8 MiB default ceiling and how to disable it. Mirror code is unchanged.
 
 - **History compaction (refs #524, PR 2; closes #735 and #737).** Schema 29 → 30 adds two blob columns and a captured creation timestamp to versions. A vendored BSD 2-clause Fossil byte codec stores depth-1 star deltas with capped runs, transparent reads and a byte-aware per-note ceiling. Adds the admin compact POST, unscoped doctor storage/orphan census and seven compaction policy keys. Deleted restore preserves captured creation time, and version counts have one owner. Two synthetic notes in a prototype used 15.5× fewer blob bytes; specification measurements put prose compaction near 108 ms and delta reads at p95 4.2–4.6 ms. Boot compaction is synchronous and budgeted. No compression is used and no mirror code changed.
 
