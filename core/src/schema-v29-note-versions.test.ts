@@ -19,7 +19,7 @@ it("P14a v28 upgrade creates both tables and three indexes without backfill", ()
   initSchema(db);
   expect(
     db.prepare("SELECT MAX(version) AS version FROM schema_version").get(),
-  ).toEqual({ version: 29 });
+  ).toEqual({ version: 30 });
   const tables = db
     .prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('note_versions','note_blobs') ORDER BY name",

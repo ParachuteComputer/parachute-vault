@@ -37,8 +37,8 @@ read. Restore loads its source before capture/pruning can evict it.
 A REST tag/link write that also updates the note row captures that row, but
 versions do not preserve tag membership or the link tables themselves.
 
-`encoding` is the seam for PR 2. Ordinary rows use NULL and reference a whole
-blob. The only non-NULL value written in v29 is `overflow`: an oversized
+In v30, ordinary version rows keep NULL `encoding`; storage encoding lives on
+the shared blob. Whole blobs use NULL and delta blobs use `fossil-delta`. The only non-NULL value written in v29 is `overflow`: an oversized
 note's deletion records size, metadata and existence with a NULL hash, but
 no recoverable content. A restore marker copied from that tombstone retains
 `overflow` and its NULL hash, even on a recreated live note. Updates of prior content larger than 2,000,000 UTF-8
@@ -69,9 +69,9 @@ Ordinary additive import captures each upsert independently.
 Live restore keeps today's path and tags, restores content/metadata/extension,
 and uses ordinary update validation and optimistic concurrency. REST checks
 today's strict schemas first; migration bypass is logged. Deleted restore
-uses the same id, the tombstone path, no tags, and deletion time as
-`created_at`. The last two are accepted PR 1 limitations; preserving original
-creation time is a follow-up. Path collisions roll back the whole restore.
+uses the same id and tombstone path, without restoring tags. Original creation
+time is restored from v30 captures (#735); legacy NULL timestamps retain the
+tombstone-time fallback. Tag membership remains a limitation. Path collisions roll back the whole restore.
 
 Deleted history is available only over unscoped REST. MCP requires a live
 note; its wrapper explicitly scopes the new object result. Doctor's deleted
@@ -81,3 +81,31 @@ blobs may also be referenced by live-note histories.
 
 PR 1 changes no mirror code. The existing mirror remains the only pre-v29
 record; launch retirement and import belong to PR 3.
+
+## Compaction (v30)
+
+Encoding belongs to `note_blobs`, because multiple version rows share each
+content-addressed blob. The hash continues to identify the reconstructed UTF-8
+body; `byte_size` now measures stored bytes, while `note_versions.content_len`
+measures logical bytes. Deltas are base64 Fossil byte deltas, without compression.
+A depth-1 star points children at a whole base, with runs capped at 24 versions.
+Prototype star reads measured p95 around 4.2–4.6 ms; avoiding chained decoding
+keeps read cost independent of the number of retained versions.
+
+Payloads at least 90% of the original stored size are refused. Encoding savings
+depend on shared byte windows; independent random bodies generally expand under
+base64 and remain whole. Such notes remain candidates on later opens and can
+consume the budget before smaller candidates. This scheduling limitation is deferred.
+
+Count, age and stored-byte ceilings share the newest-row floor, including
+protected tombstones. The byte pass compacts before dropping oldest eligible
+rows. Blob GC protects both version references and delta-base references.
+Missing or non-whole bases, unknown encoding and failed reconstruction raise a
+history delta-orphan error; external reads and restores use `history_unrecoverable`.
+Doctor's unscoped storage census is structural, not a content audit. Its per-note
+attribution excludes indirect bases and can count a shared blob for multiple notes.
+
+The boot pass is synchronous and budgeted (250 ms, 50 notes by default), checks
+bounds between notes, and may overshoot by one note. A failed note transaction
+rolls back and increments `notes_failed`; other candidates continue. The admin
+POST can run without bounds. Disabling compaction also disables the byte ceiling.

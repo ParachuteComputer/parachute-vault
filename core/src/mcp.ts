@@ -706,7 +706,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             return version;
           }
           const versions = await store.listNoteVersions(note.id, { limit: Math.max(0, Math.min(v.limit ?? 50, 200)), offset: v.offset ?? 0 });
-          const total = (db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(note.id) as { n: number }).n;
+          const total = await store.countNoteVersions(note.id);
           return { versions, total };
         }
 

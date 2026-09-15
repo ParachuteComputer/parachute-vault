@@ -6,7 +6,7 @@ import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
 
-export const SCHEMA_VERSION = 29;
+export const SCHEMA_VERSION = 30;
 
 /**
  * Deterministic last-resort epoch for a note whose `updated_at` AND
@@ -182,10 +182,47 @@ CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content
 -- the pragma throws there is no FK enforcement at all and no signal. The
 -- NOT EXISTS guard on every blob delete is therefore the PRIMARY defence and
 -- the FK is the backstop, not the other way round (§4.6).
+-- note_blobs.encoding IS NULL  -> \`content\` is the literal body, \`byte_size\`
+--   is its UTF-8 byte length, and \`hash\` = sha256(content). This is every row
+--   v29 ever wrote.
+-- note_blobs.encoding = 'fossil-delta' -> \`content\` is the BASE64 of a Fossil
+--   delta that reconstructs this row's logical body from the body of the blob
+--   named by \`delta_of\`; \`byte_size\` is the length of that base64 payload, i.e.
+--   the bytes actually stored. \`hash\` is STILL sha256 of the LOGICAL body, so
+--   every note_versions.content_hash reference and its FK stay valid and
+--   content-addressed identity is never a delta hash (ClaudeJi R3).
+--   The LOGICAL byte length is note_versions.content_len, which PR 1
+--   denormalised for exactly this moment (PR 1 §2.1: "it must stay readable
+--   after PR 2 deltifies the blob").
+-- ANY OTHER \`encoding\` VALUE IS CORRUPTION. It is not a future format marker to
+--   be tolerated: a read of such a row answers 409 (materialise's
+--   "unknown_encoding" branch) and the doctor counts it (historyStorageStats's
+--   unknown_encoding_blobs). A later format adds its value here AND to both.
+--
+-- DEPTH IS EXACTLY ONE, AND THAT IS AN INVARIANT, NOT A TUNING CHOICE.
+--   delta_of MUST name a row whose \`encoding IS NULL\`. A delta is never the
+--   base of another delta. Rebuilding any version is therefore ONE applyDelta,
+--   measured p95 3.73 ms / p99 4.68 ms on a 116 KB note, against 38.98 ms /
+--   49.99 ms for a 24-link chain on the same note -- the chain sits ON the
+--   50 ms budget with no headroom. Star also confines corruption: a damaged
+--   delta loses one version, not every older one. See §11.1 D1.
+--
+-- delta_of carries a REAL self-referential FK with the default NO ACTION, and
+-- it IS enforced on a bun handle (probe E: deleting a referenced base raises
+-- FOREIGN KEY constraint failed). It is the backstop; the NOT EXISTS guards in
+-- pruneVersions and gcBlobs are the primary defence, exactly as for
+-- content_hash in v29 (PR 1 §4.6).
+--
+-- note_versions.created_at (#735) is the captured note's OWN creation time,
+-- copied from notes.created_at at capture. NULL on every pre-v30 row; a
+-- deleted-note restore falls back to the tombstone's superseded_at when it is
+-- NULL, which is precisely v29's behaviour.
 CREATE TABLE IF NOT EXISTS note_blobs (
   hash       TEXT PRIMARY KEY,
   content    TEXT NOT NULL,
-  byte_size  INTEGER NOT NULL
+  byte_size  INTEGER NOT NULL,
+  encoding TEXT,
+  delta_of TEXT REFERENCES note_blobs(hash)
 );
 
 CREATE TABLE IF NOT EXISTS note_versions (
@@ -201,6 +238,7 @@ CREATE TABLE IF NOT EXISTS note_versions (
   op            TEXT NOT NULL,
   content_len   INTEGER NOT NULL,
   encoding      TEXT,
+  created_at    TEXT,
   PRIMARY KEY (note_id, version_ix)
 );
 -- list/get (newest first) + the prune walk.
@@ -701,6 +739,8 @@ export function initSchema(db: Database): void {
 
   // v29: note-level history, no backfill.
   migrateToV29(db);
+  // v30: depth-one history deltas and captured creation time, no backfill.
+  migrateToV30(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1903,6 +1943,17 @@ CREATE INDEX IF NOT EXISTS idx_note_versions_superseded ON note_versions(superse
 -- boot sweep runs it on an opted-in vault's open path (§4.6).
 CREATE INDEX IF NOT EXISTS idx_note_versions_hash ON note_versions(content_hash);
     `);
+  });
+}
+
+/** Add delta representation and creation time without moving prior rows. */
+function migrateToV30(db: Database): void {
+  transaction(db, () => {
+    if (hasTable(db, "note_blobs") && !hasColumn(db, "note_blobs", "encoding")) db.exec("ALTER TABLE note_blobs ADD COLUMN encoding TEXT");
+    if (hasTable(db, "note_blobs") && !hasColumn(db, "note_blobs", "delta_of")) db.exec("ALTER TABLE note_blobs ADD COLUMN delta_of TEXT REFERENCES note_blobs(hash)");
+    if (hasTable(db, "note_versions") && !hasColumn(db, "note_versions", "created_at")) db.exec("ALTER TABLE note_versions ADD COLUMN created_at TEXT");
+    // SCHEMA_SQL runs before migrations: the index must be created here.
+    db.exec("CREATE INDEX IF NOT EXISTS idx_note_blobs_delta_of ON note_blobs(delta_of)");
   });
 }
 
