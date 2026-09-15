@@ -4,6 +4,16 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.9-rc.5] - 2026-09-15
+
+**Note version history lands: schema 28 → 29 → 30 in one release.** The two commits on `next` since rc.4 are vault#524 PR 1 (#734, capture + retention + read/restore) and PR 2 (#740, the delta compactor and byte-aware ceiling). The first open after upgrading runs both migrations and a budgeted compaction pass; `UPGRADING.md` names the 8 MiB default ceiling and how to disable it. Mirror code is unchanged.
+
+- **History compaction (refs #524, PR 2; closes #735 and #737).** Schema 29 → 30 adds two blob columns and a captured creation timestamp to versions. A vendored BSD 2-clause Fossil byte codec stores depth-1 star deltas with capped runs, transparent reads and a byte-aware per-note ceiling. Adds the admin compact POST, unscoped doctor storage/orphan census and seven compaction policy keys. Deleted restore preserves captured creation time, and version counts have one owner. Two synthetic notes in a prototype used 15.5× fewer blob bytes; specification measurements put prose compaction near 108 ms and delta reads at p95 4.2–4.6 ms. Boot compaction is synchronous and budgeted. No compression is used and no mirror code changed.
+
+- **Note version history core (refs #524, PR 1 of 5).** Schema 28 → 29 adds `note_versions` and content-addressed `note_blobs`. Updates, append/prepend, deletes, tag renames and linked-note rename cascades capture prior state atomically. History defaults to enabled with a 20-version floor, a 100-version ceiling and 180-day age bound, configurable per vault under `history:`; deleted history is retained until explicit erase by default. Four REST routes list/read/restore/erase versions, MCP `query-notes` gains read-only `versions`, and unscoped doctor reports retained deleted history. Strict-schema restore rejection leaves history unchanged; the migration bypass remains logged.
+
+  The launch plan switches off live git-mirror export and keeps the repo as a **static archive**, the only pre-v29 record. The importer and retirement itself are PR 3. **PR 1 changes no mirror code**: `parachute-vault history`, `MirrorManager` and `/.parachute/mirror/history` are unchanged and still work.
+
 ## [0.7.9-rc.4] - 2026-09-13
 
 **A scoped reader's link graph stops moving with edges it cannot see, a stable can no longer skip its rc, and the hosted-door support table catches up with cloud.** The seven commits on `next` since rc.3 (#715, #718, #720, #722, #732), plus the merge of the 0.7.9-rc.3 promotion back into the line. No schema change — still 28.

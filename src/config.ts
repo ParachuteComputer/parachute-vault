@@ -233,6 +233,22 @@ export interface VaultConfig {
   auto_transcribe?: {
     enabled?: boolean;
   };
+  /** Note history policy; read once when the vault store opens (vault#524). */
+  history?: {
+    enabled?: boolean;
+    min_versions?: number;
+    max_versions?: number;
+    max_age_days?: number;
+    deleted_retention_days?: number | null;
+    /** Defaults: enabled=true, ratio=3, min=10, run=24, bytes=8 MiB, budget=250ms, notes=50. */
+    compact_enabled?: boolean;
+    compact_ratio?: number;
+    compact_min_versions?: number;
+    compact_run_length?: number;
+    max_bytes_per_note?: number | null;
+    compact_budget_ms?: number;
+    compact_max_notes?: number;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +552,13 @@ function serializeVaultConfig(config: VaultConfig): string {
     lines.push(`audio_retention: ${config.audio_retention}`);
   }
 
+  // Per-vault history policy: serialize only explicitly configured fields.
+  if (config.history) {
+    lines.push("history:");
+    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes"] as const) {
+      if (config.history[key] !== undefined) lines.push(`  ${key}: ${config.history[key]}`);
+    }
+  }
   // Per-vault auto-transcribe override. Serialized as a nested block so future
   // fields can grow under it (mirrors the GlobalConfig shape). Only emitted
   // when `enabled` is explicitly set — an unset vault falls back to global.
@@ -693,6 +716,25 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
         config.auto_transcribe = { enabled: m[1]! === "true" };
         break;
       }
+    }
+  }
+
+  const historyStart = yaml.match(/^history:\s*$/m);
+  if (historyStart) {
+    const after = yaml.slice((historyStart.index ?? 0) + historyStart[0].length);
+    config.history = {};
+    for (const line of after.split("\n")) {
+      if (line.match(/^\S/) && line.trim().length > 0) break;
+      const enabled = line.match(/^\s+(enabled|compact_enabled):\s*(true|false)\s*$/);
+      if (enabled) config.history[enabled[1] as "enabled" | "compact_enabled"] = enabled[2] === "true";
+      const number = line.match(/^\s+(min_versions|max_versions|max_age_days|compact_min_versions|compact_run_length|compact_budget_ms|compact_max_notes):\s*(\d+)\s*$/);
+      if (number) config.history[number[1] as "min_versions" | "max_versions" | "max_age_days" | "compact_min_versions" | "compact_run_length" | "compact_budget_ms" | "compact_max_notes"] = Number(number[2]);
+      const ratio = line.match(/^\s+compact_ratio:\s*(\d+(?:\.\d+)?)\s*$/);
+      if (ratio) config.history.compact_ratio = Number(ratio[1]);
+      const bytes = line.match(/^\s+max_bytes_per_note:\s*(null|\d+)\s*$/);
+      if (bytes) config.history.max_bytes_per_note = bytes[1] === "null" ? null : Number(bytes[1]);
+      const deleted = line.match(/^\s+deleted_retention_days:\s*(null|\d+)\s*$/);
+      if (deleted) config.history.deleted_retention_days = deleted[1] === "null" ? null : Number(deleted[1]);
     }
   }
 

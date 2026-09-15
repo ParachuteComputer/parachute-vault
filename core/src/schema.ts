@@ -6,7 +6,7 @@ import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
 
-export const SCHEMA_VERSION = 28;
+export const SCHEMA_VERSION = 30;
 
 /**
  * Deterministic last-resort epoch for a note whose `updated_at` AND
@@ -141,6 +141,114 @@ CREATE TABLE IF NOT EXISTS note_vectors (
 -- Backs the staleness diff (per-note row fetch) and the model-mismatch
 -- sweep (a model <> ? scan) the backfill/drain use to find pending work.
 CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content_hash);
+
+-- note_blobs + note_versions (v29, vault#524): note-level version history.
+--
+-- STORAGE. A version row is skinny; the BODY lives once per distinct content,
+-- keyed by its sha256, in note_blobs. A metadata-only edit on a 116 KB note
+-- costs one ~300-byte version row and a no-op \`INSERT OR IGNORE\` on the blob —
+-- the whole answer to "does every little update store an entirely new copy?"
+-- Live \`notes.content\` stays on \`notes\`: no join on the hot read path.
+--
+-- encoding IS NULL FOR EVERY ORDINARY ROW IN v29. NULL means "content_hash
+-- names a WHOLE blob". It exists so the PR-2 compactor can rewrite an old row
+-- to reference a delta (setting a format marker) with no second migration and
+-- no version-id change. The ONE non-NULL value v29 ever writes is the literal
+-- 'overflow', on a delete tombstone for a note whose body exceeded
+-- VERSION_MAX_BYTES: the row records that the note WAS deleted and how big it
+-- was, with content_hash NULL because the bytes were never blobbed. A delete
+-- must never be blocked by history (see history.ts captureVersion step 5).
+-- A restore marker copied from that tombstone also retains overflow encoding
+-- and a NULL hash, including after the note has been recreated.
+--
+-- content_hash IS NULLABLE, and it is nullable ONLY for that overflow
+-- tombstone or its copied restore marker. Every consumer must filter NULL —
+-- in particular gcBlobs's \`NOT IN (SELECT content_hash ...)\` MUST carry
+-- \`WHERE content_hash IS NOT NULL\`, or one NULL in the subquery makes the
+-- whole NOT IN evaluate to NULL and the sweep silently deletes nothing.
+--
+-- NO \`REFERENCES notes(id) ON DELETE CASCADE\` — the one deviation from
+-- note_vectors above, deliberate. deleteNote writes a final op='delete' row and
+-- the \`notes\` row then goes away; a cascade would delete the only surviving
+-- copy at the instant it became the only copy. Deleted-note history is reaped
+-- by the configurable sweep (history.deleted_retention_days) or an explicit
+-- erase, never by the FK.
+--
+-- content_hash DOES have a real FK to note_blobs with the default NO ACTION,
+-- so SQLite itself enforces the one invariant refcount GC protects: deleting a
+-- still-referenced blob raises instead of silently orphaning a version.
+-- foreign_keys is turned ON per connection in applyConnectionPragmas
+-- (schema.ts:486) — but inside a SWALLOWING try/catch, so on a handle where
+-- the pragma throws there is no FK enforcement at all and no signal. The
+-- NOT EXISTS guard on every blob delete is therefore the PRIMARY defence and
+-- the FK is the backstop, not the other way round (§4.6).
+-- note_blobs.encoding IS NULL  -> \`content\` is the literal body, \`byte_size\`
+--   is its UTF-8 byte length, and \`hash\` = sha256(content). This is every row
+--   v29 ever wrote.
+-- note_blobs.encoding = 'fossil-delta' -> \`content\` is the BASE64 of a Fossil
+--   delta that reconstructs this row's logical body from the body of the blob
+--   named by \`delta_of\`; \`byte_size\` is the length of that base64 payload, i.e.
+--   the bytes actually stored. \`hash\` is STILL sha256 of the LOGICAL body, so
+--   every note_versions.content_hash reference and its FK stay valid and
+--   content-addressed identity is never a delta hash (ClaudeJi R3).
+--   The LOGICAL byte length is note_versions.content_len, which PR 1
+--   denormalised for exactly this moment (PR 1 §2.1: "it must stay readable
+--   after PR 2 deltifies the blob").
+-- ANY OTHER \`encoding\` VALUE IS CORRUPTION. It is not a future format marker to
+--   be tolerated: a read of such a row answers 409 (materialise's
+--   "unknown_encoding" branch) and the doctor counts it (historyStorageStats's
+--   unknown_encoding_blobs). A later format adds its value here AND to both.
+--
+-- DEPTH IS EXACTLY ONE, AND THAT IS AN INVARIANT, NOT A TUNING CHOICE.
+--   delta_of MUST name a row whose \`encoding IS NULL\`. A delta is never the
+--   base of another delta. Rebuilding any version is therefore ONE applyDelta,
+--   measured p95 3.73 ms / p99 4.68 ms on a 116 KB note, against 38.98 ms /
+--   49.99 ms for a 24-link chain on the same note -- the chain sits ON the
+--   50 ms budget with no headroom. Star also confines corruption: a damaged
+--   delta loses one version, not every older one. See §11.1 D1.
+--
+-- delta_of carries a REAL self-referential FK with the default NO ACTION, and
+-- it IS enforced on a bun handle (probe E: deleting a referenced base raises
+-- FOREIGN KEY constraint failed). It is the backstop; the NOT EXISTS guards in
+-- pruneVersions and gcBlobs are the primary defence, exactly as for
+-- content_hash in v29 (PR 1 §4.6).
+--
+-- note_versions.created_at (#735) is the captured note's OWN creation time,
+-- copied from notes.created_at at capture. NULL on every pre-v30 row; a
+-- deleted-note restore falls back to the tombstone's superseded_at when it is
+-- NULL, which is precisely v29's behaviour.
+CREATE TABLE IF NOT EXISTS note_blobs (
+  hash       TEXT PRIMARY KEY,
+  content    TEXT NOT NULL,
+  byte_size  INTEGER NOT NULL,
+  encoding TEXT,
+  delta_of TEXT REFERENCES note_blobs(hash)
+);
+
+CREATE TABLE IF NOT EXISTS note_versions (
+  note_id       TEXT NOT NULL,
+  version_ix    INTEGER NOT NULL,
+  content_hash  TEXT REFERENCES note_blobs(hash),
+  path          TEXT,
+  metadata      TEXT,
+  extension     TEXT,
+  superseded_at TEXT NOT NULL,
+  actor         TEXT,
+  via           TEXT,
+  op            TEXT NOT NULL,
+  content_len   INTEGER NOT NULL,
+  encoding      TEXT,
+  created_at    TEXT,
+  PRIMARY KEY (note_id, version_ix)
+);
+-- list/get (newest first) + the prune walk.
+CREATE INDEX IF NOT EXISTS idx_note_versions_note ON note_versions(note_id, version_ix DESC);
+-- the age half of retention + the deleted-note sweep.
+CREATE INDEX IF NOT EXISTS idx_note_versions_superseded ON note_versions(superseded_at);
+-- refcount GC: "is any version still pointing at this blob?" This index is
+-- what keeps gcBlobs's per-vault-open anti-join off a full table scan; the
+-- boot sweep runs it on an opted-in vault's open path (§4.6).
+CREATE INDEX IF NOT EXISTS idx_note_versions_hash ON note_versions(content_hash);
 
 -- tag_schemas (v6) was retired in v14; description + fields lifted onto the
 -- tags row directly. The CREATE TABLE was removed from SCHEMA_SQL after the
@@ -628,6 +736,11 @@ export function initSchema(db: Database): void {
   // table is rebuilt. Does not create the table on vaults that never
   // queued an unresolved link, and does not rewrite notes.
   migrateToV28(db);
+
+  // v29: note-level history, no backfill.
+  migrateToV29(db);
+  // v30: depth-one history deltas and captured creation time, no backfill.
+  migrateToV30(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1754,6 +1867,94 @@ function migrateToV27(db: Database): void {
  */
 function migrateToV28(db: Database): void {
   ensureRelationshipColumn(db);
+}
+
+/** Add history tables and indexes without moving existing note data. */
+function migrateToV29(db: Database): void {
+  transaction(db, () => {
+    db.exec(`
+-- note_blobs + note_versions (v29, vault#524): note-level version history.
+--
+-- STORAGE. A version row is skinny; the BODY lives once per distinct content,
+-- keyed by its sha256, in note_blobs. A metadata-only edit on a 116 KB note
+-- costs one ~300-byte version row and a no-op \`INSERT OR IGNORE\` on the blob —
+-- the whole answer to "does every little update store an entirely new copy?"
+-- Live \`notes.content\` stays on \`notes\`: no join on the hot read path.
+--
+-- encoding IS NULL FOR EVERY ORDINARY ROW IN v29. NULL means "content_hash
+-- names a WHOLE blob". It exists so the PR-2 compactor can rewrite an old row
+-- to reference a delta (setting a format marker) with no second migration and
+-- no version-id change. The ONE non-NULL value v29 ever writes is the literal
+-- 'overflow', on a delete tombstone for a note whose body exceeded
+-- VERSION_MAX_BYTES: the row records that the note WAS deleted and how big it
+-- was, with content_hash NULL because the bytes were never blobbed. A delete
+-- must never be blocked by history (see history.ts captureVersion step 5).
+-- A restore marker copied from that tombstone also retains overflow encoding
+-- and a NULL hash, including after the note has been recreated.
+--
+-- content_hash IS NULLABLE, and it is nullable ONLY for that overflow
+-- tombstone or its copied restore marker. Every consumer must filter NULL —
+-- in particular gcBlobs's \`NOT IN (SELECT content_hash ...)\` MUST carry
+-- \`WHERE content_hash IS NOT NULL\`, or one NULL in the subquery makes the
+-- whole NOT IN evaluate to NULL and the sweep silently deletes nothing.
+--
+-- NO \`REFERENCES notes(id) ON DELETE CASCADE\` — the one deviation from
+-- note_vectors above, deliberate. deleteNote writes a final op='delete' row and
+-- the \`notes\` row then goes away; a cascade would delete the only surviving
+-- copy at the instant it became the only copy. Deleted-note history is reaped
+-- by the configurable sweep (history.deleted_retention_days) or an explicit
+-- erase, never by the FK.
+--
+-- content_hash DOES have a real FK to note_blobs with the default NO ACTION,
+-- so SQLite itself enforces the one invariant refcount GC protects: deleting a
+-- still-referenced blob raises instead of silently orphaning a version.
+-- foreign_keys is turned ON per connection in applyConnectionPragmas
+-- (schema.ts:486) — but inside a SWALLOWING try/catch, so on a handle where
+-- the pragma throws there is no FK enforcement at all and no signal. The
+-- NOT EXISTS guard on every blob delete is therefore the PRIMARY defence and
+-- the FK is the backstop, not the other way round (§4.6).
+CREATE TABLE IF NOT EXISTS note_blobs (
+  hash       TEXT PRIMARY KEY,
+  content    TEXT NOT NULL,
+  byte_size  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS note_versions (
+  note_id       TEXT NOT NULL,
+  version_ix    INTEGER NOT NULL,
+  content_hash  TEXT REFERENCES note_blobs(hash),
+  path          TEXT,
+  metadata      TEXT,
+  extension     TEXT,
+  superseded_at TEXT NOT NULL,
+  actor         TEXT,
+  via           TEXT,
+  op            TEXT NOT NULL,
+  content_len   INTEGER NOT NULL,
+  encoding      TEXT,
+  PRIMARY KEY (note_id, version_ix)
+);
+-- list/get (newest first) + the prune walk.
+CREATE INDEX IF NOT EXISTS idx_note_versions_note ON note_versions(note_id, version_ix DESC);
+-- the age half of retention + the deleted-note sweep.
+CREATE INDEX IF NOT EXISTS idx_note_versions_superseded ON note_versions(superseded_at);
+-- refcount GC: "is any version still pointing at this blob?" This index is
+-- what keeps gcBlobs's per-vault-open anti-join off a full table scan; the
+-- boot sweep runs it on an opted-in vault's open path (§4.6).
+CREATE INDEX IF NOT EXISTS idx_note_versions_hash ON note_versions(content_hash);
+    `);
+  });
+}
+
+/** Add delta representation and creation time without moving prior rows. */
+function migrateToV30(db: Database): void {
+  transaction(db, () => {
+    if (hasTable(db, "note_blobs") && !hasColumn(db, "note_blobs", "encoding")) db.exec("ALTER TABLE note_blobs ADD COLUMN encoding TEXT");
+    if (hasTable(db, "note_blobs") && !hasColumn(db, "note_blobs", "delta_of")) db.exec("ALTER TABLE note_blobs ADD COLUMN delta_of TEXT REFERENCES note_blobs(hash)");
+    if (hasTable(db, "note_versions") && !hasColumn(db, "note_versions", "created_at")) db.exec("ALTER TABLE note_versions ADD COLUMN created_at TEXT");
+    // SCHEMA_SQL runs before migrations: the index must be created here.
+    db.exec("CREATE INDEX IF NOT EXISTS idx_note_blobs_delta_of ON note_blobs(delta_of)");
+  });
 }
 
 function hasTable(db: Database, name: string): boolean {

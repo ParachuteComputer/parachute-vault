@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow, SemanticSearchResult } from "./types.js";
+import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
 import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
@@ -98,6 +99,7 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
  */
 export class BunSqliteStore implements Store {
   public readonly hooks: HookRegistry;
+  private readonly historyPolicy: HistoryPolicy;
 
   // Lazy-built caches over the post-v14 `tags` table — hierarchy via
   // parent_names, schema validation via `fields`. Null means "not yet
@@ -133,9 +135,10 @@ export class BunSqliteStore implements Store {
 
   constructor(
     public readonly db: Database,
-    opts?: { hooks?: HookRegistry; embeddingProvider?: EmbeddingProvider; embeddingDisabledReason?: string },
+    opts?: { history?: Partial<HistoryPolicy>; hooks?: HookRegistry; embeddingProvider?: EmbeddingProvider; embeddingDisabledReason?: string },
   ) {
     initSchema(db);
+    this.historyPolicy = resolveHistoryPolicy(opts?.history);
     this.hooks = opts?.hooks ?? new HookRegistry();
     this.embeddingProvider = opts?.embeddingProvider;
     this.embeddingDisabledReason = opts?.embeddingDisabledReason;
@@ -574,6 +577,27 @@ export class BunSqliteStore implements Store {
       metadata?: Record<string, unknown>;
       created_at?: string;
       skipUpdatedAt?: boolean;
+      /**
+       * State-transition compare-and-set (vault#299 Part B). DECLARED here as
+       * of vault#524 — it always arrived at runtime (src/routes.ts:3214 sets
+       * it on a `const updates: any = {}` at :3167 and passes it at :3257, and
+       * noteOps.updateNote has read it at notes.ts:708 since #299) but it was
+       * never on the declared type, so an object LITERAL carrying it did not
+       * compile. Declaring it is what lets a core test construct the shape
+       * directly (P1, P11b) instead of laundering it through `any`.
+       */
+      state_transition?: { field: string; from: unknown; to: unknown };
+      /**
+       * INTERNAL — the `op` stamped on the version row this write captures
+       * (vault#524). Set ONLY by Store.restoreNoteVersion, to "restore".
+       * noteOps.updateNote ignores it (it reads named fields, never
+       * Object.keys), so it never reaches SQL. Do NOT accept it from REST or
+       * MCP: src/routes.ts's PATCH handler builds `updates` field by field and
+       * must not copy it out of the request body, and core/src/mcp.ts's
+       * update-note executor must not either. §10.24 pins that.
+       */
+      historyOp?: HistoryOp;
+
       // Write-attribution (vault#298) — principal + interface of this edit.
       actor?: string | null;
       via?: string | null;
@@ -633,6 +657,10 @@ export class BunSqliteStore implements Store {
     // atomic unit. Any later failure must leave the note and its indexes at
     // the pre-update state rather than committing only the first SQL write.
     const note = this.transaction(() => {
+      if (willWriteNoteRow(updates)) {
+        const prior = readPriorNoteRow(this.db, id);
+        if (prior) captureVersion(this.db, prior, { actor: updates.actor ?? null, via: updates.via ?? null, op: historyOpFor(updates), policy: this.historyPolicy });
+      }
       const note = noteOps.updateNote(this.db, id, updates);
 
       // Wikilink sync runs against the *resulting* content. For append/prepend
@@ -644,7 +672,7 @@ export class BunSqliteStore implements Store {
 
       if (updates.path !== undefined && note.path) {
         if (cascadePlan && oldPath && oldPath !== note.path) {
-          this.cascadeRename(cascadePlan, note, oldPath);
+          this.cascadeRename(cascadePlan, note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null });
         }
         resolveUnresolvedWikilinks(this.db, note.path, id);
         // vault#581 — a rename is one of the two ways an ambiguity stops being
@@ -747,7 +775,7 @@ export class BunSqliteStore implements Store {
    * `unresolved_wikilinks` and `ambiguous_wikilinks` stay consistent with
    * the new text.
    */
-  private cascadeRename(plan: Map<string, string[]>, note: Note, oldPath: string): void {
+  private cascadeRename(plan: Map<string, string[]>, note: Note, oldPath: string, attr: { actor: string | null; via: string | null }): void {
     if (plan.size === 0 || !note.path) return;
     const newPath = note.path;
 
@@ -785,10 +813,51 @@ export class BunSqliteStore implements Store {
         (target) => mapping.get(target.toLowerCase()) ?? null,
       );
       if (updated !== row.content) {
+        const prior = readPriorNoteRow(this.db, sourceId);
+        if (prior) captureVersion(this.db, prior, { ...attr, op: "cascade-rename", policy: this.historyPolicy });
         noteOps.updateNote(this.db, sourceId, { content: updated });
         syncWikilinks(this.db, sourceId, updated);
       }
     }
+  }
+
+  async listNoteVersions(id: string, opts?: { limit?: number; offset?: number }) { return listVersions(this.db, id, opts); }
+  async getNoteVersion(id: string, versionIx: number) { return getVersion(this.db, id, versionIx); }
+  async eraseNoteHistory(id: string) { return eraseHistory(this.db, id); }
+  sweepDeletedHistory() { return sweepDeletedHistory(this.db, this.historyPolicy); }
+  async countNoteVersions(id: string) { return countNoteVersions(this.db, id); }
+  compactNote(id: string) { return compactNote(this.db, id, this.historyPolicy); }
+  compactHistory(opts?: { noteId?: string; budgetMs?: number | null; maxNotes?: number | null }) { return compactVault(this.db, this.historyPolicy, opts); }
+  async deletedHistoryStats() { return deletedHistoryStats(this.db); }
+  async restoreNoteVersion(id: string, versionIx: number, opts: { actor?: string | null; via?: string | null; if_updated_at?: string }): Promise<Note> {
+    if (noteOps.getNote(this.db, id)) {
+      const v = getVersion(this.db, id, versionIx);
+      if (!v) throw new HistoryNotFoundError(id, versionIx);
+      if (v.encoding === "overflow") throw new HistoryUnrecoverableError(id, versionIx);
+      return await this.updateNote(id, {
+        content: v.content!, metadata: v.metadata, extension: v.extension ?? undefined,
+        actor: opts.actor ?? null, via: opts.via ?? null,
+        ...(opts.if_updated_at !== undefined ? { if_updated_at: opts.if_updated_at } : {}),
+        historyOp: "restore",
+      });
+    }
+    const tomb = latestTombstone(this.db, id);
+    if (!tomb) throw new HistoryNotFoundError(id, null);
+    const v = getVersion(this.db, id, versionIx);
+    if (!v) throw new HistoryNotFoundError(id, versionIx);
+    if (v.encoding === "overflow") throw new HistoryUnrecoverableError(id, versionIx);
+    if (opts.if_updated_at !== undefined) throw new noteOps.ConflictError(id, tomb.path, null, opts.if_updated_at);
+    return this.transaction(() => {
+      const note = noteOps.createNote(this.db, v.content!, {
+        id, path: tomb.path ?? undefined, metadata: v.metadata,
+        extension: v.extension ?? undefined, created_at: v.created_at ?? tomb.superseded_at,
+        actor: opts.actor ?? null, via: opts.via ?? null,
+      });
+      appendRestoreMarker(this.db, id, tomb, { actor: opts.actor ?? null, via: opts.via ?? null }, this.historyPolicy);
+      if (note.content) syncWikilinks(this.db, id, note.content);
+      if (note.path) resolveUnresolvedWikilinks(this.db, note.path, id);
+      return note;
+    });
   }
 
   async restoreNoteTimestamps(id: string, createdAt: string, updatedAt: string): Promise<void> {
@@ -813,7 +882,7 @@ export class BunSqliteStore implements Store {
       .run(createdAt, updatedAt, updatedAtMs, id);
   }
 
-  async deleteNote(id: string): Promise<void> {
+  async deleteNote(id: string, opts?: { actor?: string | null; via?: string | null; captureHistory?: boolean }): Promise<void> {
     // Read before delete so we can invalidate config caches on the way out
     // AND so the post-delete hook dispatch carries the minimum payload
     // ({ id, path }). The full note can't be reconstructed post-delete —
@@ -826,14 +895,20 @@ export class BunSqliteStore implements Store {
     // it's individually re-saved. See requeueInboundWikilinksForDelete's doc
     // comment for why this must run pre-delete and what it deliberately
     // excludes (typed `links`, not just wikilinks).
-    requeueInboundWikilinksForDelete(this.db, id);
-    // vault#581 — the deleted note's resolution keys, captured BEFORE the row
-    // goes away and swept AFTER, so a `[[Dup]]` that was ambiguous only
-    // because of THIS note resolves (or, if it was the last candidate,
-    // demotes to an ordinary broken link).
-    const ambiguityKeys = noteResolutionKeys(existing);
-    noteOps.deleteNote(this.db, id);
-    refreshAmbiguousLinks(this.db, ambiguityKeys);
+    this.transaction(() => {
+      requeueInboundWikilinksForDelete(this.db, id);
+      // vault#581 — the deleted note's resolution keys, captured BEFORE the row
+      // goes away and swept AFTER, so a `[[Dup]]` that was ambiguous only
+      // because of THIS note resolves (or, if it was the last candidate,
+      // demotes to an ordinary broken link).
+      const ambiguityKeys = noteResolutionKeys(existing);
+      if (opts?.captureHistory !== false) {
+        const prior = readPriorNoteRow(this.db, id);
+        if (prior) captureVersion(this.db, prior, { actor: opts?.actor ?? null, via: opts?.via ?? null, op: "delete", policy: this.historyPolicy });
+      }
+      noteOps.deleteNote(this.db, id);
+      refreshAmbiguousLinks(this.db, ambiguityKeys);
+    });
     if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
     // Dispatch even when `existing` was null — the caller asked for a
     // deletion, and downstream consumers (e.g. the mirror) reconcile via
@@ -1094,8 +1169,8 @@ export class BunSqliteStore implements Store {
     return result;
   }
 
-  async renameTag(oldName: string, newName: string): Promise<noteOps.RenameTagResult> {
-    const result = noteOps.renameTag(this.db, oldName, newName);
+  async renameTag(oldName: string, newName: string, opts?: { actor?: string; via?: string }): Promise<noteOps.RenameTagResult> {
+    const result = noteOps.renameTag(this.db, oldName, newName, opts, this.historyPolicy);
     // Vault#240: the cascade rewrites parent_names in OTHER tag rows as
     // part of the same transaction, plus tokens.scoped_tags and
     // indexed_fields.declarer_tags. Both caches are tag-keyed, so they
@@ -1728,3 +1803,17 @@ export class BunSqliteStore implements Store {
 export const SqliteStore = BunSqliteStore;
 /** @deprecated Renamed to `BunSqliteStore`. */
 export type SqliteStore = BunSqliteStore;
+
+const MUTATING_UPDATE_KEYS = ["content", "append", "prepend", "path", "extension", "metadata", "created_at", "state_transition"] as const;
+function willWriteNoteRow(u: Parameters<Store["updateNote"]>[1]): boolean {
+  for (const key of MUTATING_UPDATE_KEYS) if (u[key] !== undefined) return true;
+  return u.skipUpdatedAt !== true;
+}
+function historyOpFor(u: Parameters<Store["updateNote"]>[1]): HistoryOp {
+  if (typeof u.historyOp === "string") return u.historyOp;
+  if (u.append !== undefined) return "append";
+  if (u.prepend !== undefined) return "prepend";
+  return "update";
+}
+export { HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES };
+export type { HistoryPolicy, HistoryOp, VersionRow, CompactResult, CompactSummary };

@@ -208,6 +208,17 @@ Response shape (vault#550 — three variants, pick by what you passed):
             required: ["note_id"],
             description: "Scope results to notes within N hops of an anchor note",
           },
+          versions: {
+            type: "object",
+            properties: {
+              note_id: { type: "string", description: "Note ID or path" },
+              version_ix: { type: "integer", minimum: 0 },
+              limit: { type: "integer", minimum: 0, maximum: 200 },
+              offset: { type: "integer", minimum: 0 },
+            },
+            required: ["note_id"],
+            description: "Read note history; mutually exclusive with id, search, near, cursor, aggregate, and semantic. Tag-scoped sessions see the SAME visibility enforcement as every other read — a note outside the token's tag scope answers `not_found`, and a deleted note's history is not readable by a scoped session at all. Deleted-note history is also unavailable to unscoped MCP sessions; restore is REST-only.",
+          },
           sort: {
             type: "string",
             enum: ["asc", "desc"],

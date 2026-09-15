@@ -71,8 +71,16 @@ That's the whole happy path. Everything else in this doc is detail.
   attachment tickets below. **Every cloud parity PR that lands or removes a
   param from this list updates this table.**
 
+Version history is the first self-hosted-first feature tracked in this table.
+
 | Param | Self-hosted (bun) | Hosted (cloud) | Note |
 |---|---|---|---|
+| `POST /api/history/compact` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524. |
+| `GET /notes/:id/versions` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
+| `GET /notes/:id/versions/:version_ix` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
+| `POST /notes/:id/restore` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
+| `DELETE /notes/:id/versions` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
+| `query-notes versions (MCP)` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
 | `has_broken_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
 | `has_ambiguous_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
 | `include_broken_links` | honored | honored | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7) |
@@ -1469,6 +1477,103 @@ Folding options:
   `content_total_length` / `content_next_offset`. See "Content range —
   bounded reads for large notes" above.
 
+### Version history
+
+Self-hosted only in PR 1 of #524; the hosted door follows in PR 4. History
+begins at the v29 upgrade (**no backfill** — the git mirror repo is the only
+pre-v29 record). A **create** writes no version. Each later mutation captures
+the prior content and metadata; identical content shares one SHA-256 blob.
+Versions are **not** full-text searchable.
+
+- `GET /vault/{name}/api/notes/{idOrPath}/versions?limit=50&offset=0`
+  (`vault:read`) returns `{versions, total}`, newest first, without content.
+  Maximum page size is 200.
+- `GET /vault/{name}/api/notes/{idOrPath}/versions/{version_ix}`
+  (`vault:read`) returns one version with its content; missing versions are 404.
+- `POST /vault/{name}/api/notes/{idOrPath}/restore` (`vault:write`)
+  accepts `{version_ix, if_updated_at?}` and returns the note with
+  `restored_from` and `recreated`. A stale token is 409 `conflict`.
+- `DELETE /vault/{name}/api/notes/{idOrPath}/versions` is **`vault:admin`
+  and irreversible**. It returns `{erased:true, id, versions_deleted,
+  blobs_deleted}` without deleting a live note.
+
+- `POST /vault/{name}/api/history/compact` requires **`vault:admin`** and
+  returns a compaction summary, including `remaining_candidates` and
+  `notes_failed`. Optional JSON `{note_id, budget_ms, max_notes}` restricts the
+  run; absent bounds mean unbounded, while explicit zero bounds are 400
+  `invalid_request`. Tag-scoped callers and every other method receive 404.
+
+Older version bodies may be stored as deltas against a newer body. Reads are
+transparent: the content returned is always the full body. A deltified version's
+`encoding` is `"fossil-delta"` on the individual GET, but null in the list view,
+which does not resolve storage. A missing base or unknown encoding returns 409
+`history_unrecoverable`; unscoped doctor reports `history_delta_orphan`.
+The doctor census checks structure, not content checksums; it is not a content audit.
+
+```json
+{"version_ix": 3, "if_updated_at": "2026-09-14T20:00:00.000Z"}
+```
+
+Every version row includes `created_at`: the captured note creation time, identical
+across its captured rows and NULL on pre-v30 rows.
+
+Restore does not restore `path` on a live note: it restores content, metadata
+and extension without undoing a later move. Restore of a DELETED note
+re-creates it at the same id, at the tombstone's path, untagged, with
+`created_at` restored from the captured original creation timestamp. Pre-v30 rows
+with a NULL timestamp fall back to the tombstone timestamp. A path collision is 409 `path_conflict`.
+Restore checks today's strict schemas using the current note's tags before
+writing; a rejected restore is 422 `schema_validation` and changes neither
+note nor history. The existing `vault:migrate` bypass applies and is logged.
+
+A `version_ix` is a stable bookmark **only within a lineage** (an erase
+restarts it at 0). Deleted-note history is readable only by an unscoped REST
+session using the note's id and is **not readable over MCP at all**. Scoped
+sessions get the ordinary 404 for deleted notes. A later tag grant exposes
+earlier versions too, just as it exposes the live note.
+
+Malformed version indices return 400 `invalid_request`; restore without
+`version_ix` returns 400 `missing_required_field`. Insufficient permission
+returns 403 `insufficient_scope`.
+
+A note over 2 MB cannot be updated while history is on (413
+`history_overflow`) but can always be deleted, leaving an overflow tombstone
+whose content is unrecoverable. Reading that version returns `content:null`
+and `encoding:"overflow"`; restoring it is 409 `history_unrecoverable`.
+
+The defaults are enabled, a 20-version floor, a 100-version ceiling and
+180-day maximum age above the floor. The ceiling is at least 1 and at least
+the floor; both age settings are capped at 36,500 days. Delete tombstones are exempt from this
+pruning. `history.deleted_retention_days: null` retains deleted-note history
+until explicit erasure; a number enables sweeping on open. A `history:`
+config change in the vault's **`vault.yaml`** takes effect at the next daemon
+restart.
+
+Compaction adds these `history:` defaults:
+
+| Key | Default |
+|---|---:|
+| `compact_enabled` | `true` |
+| `compact_ratio` | `3` |
+| `compact_min_versions` | `10` |
+| `compact_run_length` | `24` |
+| `max_bytes_per_note` | `8388608` (8 MiB) |
+| `compact_budget_ms` | `250` |
+| `compact_max_notes` | `50` |
+
+History has three ceilings: count, age and `max_bytes_per_note`. The
+`min_versions` floor outranks all three, includes tombstones, and can leave a
+note over its byte ceiling. `max_bytes_per_note: null` disables the byte ceiling;
+numeric values, including zero, are clamped to at least 65,536 bytes.
+`compact_enabled: false` also disables byte-ceiling enforcement.
+Compaction runs synchronously at first vault open, with budgets checked between
+notes: one note can overshoot the time budget. Zero boot budget skips the pass.
+An incompressible note remains a candidate on subsequent opens and may precede
+other notes under the note budget because candidates are ordered by stored size.
+The unbounded admin route visits every candidate and completes even when some
+bodies cannot be reduced. Byte totals attribute directly referenced blobs to a
+note; shared blobs can count for multiple notes, and indirect bases are excluded.
+
 #### `PATCH /vault/{name}/api/notes/{idOrPath}` — `vault:write`
 Update content, path, metadata, extension, tags, or links. The body
 supports three mutually-exclusive content modes:
@@ -2395,6 +2500,10 @@ hasn't landed yet; until it does, `request-attachment-upload` /
 (D10 — an agent is never shown an affordance the runtime can't back).
 
 ### MCP
+
+`query-notes` supports a read-only, tag-scope-enforced `versions` mode on the
+self-hosted door, with no deleted-note history; restore is deliberately
+REST-only in PR 1 of #524.
 
 `GET|POST /vault/{name}/mcp[/*]` — Streaming HTTP transport. Auth is by
 the same credentials as REST (Bearer / X-API-Key). Per-tool scope is
