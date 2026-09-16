@@ -438,8 +438,11 @@ interface BlobReadRow {
 function materialise(db: Database, hash: string, row: BlobReadRow): string | null {
   if (row.content === null)
     return null;
-  if (row.blob_encoding === null)
+  if (row.blob_encoding === null) {
+    if (hashContent(row.content) !== hash)
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "identity_mismatch");
     return row.content;
+  }
   if (row.blob_encoding !== "fossil-delta")
     throw new HistoryDeltaOrphanError(hash, row.delta_of, "unknown_encoding");
   const base = row.delta_of ? db.prepare("SELECT content, encoding FROM note_blobs WHERE hash = ?").get(row.delta_of) as {
