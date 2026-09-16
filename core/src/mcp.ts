@@ -1,3 +1,4 @@
+import { getImportedVersion, parseHistorySelector, projectHistoryRow } from "./history-import.js";
 import { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts, Attachment } from "./types.js";
 import { transactionAsync } from "./txn.js";
@@ -698,16 +699,22 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               error_type: "invalid_query", field: "versions", hint: `drop ${key} when using versions`,
             });
           }
-          const v = params.versions as { note_id: string; version_ix?: number; limit?: number; offset?: number };
+          const v = params.versions as { note_id: string; version_ix?: number; origin?: unknown; import_ix?: unknown; limit?: number; offset?: number };
+          const selector = parseHistorySelector(v);
           const note = requireNote(db, requireNoteReference(v.note_id));
-          if (typeof v.version_ix === "number") {
-            const version = await store.getNoteVersion(note.id, v.version_ix);
+          if (selector && "import_ix" in selector) {
+            const version = getImportedVersion(db, note.id, selector.import_ix);
+            if (!version) return { error: "Imported version not found", error_type: "not_found", id: v.note_id, ...selector };
+            return projectHistoryRow(version);
+          }
+          if (selector && "version_ix" in selector) {
+            const version = await store.getNoteVersion(note.id, selector.version_ix);
             if (!version) return { error: `Version not found: "${v.note_id}"@${v.version_ix}`, error_type: "not_found", id: v.note_id, version_ix: v.version_ix };
             return version;
           }
           const versions = await store.listNoteVersions(note.id, { limit: Math.max(0, Math.min(v.limit ?? 50, 200)), offset: v.offset ?? 0 });
           const total = await store.countNoteVersions(note.id);
-          return { versions, total };
+          return { versions: versions.map(projectHistoryRow), total };
         }
 
         // --- Single note by ID/path ---

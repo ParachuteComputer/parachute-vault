@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { assertVaultNotPaused, VaultImportPausedError, MirrorRetiredError } from "./mirror-config.ts";
 /**
  * Multi-vault HTTP server using Bun.serve().
  *
@@ -430,22 +431,27 @@ for (const warning of reservedNameSquatWarnings(listVaults())) {
 // Migrate tag schemas from vault.yaml → DB for each vault.
 // Only inserts schemas that don't already exist in the DB (safe across restarts).
 for (const vaultName of listVaults()) {
-  const vaultConfig = readVaultConfig(vaultName);
-  if (vaultConfig?.tag_schemas && Object.keys(vaultConfig.tag_schemas).length > 0) {
-    const store = getVaultStore(vaultName);
-    const existingTags = new Set((await store.listTagSchemas()).map((s) => s.tag));
-    let migrated = 0;
-    for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
-      if (!existingTags.has(tag)) {
-        await store.upsertTagSchema(tag, schema);
-        migrated++;
+  try {
+    const vaultConfig = readVaultConfig(vaultName);
+    if (vaultConfig?.tag_schemas && Object.keys(vaultConfig.tag_schemas).length > 0) {
+      const store = getVaultStore(vaultName);
+      const existingTags = new Set((await store.listTagSchemas()).map((s) => s.tag));
+      let migrated = 0;
+      for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
+        if (!existingTags.has(tag)) {
+          await store.upsertTagSchema(tag, schema);
+          migrated++;
+        }
+      }
+      if (migrated > 0) {
+        console.log(`[migration] migrated ${migrated} tag schema(s) from vault.yaml to DB for vault "${vaultName}"`);
+      } else {
+        console.log(`[migration] vault "${vaultName}" has tag_schemas in vault.yaml (already in DB — vault.yaml section can be removed)`);
       }
     }
-    if (migrated > 0) {
-      console.log(`[migration] migrated ${migrated} tag schema(s) from vault.yaml to DB for vault "${vaultName}"`);
-    } else {
-      console.log(`[migration] vault "${vaultName}" has tag_schemas in vault.yaml (already in DB — vault.yaml section can be removed)`);
-    }
+  } catch (err) {
+    if (!(err instanceof VaultImportPausedError)) throw err;
+    console.warn(`[history-import] vault "${vaultName}" is paused; skipping tag-schema migration`);
   }
 }
 
@@ -633,6 +639,16 @@ const server = Bun.serve({
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
+    // Refuse before WS upgrade and before any route can open/maintain a paused DB.
+    const vaultSegment = /^\/vault\/([^/]+)/.exec(path)?.[1];
+    if (vaultSegment && listVaults().includes(vaultSegment)) {
+      try { assertVaultNotPaused(vaultSegment); }
+      catch (err) {
+        if (!(err instanceof VaultImportPausedError)) throw err;
+        return Response.json({ error_type: err.error_type, message: err.message }, { status: 503, headers: corsHeaders });
+      }
+    }
+
     // Live-query WebSocket upgrade — detected BEFORE the fetch pipeline because
     // WS upgrades don't traverse `route()`. Non-upgrade requests (incl. a
     // straggler non-WS GET /subscribe, which now gets a 410 Gone in routing.ts —
@@ -659,6 +675,9 @@ const server = Bun.serve({
       }
       return response;
     } catch (err) {
+      if (err instanceof VaultImportPausedError || err instanceof MirrorRetiredError) {
+        return Response.json({ error_type: err.error_type, message: err.message }, { status: err.status, headers: corsHeaders });
+      }
       console.error(`[${req.method} ${path}]`, err);
       return Response.json(
         { error: "Internal server error" },

@@ -147,3 +147,9 @@ The exact candidate SELECT over 100 synthetic notes took 4.98 ms in this run.
 A production `unforced` database copy migrated from v28 in 580 ms; it had no
 history tables before migration and zero history blobs afterward. Production
 compaction savings therefore remain unmeasured.
+
+## Offline git-history importer bounds
+
+The importer stages observations in temporary SQLite and walks first-parent trees in commit order. Limits are 100,000 note identities, 100,000 commits, 10,000,000 tree entries across the walk, 2 GiB of distinct decoded source objects, 32 MiB per git command output, and 64 MiB of staged observations per note. Limits fail loudly; they never truncate history. A single body above the existing 2,000,000-byte ceiling quarantines its note. Temporary storage must accommodate the source staging, target DB copy, and private bundle/object database. Projection and apply process notes in the same ID order, using identical retention/compaction rules and a frozen policy time.
+
+Measured importer timings and production-copy coverage must be recorded with the tested source tip and implementation commit; the compactor prototype numbers above are not importer measurements.

@@ -16,6 +16,7 @@ import { encodeDelta, decodeDelta } from "./delta.js";
 import { transaction } from "./txn.js";
 
 export type HistoryOp =
+  | "import"
   | "update"
   | "append"
   | "prepend"
@@ -162,7 +163,7 @@ function nextIndex(db: Database, noteId: string): number {
   return (
     db
       .prepare(
-        "SELECT COALESCE(MAX(version_ix), -1) + 1 AS ix FROM note_versions WHERE note_id = ?",
+        "SELECT COALESCE(MAX(version_ix), -1) + 1 AS ix FROM note_versions WHERE note_id = ? AND version_ix >= 0",
       )
       .get(noteId) as { ix: number }
   ).ix;
@@ -258,6 +259,7 @@ export function pruneVersions(
   db: Database,
   noteId: string,
   policy: HistoryPolicy,
+  now = Date.now(),
 ): { versionsDeleted: number; blobsDeleted: number } {
   const rows = db
     .prepare(
@@ -268,7 +270,7 @@ export function pruneVersions(
     "version_ix" | "superseded_at" | "op" | "content_hash"
   >[];
   const cutoff = new Date(
-    Date.now() - policy.max_age_days * 86_400_000,
+    now - policy.max_age_days * 86_400_000,
   ).toISOString();
   const doomed = rows.filter(
     (r, i) =>

@@ -4,6 +4,33 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## Git history import: schema v30 → v31
+
+v31 adds import runs, receipts and source references. Opening a vault does not import or retire its mirror. Native history remains usable; automatic mirror exports continue until an explicit cutover.
+
+First rehearse on a copy. Keep the original repository and an independently stored bundle. Import recovers exported observations, not edits that were never exported. Git author identity is not imported. Markdown export may already have added a trailing newline; the importer preserves exported body bytes, including CRLF, but cannot reconstruct pre-export bytes.
+
+```sh
+parachute-vault history-import plan --vault NAME --source /absolute/repo --through FULL_COMMIT_SHA --output /absolute/plan.json
+parachute stop vault
+parachute-vault history-import prepare --vault NAME --source /absolute/repo --through FULL_COMMIT_SHA --archive /absolute/history.bundle --output /absolute/final.json
+parachute-vault history-import apply --vault NAME --manifest /absolute/final.json --archive /absolute/history.bundle
+parachute-vault history-import retire --vault NAME --manifest /absolute/final.json
+parachute start vault
+```
+
+Keep the daemon stopped from prepare through retire, including interruptions. Prepare writes a recovery journal, a consistent pre-import SQLite backup, a paused marker and disabled mirror config. It then verifies the bundle and creates a fresh final manifest. Diagnostic plans cannot be applied. Apply reads a private verified copy of the bundle; later commits in the working repository cannot change its input. Paused vault requests answer 503; other vaults continue serving after an accidental restart. Retired vaults serve normally, but live mirror writers and attempts to re-enable them are refused.
+
+Inspect the manifest before apply: policy runs `pruneVersions` then `compactNote`, with a frozen evaluation time. It can remove imported **and native** rows; the manifest lists native indices to be removed and separate imported/native counts. Surviving native indices are never renumbered. Configure retention explicitly before prepare if needed. Do not mistake retained SQLite history for the complete archive.
+
+Duplicate IDs and oversized revisions quarantine the entire note. Missing live IDs are reported and skipped; no deleted note or deletion event is invented. Quarantined IDs and live IDs missing at the final tip block cutover unless explicitly waived before prepare using `--waivers FILE` (JSON object mapping note ID to an operator's reason). Unidentified source issues must be resolved. A waiver excludes the note from import while preserving it in the archive; it is not an import success.
+
+On interruption, retry apply with the **same** manifest and bundle. Receipts survive retention and history erasure, so retry cannot resurrect erased versions. Different source/options runs cannot take ownership of an already imported note. Stale unprocessed target state refuses with the backup location: reconcile unexpected writes rather than overwriting them. Before any receipt exists, `history-import cancel --vault NAME` restores config under the pause guard, then restores the prior marker or writes an explicit active marker. It never removes the marker. After a receipt exists, cancel refuses; resume the same run. Missing marker plus enabled config means live export. Do not delete markers or receipts to bypass a refusal.
+
+The journal is `data/NAME/history-import-recovery.json`; the marker is `data/NAME/history-mirror-state.json`, alongside `mirror-config.yaml`. Keep post-import backups of the entire DB so receipts travel with history. A dead importer PID permits lock recovery; a lock without a valid PID needs operator verification that no importer is running before removing only `history-import.lock`. No database is automatically restored.
+
+Global `default_mirror` is unchanged. Set it to `off` explicitly if future vaults should not create live mirrors. Manual portable export and `export --watch` remain available. No repository, remote or credential is deleted.
+
 ## Note history: schema v28 → v29 → v30
 
 The upgrade creates history tables (v29), then adds delta-storage columns and

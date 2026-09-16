@@ -1477,6 +1477,16 @@ Folding options:
   `content_total_length` / `content_next_offset`. See "Content range —
   bounded reads for large notes" above.
 
+### Imported git history references
+
+Imported history appears in existing version lists with `origin: "git-import"` and nonnegative `import_ix`, omitting `version_ix`. The newest imported observation is `import_ix: 0`; older observations increase that index. Native rows keep their existing `version_ix` shape and appear before imported rows. For example: native 1, native 0, import 0, import 1. The boundary is provenance, not a claim about exact edit chronology.
+
+`GET /vault/{name}/api/notes/{idOrPath}/imports/{import_ix}` reads a retained imported observation. Paths use the same URL encoding and tag-scope checks as `/versions/{version_ix}`. Restore uses the existing POST `/notes/{idOrPath}/restore` with `{ "origin": "git-import", "import_ix": 0 }`, optionally `if_updated_at`. `restored_from` is that reference object for imports. Native `{version_ix}` remains unchanged. Mixed, incomplete, negative, fractional or unsafe selectors are rejected. Pruned imports return 404 with their public reference; unrecoverable imports return 409 `history_unrecoverable` with the reference, never an internal storage index.
+
+MCP `query-notes` accepts `versions: {note_id, origin:"git-import", import_ix:0}` for reads. It preserves existing live-note and tag-scope restrictions. Corrupt imported content produces a JSON-RPC error with `error.data.error_type`, `origin`, and `import_ix`; it is not a successful tool result containing an error string. There is no new MCP restore operation.
+
+History erasure removes retained content through the existing GC rules. Minimal import receipts and commit/blob references remain to prevent re-import after erasure; a full vault wipe removes them. Git committer identity is not historical note authorship: imported rows have null actor and `via: "git-import"`.
+
 ### Version history
 
 Self-hosted only in PR 1 of #524; the hosted door follows in PR 4. History

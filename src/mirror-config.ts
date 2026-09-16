@@ -930,3 +930,41 @@ export async function validateExternalPath(
   }
   return { ok: true, resolved_path: externalPath };
 }
+
+export class VaultImportPausedError extends Error {
+  readonly error_type = "history_import_paused";
+  readonly status = 503;
+  constructor() { super("Vault history import is paused"); this.name = "VaultImportPausedError"; }
+}
+export class MirrorRetiredError extends Error {
+  readonly error_type = "mirror_retired";
+  readonly status = 409;
+  constructor() { super("This vault mirror is retired"); this.name = "MirrorRetiredError"; }
+}
+export function historyMirrorStatePath(vaultName: string): string {
+  return join(dirname(mirrorConfigPath(vaultName)), "history-mirror-state.json");
+}
+export function historyImportRecoveryPath(vaultName: string): string {
+  return join(dirname(mirrorConfigPath(vaultName)), "history-import-recovery.json");
+}
+export function readHistoryMirrorPhase(vaultName: string): "active" | "paused" | "retired" {
+  let raw: string;
+  try { raw = readFileSync(historyMirrorStatePath(vaultName), "utf8"); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "active";
+    throw new VaultImportPausedError();
+  }
+  try {
+    const state = JSON.parse(raw);
+    if (state?.phase === "active" || state?.phase === "paused" || state?.phase === "retired") return state.phase;
+  } catch {}
+  throw new VaultImportPausedError();
+}
+export function assertVaultNotPaused(vaultName: string): void {
+  if (readHistoryMirrorPhase(vaultName) === "paused") throw new VaultImportPausedError();
+}
+export function assertMirrorActive(vaultName: string): void {
+  const phase = readHistoryMirrorPhase(vaultName);
+  if (phase === "paused") throw new VaultImportPausedError();
+  if (phase === "retired") throw new MirrorRetiredError();
+}
