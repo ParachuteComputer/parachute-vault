@@ -169,3 +169,6 @@ A diagnostic projection on a consistent copy of the uni vault completed in **799
 | Unidentified source issues | 0 |
 
 Projection runs the actual writer, retention/compaction and retained-content verification on the copy. It is not a production cutover or a benchmark of every prepare/apply/retire command. No waivers were supplied; quarantine and coverage findings block apply until explicitly resolved or waived. The earlier development-source sample took 731.90 seconds and produced the same counts; it is not attributed to a commit. The compactor prototype measurements above are unrelated to importer timing.
+
+
+Explicit duplicate selections add a bounded per-tree candidate buffer and a canonical input map (at most 100,000 entries / 32 MiB). The candidate census at frozen tip `4f96cdb0cb7b21b7ab5b7c32e735cf508e7e2a94` covered 2,224 trees and 801,331 parsed candidates across 653 identities, identifying 22,623 duplicate-tree sets for 11 identities. This census licenses proposed exact selections; it is not a measurement of the extension's retention outcome. A projection with selections must report newly eligible notes and their native deletion sets separately.

@@ -1,10 +1,11 @@
 import { test, expect } from "bun:test";
+import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { stageArchive, runHistoryImport, type ImportManifest } from "./history-import.ts";
+import { stageArchive, runHistoryImport, type ImportManifest, normalizeHistorySelections, type HistorySelections } from "./history-import.ts";
 import { writeVaultConfig, writeGlobalConfig, vaultDbPath } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { getImportedVersion } from "../core/src/history-import.ts";
@@ -155,3 +156,163 @@ test("first-parent import sees side-branch notes only in the merge tree", () => 
     expect(JSON.parse(side.row_json).commit).toBe(tip);
   } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+function selectionFile(repo: string, tip: string, entries: HistorySelections["selections"]): HistorySelections {
+  const walk = git(repo, "log", "--first-parent", "--reverse", "--format=%H %T", tip) + "\n";
+  return { format: 1, tip, source_fingerprint: createHash("sha256").update(walk).digest("hex"), selections: entries };
+}
+function pin(repo: string, commitId: string, path: string) { return { git_path: path, blob: git(repo, "rev-parse", `${commitId}:${path}`) }; }
+function selection(repo: string, commitId: string, selected: string, rejected: string, id = noteId): HistorySelections["selections"][number] {
+  return { note_id: id, commit: commitId, selected: pin(repo, commitId, selected), rejected: [{ ...pin(repo, commitId, rejected), reason: "Retained stale export" }], reason: "Reviewed explicit fixture path" };
+}
+function selectedStage(repo: string, tip: string, selectors?: HistorySelections) {
+  const db = new Database(":memory:");
+  try {
+    stageArchive(repo, tip, db, selectors);
+    return {
+      rows: (db.query("SELECT row_json FROM observations ORDER BY note_id,seq").all() as { row_json: string }[]).map(r => JSON.parse(r.row_json)),
+      quarantine: db.query("SELECT * FROM quarantine ORDER BY note_id").all(),
+      failures: db.query("SELECT * FROM selection_failures ORDER BY note_id,commit_id").all(),
+    };
+  } finally { db.close(); }
+}
+
+test("exact selections resolve duplicate trees regardless of Git path order; same bodies still require a selection", () => {
+  const dir = mkdtempSync(join(tmpdir(), "selection-order-"));
+  try {
+    for (const selectedFirst of [true, false]) {
+      const repo = repoAt(join(dir, String(selectedFirst))), oldPath = selectedFirst ? "z-old.md" : "a-old.md", newPath = selectedFirst ? "a-new.md" : "z-new.md";
+      commit(repo, "old", noteId, oldPath); const tip = commit(repo, "selected", noteId, newPath);
+      const selectors = selectionFile(repo, tip, [selection(repo, tip, newPath, oldPath)]);
+      expect(selectedStage(repo, tip).quarantine).toEqual([{ note_id: noteId, reason: "duplicate_id" }]);
+      const result = selectedStage(repo, tip, selectors);
+      expect(result.quarantine).toEqual([]); expect(result.rows.map(r => r.content)).toEqual(["old", "selected"]);
+      expect(result.rows[1].path).toBe("entry"); // Comes from frontmatter, not the Git path.
+    }
+    const repo = repoAt(join(dir, "same"));
+    commit(repo, "same", noteId, "old.md");
+    writeFileSync(join(repo, "new.md"), `---\nid: ${noteId}\npath: renamed\n---\nsame`);
+    git(repo, "add", "."); git(repo, "commit", "-m", "same body, new path"); const tip = git(repo, "rev-parse", "HEAD");
+    expect(selectedStage(repo, tip).quarantine).toHaveLength(1);
+    const result = selectedStage(repo, tip, selectionFile(repo, tip, [selection(repo, tip, "new.md", "old.md")]));
+    expect(result.rows.map(r => r.path)).toEqual(["entry", "renamed"]); expect(result.quarantine).toEqual([]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+test("stale selectors, candidate mismatches, rejected divergence and unlisted duplicate trees quarantine the whole note", () => {
+  const dir = mkdtempSync(join(tmpdir(), "selection-refusal-"));
+  try {
+    const repo = repoAt(join(dir, "repo")); const first = commit(repo, "old", noteId, "old.md"), tip = commit(repo, "new", noteId, "new.md");
+    const good = selectionFile(repo, tip, [selection(repo, tip, "new.md", "old.md")]);
+    const bad: HistorySelections[] = [];
+    for (const field of ["blob", "git_path"] as const) {
+      const copy = structuredClone(good); copy.selections[0]!.selected[field] = field === "blob" ? "0".repeat(40) : "absent.md"; bad.push(copy);
+      const rejected = structuredClone(good); rejected.selections[0]!.rejected[0]![field] = field === "blob" ? "0".repeat(40) : "absent.md"; bad.push(rejected);
+    }
+    const extra = structuredClone(good); extra.selections[0]!.rejected.push({ git_path: "third.md", blob: good.selections[0]!.selected.blob, reason: "Not present" }); bad.push(extra);
+    const singleton = structuredClone(good); singleton.selections.push({ ...selection(repo, tip, "old.md", "new.md"), commit: first }); bad.push(singleton);
+    const missing = structuredClone(good); missing.selections = []; bad.push(missing);
+    const absent = structuredClone(good); absent.selections[0]!.note_id = "01M2KT4GXMQDNB8ZFXY05MHT6B"; bad.push(absent);
+    for (const selectors of bad) {
+      const result = selectedStage(repo, tip, selectors);
+      expect(result.rows).toEqual([]); expect(result.quarantine).toContainEqual({ note_id: noteId, reason: "duplicate_id" }); expect(result.failures.length).toBeGreaterThan(0);
+    }
+    const changed = commit(repo, "rejected diverged", noteId, "old.md");
+    const divergent = selectionFile(repo, changed, [...good.selections, { ...good.selections[0]!, commit: changed }]);
+    expect(selectedStage(repo, changed, divergent).failures).toContainEqual({ note_id: noteId, commit_id: changed, reason: "candidate_set_mismatch" });
+    const third = commit(repo, "third candidate", noteId, "third.md");
+    const unlisted = selectionFile(repo, third, [...good.selections, selection(repo, changed, "new.md", "old.md")]);
+    expect(selectedStage(repo, third, unlisted).rows).toEqual([]);
+    expect(selectedStage(repo, third, { ...unlisted, selections: [...unlisted.selections, selection(repo, third, "new.md", "old.md")] }).failures).toContainEqual({ note_id: noteId, commit_id: third, reason: "candidate_set_mismatch" });
+    expect(() => selectedStage(repo, tip, { ...good, source_fingerprint: "0".repeat(64) })).toThrow("fingerprint");
+    expect(() => selectedStage(repo, tip, { ...good, tip: first })).toThrow("tip");
+    const foreign = structuredClone(good); foreign.selections[0]!.commit = "0".repeat(40);
+    expect(() => selectedStage(repo, tip, foreign)).toThrow("first-parent");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+test("selections cannot clear ambiguous sidecars or oversized observations", () => {
+  const dir = mkdtempSync(join(tmpdir(), "selection-causes-"));
+  try {
+    const repo = repoAt(join(dir, "sidecars")), other = "01M2KT4GXMQDNB8ZFXY05MHT6B";
+    mkdirSync(join(repo, ".parachute/notes-meta"), { recursive: true });
+    for (const id of [noteId, other]) writeFileSync(join(repo, `.parachute/notes-meta/${id}.yaml`), `id: ${id}\npath: shared\nextension: json\n`);
+    writeFileSync(join(repo, "shared.json"), "{}"); const tip = commit(repo, "inline selected", noteId, "inline.md");
+    const item = selection(repo, tip, "inline.md", "shared.json");
+    item.rejected[0]!.sidecar = pin(repo, tip, `.parachute/notes-meta/${noteId}.yaml`);
+    const result = selectedStage(repo, tip, selectionFile(repo, tip, [item]));
+    expect(result.failures).toEqual([]); // The exact successful set matches; another cause remains authoritative.
+    expect(result.quarantine).toContainEqual({ note_id: noteId, reason: "ambiguous_sidecar" }); expect(result.rows).toEqual([]);
+    const large = repoAt(join(dir, "large")); commit(large, "x".repeat(2_000_001), noteId, "bad.md");
+    commit(large, "old", noteId, "old.md"); const end = commit(large, "new", noteId, "new.md");
+    const kept = selectedStage(large, end, selectionFile(large, end, [selection(large, end, "new.md", "old.md")]));
+    expect(kept.failures).toEqual([]); expect(kept.quarantine).toEqual([{ note_id: noteId, reason: "oversized_body" }]); expect(kept.rows).toEqual([]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+test("selection normalization rejects malformed pins and canonicalizes array order", () => {
+  const ref = { git_path: "a.md", blob: "a".repeat(40) }, other = { git_path: "b.md", blob: "b".repeat(40), reason: "kept" };
+  const input: HistorySelections = { format: 1, tip: "c".repeat(40), source_fingerprint: "d".repeat(64), selections: [{ note_id: noteId, commit: "c".repeat(40), selected: ref, rejected: [other, { ...other, git_path: "c.md" }], reason: "audit" }, { note_id: noteId, commit: "e".repeat(40), selected: ref, rejected: [other], reason: "audit" }] };
+  const reversed = structuredClone(input); reversed.selections.reverse(); for (const s of reversed.selections) s.rejected.reverse();
+  expect(normalizeHistorySelections(input)).toEqual(normalizeHistorySelections(reversed));
+  expect(() => normalizeHistorySelections({ ...input, body: "not permitted" })).toThrow();
+  expect(() => normalizeHistorySelections({ ...input, selections: [input.selections[0], input.selections[0]] })).toThrow("Duplicate selection");
+  expect(() => normalizeHistorySelections({ ...input, selections: [{ ...input.selections[0], reason: "" }] })).toThrow("reasons");
+  expect(() => normalizeHistorySelections({ ...input, selections: [{ ...input.selections[0], selected: { ...ref, git_path: "../a.md" } }] })).toThrow("reference");
+});
+
+test("partial selections block apply; complete selections are embedded and restage to the projected digest", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "selection-cutover-")), saved = process.env.PARACHUTE_HOME;
+  process.env.PARACHUTE_HOME = join(dir, "home");
+  try {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response() }); const port = probe.port!; probe.stop(true); writeGlobalConfig({ port });
+    writeVaultConfig({ name: "test", api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore("test"), a = await store.createNote("native A"), b = await store.createNote("native B"); clearVaultStoreCache();
+    const repo = repoAt(join(dir, "repo")); commit(repo, "a old", a.id, "a-old.md"); const t1 = commit(repo, "a new", a.id, "a-new.md");
+    const t2 = commit(repo, "b old", b.id, "b-old.md"), tip = commit(repo, "b new", b.id, "b-new.md");
+    const partial = selectionFile(repo, tip, [t1,t2,tip].map(c => selection(repo, c, "a-new.md", "a-old.md", a.id)));
+    const complete = selectionFile(repo, tip, [...partial.selections, selection(repo, tip, "b-new.md", "b-old.md", b.id)]);
+    const file = join(dir, "selections.json"); writeFileSync(file, JSON.stringify(partial));
+    for (const command of ["apply", "retire", "cancel"]) await expect(runHistoryImport([command, "--selections", file])).rejects.toThrow("only valid for plan/prepare");
+    const prepared = join(dir, "partial.json"), archive = join(dir, "partial.bundle");
+    const p = await runHistoryImport(["prepare", "--vault", "test", "--source", repo, "--through", tip, "--selections", file, "--archive", archive, "--output", prepared]) as ImportManifest;
+    expect(p.quarantined).toEqual([{ note_id: b.id, reason: "duplicate_id" }]);
+    await expect(runHistoryImport(["apply", "--vault", "test", "--manifest", prepared, "--archive", archive])).rejects.toThrow("Quarantined");
+    await runHistoryImport(["cancel", "--vault", "test"]);
+    writeFileSync(file, JSON.stringify(complete));
+    const finalPath = join(dir, "final.json"), bundle = join(dir, "final.bundle");
+    const final = await runHistoryImport(["prepare", "--vault", "test", "--source", repo, "--through", tip, "--selections", file, "--archive", bundle, "--output", finalPath]) as ImportManifest;
+    expect(final.quarantined).toEqual([]); expect(final.options_digest).not.toBe(p.options_digest); expect(final.selections_digest).not.toBe(p.selections_digest);
+    expect(final.selections).toEqual(normalizeHistorySelections(complete)); expect(final.notes).toHaveLength(2);
+    expect(final.notes.every(n => n.native_drops.length === 0)).toBe(true);
+    rmSync(file); // Apply cannot consult the original selectors file.
+    await runHistoryImport(["apply", "--vault", "test", "--manifest", finalPath, "--archive", bundle]);
+    const db = new Database(vaultDbPath("test"), { readonly: true });
+    try {
+      expect(getImportedVersion(db, a.id, 0)?.content).toBe("a new"); expect(getImportedVersion(db, b.id, 0)?.content).toBe("b new");
+      for (const note of final.notes) expect(db.query("SELECT state_digest FROM history_import_receipts WHERE note_id=?").get(note.id)).toEqual({ state_digest: note.state_digest });
+      expect(db.query("SELECT content FROM notes ORDER BY content").all()).toEqual([{ content: "native A" }, { content: "native B" }]);
+    } finally { db.close(); }
+  } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+
+test("valid sidecar candidate selection binds both content and metadata blobs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "selection-sidecar-valid-"));
+  try {
+    const repo = repoAt(join(dir, "repo")); mkdirSync(join(repo, ".parachute/notes-meta"), { recursive: true });
+    for (const path of ["old", "new"]) {
+      writeFileSync(join(repo, `${path}.json`), JSON.stringify({ value: path }));
+      writeFileSync(join(repo, `.parachute/notes-meta/${path}.yaml`), `id: ${noteId}\npath: ${path}\nextension: json\n`);
+    }
+    git(repo, "add", "."); git(repo, "commit", "-m", "sidecar duplicates"); const tip = git(repo, "rev-parse", "HEAD");
+    const item = selection(repo, tip, "new.json", "old.json");
+    item.selected.sidecar = pin(repo, tip, ".parachute/notes-meta/new.yaml");
+    item.rejected[0]!.sidecar = pin(repo, tip, ".parachute/notes-meta/old.yaml");
+    const selectors = selectionFile(repo, tip, [item]), result = selectedStage(repo, tip, selectors);
+    expect(result.quarantine).toEqual([]); expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({ path: "new", extension: "json", content: '{"value":"new"}' });
+    const stale = structuredClone(selectors); stale.selections[0]!.selected.sidecar!.blob = "0".repeat(40);
+    expect(selectedStage(repo, tip, stale).quarantine).toEqual([{ note_id: noteId, reason: "duplicate_id" }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
