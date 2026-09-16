@@ -20,9 +20,12 @@ const ID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 class GitArchiveError extends Error {}
 function git(repo: string, args: string[]): Buffer {
+  const environment = { ...process.env };
+  // A caller's GIT_DIR/object/config variables must not redirect the private bundle reader.
+  for (const key of Object.keys(environment)) if (key.startsWith("GIT_")) delete environment[key];
   const result = spawnSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always", "-C", repo, ...args], {
     encoding: "buffer", maxBuffer: MAX_OUTPUT,
-    env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+    env: { ...environment, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
   });
   if (result.error || result.status !== 0) throw new GitArchiveError(`Git ${args[0]} failed; verify complete local archive (${result.error?.message ?? result.status})`);
   return result.stdout;
@@ -290,13 +293,7 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
   let locked = false;
   try {
     if (command !== "plan") {
-      if (existsSync(lock)) {
-        const owner = Number(readOptional(join(lock, "pid")));
-        if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error(`Incomplete importer lock at ${lock}; verify no importer is running before removing this lock directory`);
-        try { process.kill(owner, 0); throw new Error("Another history importer is running"); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
-        rmSync(lock, { recursive: true });
-      }
+      if (existsSync(lock)) throw new Error(`Importer lock exists at ${lock}; verify no importer is running before removing only this lock directory, then resume the same manifest`);
       mkdirSync(lock); locked = true; atomic(join(lock, "pid"), String(process.pid));
     }
     if (command === "plan" || command === "prepare") {
@@ -326,11 +323,12 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
       atomic(historyMirrorStatePath(vault), JSON.stringify({ phase: "paused", run_id: m.run_id, source: repo, tip }));
       return m;
     }
-    if (command !== "cancel" && readHistoryMirrorPhase(vault) !== "paused") throw new Error("Vault must be paused for this command");
+    const phase = readHistoryMirrorPhase(vault);
+    if (command !== "cancel" && phase !== "paused" && !(command === "retire" && phase === "retired")) throw new Error("Vault must be paused for this command");
     const journal = JSON.parse(readFileSync(historyImportRecoveryPath(vault), "utf8")) as Recovery;
     if (command === "cancel") {
       const phase = readHistoryMirrorPhase(vault);
-      if (phase === "retired" || (phase !== "paused" && journal.phase !== "preparing")) throw new Error("Only an unfinished preparation can be cancelled");
+      if (phase === "retired") throw new Error("Only an unfinished preparation can be cancelled");
       const db = new Database(vaultDbPath(vault), { readonly: true });
       try {
         if (db.prepare("SELECT 1 FROM sqlite_master WHERE name='history_import_receipts'").get() && db.prepare("SELECT 1 FROM history_import_receipts LIMIT 1").get()) throw new Error("Receipts exist: resume the same run; cancellation is unavailable");

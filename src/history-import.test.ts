@@ -58,7 +58,10 @@ test("offline prepare applies verified bundle, retries without resurrection, the
     const m = JSON.parse(readFileSync(manifest, "utf8")) as ImportManifest;
     expect(m.notes).toHaveLength(1);
     commit(repo, "changed after bundle", note.id);
-    await runHistoryImport(["apply", "--vault", "test", "--manifest", manifest, "--archive", archive]);
+    const savedGitDir = process.env.GIT_DIR;
+    process.env.GIT_DIR = join(dir, "not-the-archive");
+    try { await runHistoryImport(["apply", "--vault", "test", "--manifest", manifest, "--archive", archive]); }
+    finally { if (savedGitDir === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = savedGitDir; }
     const db = new Database(vaultDbPath("test"));
     try {
       expect(getImportedVersion(db, note.id, 0)?.content).toBe("recent");
@@ -71,6 +74,7 @@ test("offline prepare applies verified bundle, retries without resurrection, the
     await expect(runHistoryImport(["cancel", "--vault", "test"])).rejects.toThrow("Receipts exist");
     await runHistoryImport(["retire", "--vault", "test", "--manifest", manifest]);
     expect(readHistoryMirrorPhase("test")).toBe("retired");
+    expect(await runHistoryImport(["retire", "--vault", "test", "--manifest", manifest])).toMatchObject({ retired: true });
     expect(getVaultStore("test")).toBeDefined();
   } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
 });
@@ -85,6 +89,11 @@ for (const priorConfig of [null, "mirror:\n  enabled: true\n  location: internal
     if (priorConfig !== null) writeFileSync(mirrorConfigPath("test"), priorConfig);
     const repo = repoAt(join(dir, "repo")), tip = commit(repo, "old", note.id);
     await runHistoryImport(["prepare", "--vault", "test", "--source", repo, "--through", tip, "--archive", join(dir, "archive.bundle"), "--output", join(dir, "final.json")]);
+    if (priorConfig === null) {
+      // Interrupted cancellation after restoring config/marker but before archiving its journal.
+      rmSync(mirrorConfigPath("test"));
+      writeFileSync(historyMirrorStatePath("test"), JSON.stringify({ phase: "active" }));
+    }
     await runHistoryImport(["cancel", "--vault", "test"]);
     if (priorConfig === null) expect(() => readFileSync(mirrorConfigPath("test"))).toThrow();
     else expect(readFileSync(mirrorConfigPath("test"), "utf8")).toBe(priorConfig);

@@ -5218,6 +5218,9 @@ Import/Export:
                                                        --git-push to push after commit)
 
 History:
+  parachute-vault history-import plan|prepare|apply|retire|cancel --vault <name>
+                                                       Import a local git archive into note history;
+                                                       see UPGRADING.md for offline cutover and recovery.
   parachute-vault history [--vault <name>]             Show the vault's git write history (the
                                                        mirror is git-backed — one file per note,
                                                        so git log IS a tamper-evident history)
