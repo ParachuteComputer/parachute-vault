@@ -296,6 +296,11 @@ switch (command) {
   case "backup":
     await cmdBackup(cmdArgs);
     break;
+  case "history-import": {
+    const { runHistoryImport } = await import("./history-import.ts");
+    console.log(JSON.stringify(await runHistoryImport(cmdArgs), null, 2));
+    break;
+  }
   case "import":
     await cmdImport(cmdArgs);
     break;
@@ -4815,7 +4820,7 @@ async function createVault(
   // git-less box leaves the config written but inactive + logs an actionable
   // hint — it must NEVER fail the vault create. Create-time ONLY: existing
   // vaults are never retroactively migrated.
-  if (shouldEnableCreateTimeMirror(opts)) {
+  if (shouldEnableCreateTimeMirror(opts) && (await import("./mirror-config.ts")).readHistoryMirrorPhase(name) === "active") {
     const mirrorConfig = historyPresetMirrorConfig();
     writeMirrorConfigForVault(name, mirrorConfig);
     const mirrorPath = resolveMirrorPath(vaultDir(name), mirrorConfig);
@@ -5213,6 +5218,9 @@ Import/Export:
                                                        --git-push to push after commit)
 
 History:
+  parachute-vault history-import plan|prepare|apply|retire|cancel --vault <name>
+                                                       Import a local git archive into note history;
+                                                       see UPGRADING.md for offline cutover and recovery.
   parachute-vault history [--vault <name>]             Show the vault's git write history (the
                                                        mirror is git-backed — one file per note,
                                                        so git log IS a tamper-evident history)

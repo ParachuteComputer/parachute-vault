@@ -147,3 +147,25 @@ The exact candidate SELECT over 100 synthetic notes took 4.98 ms in this run.
 A production `unforced` database copy migrated from v28 in 580 ms; it had no
 history tables before migration and zero history blobs afterward. Production
 compaction savings therefore remain unmeasured.
+
+## Offline git-history importer bounds
+
+The importer stages observations in temporary SQLite and walks first-parent trees in commit order. Limits are 100,000 note identities, 100,000 commits, 10,000,000 tree entries across the walk, 2 GiB of distinct decoded source objects, 32 MiB per git command output, and 64 MiB of staged observations per note. Limits fail loudly; they never truncate history. A single body above the existing 2,000,000-byte ceiling quarantines its note. Temporary storage must accommodate the source staging, target DB copy, and private bundle/object database. Projection and apply process notes in the same ID order, using identical retention/compaction rules and a frozen policy time.
+
+A diagnostic projection on a consistent copy of the uni vault completed in **799.96 seconds (13.33 minutes)** on the loaded mini, using implementation `bc6918df2d25ba77f7515df2ff4f2295075efbd7` and frozen archive tip `4f96cdb0cb7b21b7ab5b7c32e735cf508e7e2a94` (2026-09-16). This is one measured sample, not an import-time bound. Other test processes ran during part of the measurement.
+
+| Copied archive / projection | Count |
+| --- | ---: |
+| First-parent commits | 2,224 |
+| Tree entries visited across commits | 817,867 |
+| Distinct decoded source bytes | 23,539,286 |
+| Eligible live notes | 624 |
+| Imported observations before retention | 2,183 |
+| Imported observations retained | 1,736 |
+| Native versions pruned | 0 |
+| Quarantined identities | 11 |
+| Historical identities without a live note (skipped) | 18 |
+| Live identities absent at source tip | 1 |
+| Unidentified source issues | 0 |
+
+Projection runs the actual writer, retention/compaction and retained-content verification on the copy. It is not a production cutover or a benchmark of every prepare/apply/retire command. No waivers were supplied; quarantine and coverage findings block apply until explicitly resolved or waived. The earlier development-source sample took 731.90 seconds and produced the same counts; it is not attributed to a commit. The compactor prototype measurements above are unrelated to importer timing.

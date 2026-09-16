@@ -6,7 +6,7 @@ import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
 
-export const SCHEMA_VERSION = 30;
+export const SCHEMA_VERSION = 31;
 
 /**
  * Deterministic last-resort epoch for a note whose `updated_at` AND
@@ -741,6 +741,7 @@ export function initSchema(db: Database): void {
   migrateToV29(db);
   // v30: depth-one history deltas and captured creation time, no backfill.
   migrateToV30(db);
+  migrateToV31(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -2031,4 +2032,35 @@ function migrateFromV2(db: Database): void {
 
   // Re-enable FK checks
   db.exec("PRAGMA foreign_keys = ON");
+}
+
+/** Import receipts deliberately survive version retention and erasure. */
+function migrateToV31(db: Database): void {
+  transaction(db, () => db.exec(`
+    CREATE TABLE IF NOT EXISTS history_import_runs (
+      run_id TEXT PRIMARY KEY,
+      source_fingerprint TEXT NOT NULL,
+      tip TEXT NOT NULL,
+      options_digest TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('applying', 'complete')),
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS history_import_receipts (
+      note_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES history_import_runs(run_id),
+      state_digest TEXT NOT NULL,
+      imported_count INTEGER NOT NULL,
+      retained_count INTEGER NOT NULL,
+      pruned_imported INTEGER NOT NULL,
+      pruned_native INTEGER NOT NULL,
+      completed_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS history_import_refs (
+      note_id TEXT NOT NULL REFERENCES history_import_receipts(note_id),
+      import_ix INTEGER NOT NULL CHECK(import_ix >= 0),
+      source_commit TEXT NOT NULL,
+      source_blob TEXT NOT NULL,
+      PRIMARY KEY(note_id, import_ix)
+    );
+  `));
 }

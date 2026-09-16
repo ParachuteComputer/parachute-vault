@@ -1,3 +1,4 @@
+import { readHistoryMirrorPhase, assertMirrorActive, MirrorRetiredError, VaultImportPausedError } from "./mirror-config.ts";
 /**
  * HTTP surface for the mirror lifecycle.
  *
@@ -158,6 +159,10 @@ export async function handleMirrorPut(
   // to exercise the git_not_installed 503 path without uninstalling git.
   whichOverride?: (cmd: string) => string | null,
 ): Promise<Response> {
+  try { assertMirrorActive(manager.getVaultName()); } catch (error) {
+    if (error instanceof MirrorRetiredError || error instanceof VaultImportPausedError) return Response.json({ error_type: error.error_type, message: error.message }, { status: error.status });
+    throw error;
+  }
   let body: unknown;
   try {
     body = await req.json();
@@ -1067,7 +1072,7 @@ export async function handleAuthDelete(manager: MirrorManager): Promise<Response
   deleteCredentials(manager.getVaultName());
   // Strip origin from the mirror dir if one is set.
   const status = manager.getStatus();
-  if (status.mirror_path) {
+  if (status.mirror_path && readHistoryMirrorPhase(manager.getVaultName()) === "active") {
     try {
       await unsetGitRemote(status.mirror_path);
     } catch (err) {
@@ -1441,7 +1446,7 @@ export async function handleAuthGithubSelectRepo(
   // stored, and the URL will get applied next time the mirror starts.
   const status = manager.getStatus();
   let applied = false;
-  if (status.mirror_path) {
+  if (status.mirror_path && readHistoryMirrorPhase(manager.getVaultName()) === "active") {
     const res = await applyToGitRemote(status.mirror_path, authedUrl);
     if (!res.ok) {
       return Response.json(
@@ -1520,6 +1525,7 @@ async function maybeEnableHistoryOnLink(
   manager: MirrorManager,
 ): Promise<HistoryOnLink> {
   const vaultName = manager.getVaultName();
+  if (readHistoryMirrorPhase(vaultName) !== "active") return false;
   if (!existsSync(mirrorConfigPath(vaultName))) {
     try {
       const status = await manager.reload({
@@ -1567,6 +1573,7 @@ async function maybeEnableHistoryOnLink(
 async function maybeEnableAutoPush(
   manager: MirrorManager,
 ): Promise<{ was_already_enabled: boolean; auto_push_now_enabled: boolean }> {
+  if (readHistoryMirrorPhase(manager.getVaultName()) !== "active") return { was_already_enabled: false, auto_push_now_enabled: false };
   const config = manager.getConfig();
   // Don't muck with auto_push when the mirror is disabled — the operator
   // is configuring credentials before turning the mirror on, which is a
@@ -1607,6 +1614,7 @@ async function maybeFireInitialPush(
   | { fired: false; reason: "auto_push_disabled" | "no_mirror_path" | "manager_skipped" | "not_enabled" }
   | { fired: true; pushed: boolean; error?: string; sha?: string }
 > {
+  if (readHistoryMirrorPhase(manager.getVaultName()) !== "active") return { fired: false, reason: "not_enabled" };
   if (!autoPushEnabled) return { fired: false, reason: "auto_push_disabled" };
   const status = manager.getStatus();
   if (!status.mirror_path) return { fired: false, reason: "no_mirror_path" };
@@ -1638,6 +1646,7 @@ async function maybeFireInitialPush(
 export async function applyCredentialsToMirror(
   manager: MirrorManager,
 ): Promise<void> {
+  if (readHistoryMirrorPhase(manager.getVaultName()) !== "active") return;
   const status = manager.getStatus();
   if (!status.mirror_path) return;
   const creds = readCredentials(manager.getVaultName());
@@ -2211,6 +2220,7 @@ export async function enableSyncToImportedRepo(opts: {
   ) => Promise<{ ok: boolean; error?: string; heads?: string[] }>;
 }): Promise<{ sync_enabled: boolean; warning?: string }> {
   const { vaultName, remoteUrl, auth, manager, override = false, probeOverride } = opts;
+  if (readHistoryMirrorPhase(vaultName) !== "active") return { sync_enabled: false, warning: "History mirror is paused or retired; automatic sync cannot be enabled" };
   // Set when the unrelated-history probe couldn't reach the remote. Rides along
   // on a SUCCESSFUL arm — the operator gets Sync and the caveat, not neither.
   let historyUnverified = false;

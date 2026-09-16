@@ -26,7 +26,7 @@ test("P12 v29 opens losslessly, fresh and upgraded columns/indexes agree", async
     const snap = () => ({ blobs: db.prepare("SELECT hash,content,byte_size FROM note_blobs ORDER BY hash").all(), versions: db.prepare("SELECT note_id,version_ix,content_hash,path,metadata,extension,superseded_at,actor,via,op,content_len,encoding FROM note_versions ORDER BY note_id,version_ix").all() });
     const before = snap();
     expect(() => initSchema(db)).not.toThrow();
-    expect(SCHEMA_VERSION).toBe(30);
+    expect(SCHEMA_VERSION).toBe(31);
     expect(snap()).toEqual(before);
     expect(db.prepare("SELECT hash FROM note_blobs WHERE delta_of IS NOT NULL OR encoding IS NOT NULL").all()).toEqual([]);
     expect(db.prepare("SELECT note_id FROM note_versions WHERE created_at IS NOT NULL").all()).toEqual([]);
