@@ -4,6 +4,14 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.9-rc.6] - 2026-09-16
+
+**Offline Git-history import and per-vault mirror retirement (#746, #747; refs #524).** Schema 30 → 31 adds import provenance and erasure-safe receipts. Plan on a database copy, prepare a verified archive with the vault offline, apply the exact manifest, then retire that vault's live mirror. Existing mirrors remain active until explicitly retired; archives and manual portable export remain available.
+
+- Imported history has separate public `origin`/`import_ix` references; surviving native version identifiers are preserved. Retention projections name any native versions that would be removed.
+- Duplicate identities quarantine whole notes unless an audited selection pins every selected and rejected candidate for each affected tree. Selection input is embedded into the manifest and checked again during apply; it cannot bypass parse, size, sidecar, or coverage failures.
+- Paused vaults refuse service before database maintenance while other vaults keep serving. Durable receipts prevent retry from resurrecting erased imported history. See `UPGRADING.md` for the offline sequence, recovery, and required backups.
+
 ## [0.7.9-rc.5] - 2026-09-15
 
 **Note version history lands: schema 28 → 29 → 30 in one release.** The two commits on `next` since rc.4 are vault#524 PR 1 (#734, capture + retention + read/restore) and PR 2 (#740, the delta compactor and byte-aware ceiling). The first open after upgrading runs both migrations and a budgeted compaction pass; `UPGRADING.md` names the 8 MiB default ceiling and how to disable it. Mirror code is unchanged.
