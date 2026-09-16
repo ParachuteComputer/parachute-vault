@@ -2,7 +2,7 @@
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { applyImportedNote, beginImportRun, canonicalJson, importObservationDigest, importTargetDigest, readImportReceipt, type ImportedObservation, type ImportRun } from "../core/src/history-import.ts";
@@ -55,24 +55,90 @@ function observation(meta: Record<string, unknown>, content: string, commit: str
   if (created !== null && (typeof created !== "string" || !Number.isFinite(Date.parse(created)))) throw new Error("invalid_created_at");
   return { id: meta.id, row: { content, path, extension, created_at: created, metadata: meta.metadata === undefined ? {} : mapping(meta.metadata), observed_at: time, commit, blob } };
 }
+export interface HistoryCandidateRef { git_path: string; blob: string; sidecar?: { git_path: string; blob: string }; }
+export interface HistorySelection {
+  note_id: string; commit: string; selected: HistoryCandidateRef;
+  rejected: (HistoryCandidateRef & { reason: string })[]; reason: string;
+}
+export interface HistorySelections { format: 1; tip: string; source_fingerprint: string; selections: HistorySelection[]; }
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const compareText = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+function selectionObject(input: unknown, keys: string[]): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(k => !keys.includes(k))) throw new Error("Invalid selections object");
+  return input as Record<string, unknown>;
+}
+function selectionReason(input: unknown): string {
+  if (typeof input !== "string" || !input.trim()) throw new Error("Selections require audit reasons");
+  return input;
+}
+function candidateRef(input: unknown, rejected = false): HistoryCandidateRef {
+  const value = selectionObject(input, rejected ? ["git_path", "blob", "sidecar", "reason"] : ["git_path", "blob", "sidecar"]);
+  if (typeof value.git_path !== "string" || !value.git_path || value.git_path.startsWith("/") || value.git_path.includes("\0") || value.git_path.split("/").some(p => p === ".." || p === "." || !p) || typeof value.blob !== "string" || !OBJECT_ID.test(value.blob)) throw new Error("Invalid selection candidate reference");
+  const ref: HistoryCandidateRef = { git_path: value.git_path, blob: value.blob };
+  if (value.sidecar !== undefined) {
+    selectionObject(value.sidecar, ["git_path", "blob"]);
+    ref.sidecar = candidateRef(value.sidecar);
+  }
+  return ref;
+}
+/** Canonical ordering makes options independent of selector/rejected array order. */
+export function normalizeHistorySelections(input: unknown): HistorySelections {
+  const value = selectionObject(input, ["format", "tip", "source_fingerprint", "selections"]);
+  if (value.format !== 1 || typeof value.tip !== "string" || !OBJECT_ID.test(value.tip) || typeof value.source_fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(value.source_fingerprint) || !Array.isArray(value.selections) || value.selections.length > 100_000) throw new Error("Invalid selections header or entry limit (100,000)");
+  const seen = new Set<string>();
+  const selections = value.selections.map(raw => {
+    const entry = selectionObject(raw, ["note_id", "commit", "selected", "rejected", "reason"]);
+    if (typeof entry.note_id !== "string" || !ID.test(entry.note_id) || typeof entry.commit !== "string" || !OBJECT_ID.test(entry.commit) || !Array.isArray(entry.rejected) || !entry.rejected.length) throw new Error("Invalid selection entry");
+    const key = `${entry.note_id}:${entry.commit}`;
+    if (seen.has(key)) throw new Error("Duplicate selection note/commit");
+    seen.add(key);
+    const selected = candidateRef(entry.selected), paths = new Set([selected.git_path]);
+    const rejected = entry.rejected.map(raw => {
+      const ref = candidateRef(raw, true);
+      if (paths.has(ref.git_path)) throw new Error("Duplicate selection candidate path");
+      paths.add(ref.git_path);
+      return { ...ref, reason: selectionReason((raw as Record<string, unknown>).reason) };
+    }).sort((a, b) => compareText(canonicalJson(candidateRef(a, true)), canonicalJson(candidateRef(b, true))));
+    return { note_id: entry.note_id, commit: entry.commit, selected, rejected, reason: selectionReason(entry.reason) };
+  }).sort((a, b) => compareText(`${a.note_id}:${a.commit}`, `${b.note_id}:${b.commit}`));
+  const result: HistorySelections = { format: 1, tip: value.tip, source_fingerprint: value.source_fingerprint, selections };
+  if (Buffer.byteLength(canonicalJson(result)) > MAX_OUTPUT) throw new Error("Selections exceed 32 MiB");
+  return result;
+}
+function selectionsDigest(selections: HistorySelections | null): string | null { return selections ? hashContent(canonicalJson(selections)) : null; }
+function optionsDigest(policy: HistoryPolicy, waivers: Record<string, string>, selections: HistorySelections | null): string {
+  return hashContent(canonicalJson({ parser: 1, policy, waivers, ...(selections ? { selections_digest: selectionsDigest(selections) } : {}) }));
+}
+
 export interface StagedArchive { source_fingerprint: string; tip: string; commits: number; objects: number; bytes: number; }
 /** Disk-backed staging bounds memory to one git tree and one note body. */
-export function stageArchive(repo: string, tip: string, stage: Database): StagedArchive {
+export function stageArchive(repo: string, tip: string, stage: Database, inputSelections?: HistorySelections | null): StagedArchive {
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tip)) throw new Error("through must be a full commit hash");
   if (text(git(repo, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") throw new Error("Shallow archives are not supported");
   if (text(git(repo, ["rev-parse", `${tip}^{commit}`])).trim() !== tip) throw new Error("Tip is not a commit");
   git(repo, ["rev-list", "--objects", "--missing=error", tip]);
   const commits = text(git(repo, ["log", "--first-parent", "--reverse", "--format=%H %T %cI", tip])).trim().split("\n");
   if (commits.length > MAX_COMMITS) throw new Error("Archive commit limit exceeded");
-  stage.exec("CREATE TABLE observations(note_id TEXT NOT NULL, seq INTEGER NOT NULL, state TEXT NOT NULL, row_json TEXT NOT NULL, PRIMARY KEY(note_id,seq)); CREATE TABLE quarantine(note_id TEXT PRIMARY KEY, reason TEXT NOT NULL); CREATE TABLE issues(commit_id TEXT, path TEXT, reason TEXT); CREATE TABLE tip_ids(note_id TEXT PRIMARY KEY); CREATE TABLE object_cache(hash TEXT PRIMARY KEY, content TEXT NOT NULL); CREATE TABLE parsed_cache(hash TEXT PRIMARY KEY, note_id TEXT NOT NULL, state TEXT NOT NULL, row_json TEXT NOT NULL)");
+  const selections = inputSelections == null ? null : normalizeHistorySelections(inputSelections);
+  if (selections && selections.tip !== tip) throw new Error("Selections tip differs from archive");
+  const commitIds = new Set(commits.map(c => c.split(" ")[0]!));
+  const byCommit = new Map<string, Map<string, HistorySelection>>();
+  for (const selection of selections?.selections ?? []) {
+    if (!commitIds.has(selection.commit)) throw new Error("Selection commit is not on the first-parent walk");
+    let entries = byCommit.get(selection.commit);
+    if (!entries) byCommit.set(selection.commit, entries = new Map());
+    entries.set(selection.note_id, selection);
+  }
+  stage.exec("CREATE TABLE selection_failures(note_id TEXT, commit_id TEXT, reason TEXT); CREATE TABLE observations(note_id TEXT NOT NULL, seq INTEGER NOT NULL, state TEXT NOT NULL, row_json TEXT NOT NULL, PRIMARY KEY(note_id,seq)); CREATE TABLE quarantine(note_id TEXT PRIMARY KEY, reason TEXT NOT NULL); CREATE TABLE issues(commit_id TEXT, path TEXT, reason TEXT); CREATE TABLE tip_ids(note_id TEXT PRIMARY KEY); CREATE TABLE object_cache(hash TEXT PRIMARY KEY, content TEXT NOT NULL); CREATE TABLE parsed_cache(hash TEXT PRIMARY KEY, note_id TEXT NOT NULL, state TEXT NOT NULL, row_json TEXT NOT NULL)");
   const fingerprint = createHash("sha256");
   let objects = 0, bytes = 0;
   const lastStates = new Map<string, string>();
+  const identities = new Set<string>();
   const parsedGet = stage.prepare("SELECT note_id,state FROM parsed_cache WHERE hash=?");
   const parsedBody = stage.prepare("SELECT row_json FROM parsed_cache WHERE hash=?");
   const parsedPut = stage.prepare("INSERT OR IGNORE INTO parsed_cache VALUES(?,?,?,?)");
   const insertObservation = stage.prepare("INSERT INTO observations VALUES(?,?,?,?)");
-  const markQuarantine = stage.prepare("INSERT OR REPLACE INTO quarantine VALUES(?,?)");
+  const markQuarantine = stage.prepare("INSERT OR IGNORE INTO quarantine VALUES(?,?)");
   const markTip = stage.prepare("INSERT OR IGNORE INTO tip_ids VALUES(?)");
   for (let seq = 0; seq < commits.length; seq++) {
     const [commit, tree, time] = commits[seq]!.split(" ");
@@ -86,7 +152,8 @@ export function stageArchive(repo: string, tip: string, stage: Database): Staged
     objects += entries.length;
     if (objects > MAX_OBJECTS) throw new Error("Archive object limit exceeded");
     const files = new Map(entries.map(e => [e.path, e]));
-    const seen = new Set<string>(), used = new Set<string>(), sidecarOwners = new Map<string, string>();
+    const used = new Set<string>(), sidecarOwners = new Map<string, string>();
+    const candidates = new Map<string, { ref: HistoryCandidateRef; state: string; row: () => ImportedObservation }[]>();
     const read = (entry: typeof entries[number]) => {
       if (entry.mode !== "100644" && entry.mode !== "100755") throw new Error("unsupported_tree_entry");
       const cached = stage.prepare("SELECT content FROM object_cache WHERE hash=?").get(entry.hash) as { content: string } | null;
@@ -96,23 +163,23 @@ export function stageArchive(repo: string, tip: string, stage: Database): Staged
       stage.prepare("INSERT INTO object_cache VALUES(?,?)").run(entry.hash, value);
       return value;
     };
-    const acceptState = (id: string, state: string, row: () => ImportedObservation) => {
-      if (seen.has(id)) { markQuarantine.run(id, "duplicate_id"); return; }
-      seen.add(id);
-      if (seq === commits.length - 1) markTip.run(id);
-      if (lastStates.get(id) === state) return;
-      if (!lastStates.has(id) && lastStates.size >= 100_000) throw new Error("Archive note limit exceeded");
-      lastStates.set(id, state);
-      insertObservation.run(id, seq, state, JSON.stringify({ ...row(), commit, observed_at: time }));
+    const collect = (id: string, state: string, row: () => ImportedObservation, ref: HistoryCandidateRef) => {
+      if (!identities.has(id) && identities.size >= 100_000) throw new Error("Archive note limit exceeded");
+      identities.add(id);
+      let group = candidates.get(id);
+      if (!group) candidates.set(id, group = []);
+      group.push({ ref, state, row });
     };
     const parseObservation = (meta: Record<string, unknown>, body: string, entry: typeof entries[number]) => {
       const { id, row } = observation(meta, body, commit, entry.hash, time);
       const state = hashContent(canonicalJson({ content: row.content, path: row.path, metadata: row.metadata, extension: row.extension, created_at: row.created_at }));
       return { id, row, state };
     };
-    const accept = (meta: Record<string, unknown>, body: string, entry: typeof entries[number]) => {
+    const accept = (meta: Record<string, unknown>, body: string, entry: typeof entries[number], sidecar: { git_path: string; blob: string }) => {
       const { id, row, state } = parseObservation(meta, body, entry);
-      acceptState(id, state, () => row);
+      const cacheKey = `${entry.hash}:${sidecar.blob}`;
+      parsedPut.run(cacheKey, id, state, JSON.stringify(row));
+      collect(id, state, () => JSON.parse((parsedBody.get(cacheKey) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash, sidecar });
     };
     const failure = (entry: typeof entries[number], error: unknown, id?: unknown) => {
       const message = error instanceof Error ? error.message : "invalid_observation";
@@ -140,7 +207,7 @@ export function stageArchive(repo: string, tip: string, stage: Database): Staged
         }
         sidecarOwners.set(contentPath, meta.id);
         used.add(contentPath);
-        accept(meta, read(body), body);
+        accept(meta, read(body), body, { git_path: entry.path, blob: entry.hash });
       } catch (error) { failure(entry, error, meta?.id ?? entry.path.split("/").pop()?.slice(0, -5)); }
     }
     for (const entry of entries) {
@@ -150,18 +217,42 @@ export function stageArchive(repo: string, tip: string, stage: Database): Staged
       try {
         const cached = parsedGet.get(entry.hash) as { note_id: string; state: string } | null;
         if (cached) {
-          acceptState(cached.note_id, cached.state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json));
+          collect(cached.note_id, cached.state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
         } else {
           const parsed = inline(read(entry)); meta = parsed.meta;
           const { id, row, state } = parseObservation(meta, parsed.content, entry);
           parsedPut.run(entry.hash, id, state, JSON.stringify(row));
-          acceptState(id, state, () => row);
+          collect(id, state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
         }
       } catch (error) { failure(entry, error, meta?.id); }
     }
+    const requested = byCommit.get(commit);
+    for (const id of [...new Set([...candidates.keys(), ...(requested?.keys() ?? [])])].sort()) {
+      const group = candidates.get(id) ?? [], selection = requested?.get(id);
+      if (group.length && seq === commits.length - 1) markTip.run(id);
+      let selected = group.length === 1 && !selection ? group[0] : undefined;
+      let refusal = selection ? "stale_selection" : "missing_selection";
+      if (group.length >= 2 && selection) {
+        const actual = group.map(c => canonicalJson(c.ref)).sort();
+        const expected = [selection.selected, ...selection.rejected.map(r => candidateRef(r, true))].map(c => canonicalJson(c)).sort();
+        if (canonicalJson(actual) === canonicalJson(expected)) selected = group.find(c => canonicalJson(c.ref) === canonicalJson(selection.selected));
+        else refusal = "candidate_set_mismatch";
+      }
+      if (!selected) {
+        markQuarantine.run(id, "duplicate_id");
+        if (selections) stage.prepare("INSERT INTO selection_failures VALUES(?,?,?)").run(id, commit, refusal);
+        continue;
+      }
+      if (lastStates.get(id) === selected.state) continue;
+      if (!lastStates.has(id) && lastStates.size >= 100_000) throw new Error("Archive note limit exceeded");
+      lastStates.set(id, selected.state);
+      insertObservation.run(id, seq, selected.state, JSON.stringify({ ...selected.row(), commit, observed_at: time }));
+    }
   }
+  const sourceFingerprint = fingerprint.digest("hex");
+  if (selections && selections.source_fingerprint !== sourceFingerprint) throw new Error("Selections source fingerprint differs from archive");
   stage.exec("DELETE FROM observations WHERE note_id IN (SELECT note_id FROM quarantine)");
-  return { source_fingerprint: fingerprint.digest("hex"), tip, commits: commits.length, objects, bytes };
+  return { source_fingerprint: sourceFingerprint, tip, commits: commits.length, objects, bytes };
 }
 
 interface PlannedNote { id: string; target_digest: string; state_digest: string; native_drops: number[]; imported: number; retained: number; pruned_imported: number; pruned_native: number; }
@@ -170,6 +261,8 @@ export interface ImportManifest extends StagedArchive {
   archive: string | null; archive_hash: string | null; backup: string | null;
   options_digest: string; target_ids_digest: string; notes: PlannedNote[]; skipped: string[];
   quarantined: { note_id: string; reason: string }[]; issues: { commit_id: string; path: string; reason: string }[];
+  selections?: HistorySelections | null; selections_digest?: string | null;
+  selection_failures?: { note_id: string; commit_id: string; reason: string }[];
   missing_at_tip: string[]; waivers: Record<string, string>; run_id: string;
 }
 function digestManifest(manifest: Omit<ImportManifest, "run_id"> | ImportManifest): string {
@@ -213,7 +306,7 @@ function openStage(path: string): Database {
   stage.exec("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF");
   return stage;
 }
-function project(vault: string, repo: string, tip: string, dir: string, opts: { archive?: string; backup?: string; waivers?: Record<string, string> }): ImportManifest {
+function project(vault: string, repo: string, tip: string, dir: string, opts: { archive?: string; backup?: string; waivers?: Record<string, string>; selections?: HistorySelections | null }): ImportManifest {
   const config = readVaultConfig(vault);
   if (!config) throw new Error("Vault does not exist");
   const stage = openStage(join(dir, "stage.db"));
@@ -222,10 +315,11 @@ function project(vault: string, repo: string, tip: string, dir: string, opts: { 
   const db = new Database(copy);
   try {
     applyConnectionPragmas(db); initSchema(db);
-    const source = stageArchive(repo, tip, stage), policy = resolveHistoryPolicy(config.history);
+    const selections = opts.selections ?? null;
+    const source = stageArchive(repo, tip, stage, selections), policy = resolveHistoryPolicy(config.history);
     const waivers = opts.waivers ?? {};
     for (const [id, reason] of Object.entries(waivers)) if (!ID.test(id) || typeof reason !== "string" || !reason.trim()) throw new Error("Waivers require note IDs and reasons");
-    const options_digest = hashContent(canonicalJson({ parser: 1, policy, waivers }));
+    const options_digest = optionsDigest(policy, waivers, selections);
     const run = { run_id: "projection", source_fingerprint: source.source_fingerprint, tip, options_digest };
     beginImportRun(db, run);
     const evaluated_at = Date.now(), notes: PlannedNote[] = [], skipped: string[] = [];
@@ -242,6 +336,8 @@ function project(vault: string, repo: string, tip: string, dir: string, opts: { 
     const body: Omit<ImportManifest, "run_id"> = {
       ...source, format: 1, kind: opts.archive ? "final" : "diagnostic", vault, evaluated_at, policy,
       archive: opts.archive ?? null, archive_hash: opts.archive ? fileHash(opts.archive) : null, backup: opts.backup ?? null,
+      selections, selections_digest: selectionsDigest(selections),
+      selection_failures: stage.prepare("SELECT * FROM selection_failures ORDER BY note_id,commit_id").all() as NonNullable<ImportManifest["selection_failures"]>,
       options_digest, target_ids_digest: hashContent(canonicalJson(live.map(r => r.id))), notes, skipped, missing_at_tip, waivers,
       quarantined: stage.prepare("SELECT * FROM quarantine ORDER BY note_id").all() as ImportManifest["quarantined"],
       issues: stage.prepare("SELECT * FROM issues ORDER BY commit_id,path,reason").all() as ImportManifest["issues"],
@@ -268,6 +364,8 @@ function readManifest(vault: string, path: string): ImportManifest {
   const m = JSON.parse(readFileSync(path, "utf8")) as ImportManifest;
   if (m.format !== 1 || m.kind !== "final" || m.vault !== vault || m.run_id !== digestManifest(m) || !m.archive || !m.archive_hash || !m.backup) throw new Error("A matching final manifest is required");
   if (canonicalJson(resolveHistoryPolicy(readVaultConfig(vault)?.history)) !== canonicalJson(m.policy)) throw new Error("History policy differs from final manifest");
+  const selections = m.selections == null ? null : normalizeHistorySelections(m.selections);
+  if ((m.selections_digest ?? null) !== selectionsDigest(selections) || m.options_digest !== optionsDigest(m.policy, m.waivers, selections)) throw new Error("Manifest selection/options digest mismatch");
   return m;
 }
 function retirementReady(m: ImportManifest): void {
@@ -281,9 +379,10 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
   const flags = new Map<string, string>();
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i], value = rest[i + 1];
-    if (!key || !["--vault", "--source", "--through", "--output", "--archive", "--manifest", "--waivers"].includes(key) || !value || flags.has(key)) throw new Error("Invalid history-import arguments");
+    if (!key || !["--vault", "--source", "--through", "--output", "--archive", "--manifest", "--waivers", "--selections"].includes(key) || !value || flags.has(key)) throw new Error("Invalid history-import arguments");
     flags.set(key, value);
   }
+  if (flags.has("--selections") && command !== "plan" && command !== "prepare") throw new Error("--selections is only valid for plan/prepare; apply uses the embedded manifest");
   const required = (key: string) => { const value = flags.get(key); if (!value) throw new Error(`Required ${key}`); return value; };
   const vault = required("--vault");
   if (!/^[a-zA-Z0-9_-]+$/.test(vault) || !readVaultConfig(vault)) throw new Error("Unknown vault");
@@ -300,8 +399,14 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
       const repo = realpathSync(required("--source")), tip = required("--through"), output = resolve(required("--output"));
       if (existsSync(output)) throw new Error("Manifest output already exists");
       const waivers = flags.has("--waivers") ? mapping(JSON.parse(readFileSync(required("--waivers"), "utf8"))) as Record<string, string> : {};
+      let selections: HistorySelections | null = null;
+      if (flags.has("--selections")) {
+        const path = required("--selections");
+        if (statSync(path).size > MAX_OUTPUT) throw new Error("Selections exceed 32 MiB");
+        selections = normalizeHistorySelections(JSON.parse(readFileSync(path, "utf8")));
+      }
       if (command === "plan") {
-        const m = project(vault, repo, tip, dir, { waivers }); atomic(output, JSON.stringify(m, null, 2)); return m;
+        const m = project(vault, repo, tip, dir, { waivers, selections }); atomic(output, JSON.stringify(m, null, 2)); return m;
       }
       if (readHistoryMirrorPhase(vault) !== "active" || existsSync(historyImportRecoveryPath(vault))) throw new Error("Existing cutover: resume or cancel using its recovery journal");
       if (text(git(repo, ["rev-parse", "--is-bare-repository"])).trim() !== "true" && text(git(repo, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"])).length) throw new Error("Source working tree is dirty");
@@ -317,7 +422,7 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
       mkdirSync(dirname(archive), { recursive: true });
       git(repo, ["bundle", "create", archive, "--all"]); chmodSync(archive, 0o600);
       const objects = privateBundle(archive, fileHash(archive), dir);
-      const m = project(vault, objects, tip, dir, { archive, backup, waivers });
+      const m = project(vault, objects, tip, dir, { archive, backup, waivers, selections });
       atomic(output, JSON.stringify(m, null, 2));
       atomic(historyImportRecoveryPath(vault), JSON.stringify({ ...journal, phase: "prepared", run_id: m.run_id }));
       atomic(historyMirrorStatePath(vault), JSON.stringify({ phase: "paused", run_id: m.run_id, source: repo, tip }));
@@ -354,7 +459,7 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
       if (command === "apply") {
         const stage = openStage(join(dir, "apply-stage.db"));
         try {
-          const source = stageArchive(repo, m.tip, stage);
+          const source = stageArchive(repo, m.tip, stage, m.selections);
           if (source.source_fingerprint !== m.source_fingerprint) throw new Error("Bundle lineage differs from manifest");
           beginImportRun(db, run);
           for (const note of m.notes) {
