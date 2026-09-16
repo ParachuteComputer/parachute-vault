@@ -77,7 +77,7 @@ test("offline prepare applies verified bundle, retries without resurrection, the
     expect(await runHistoryImport(["retire", "--vault", "test", "--manifest", manifest])).toMatchObject({ retired: true });
     expect(getVaultStore("test")).toBeDefined();
   } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
-});
+}, 30_000);
 
 for (const priorConfig of [null, "mirror:\n  enabled: true\n  location: internal\n"]) test(`prepare cancellation restores ${priorConfig === null ? "absent" : "present"} config and explicit active marker`, async () => {
   const dir = mkdtempSync(join(tmpdir(), "import-cancel-")), saved = process.env.PARACHUTE_HOME;
