@@ -216,6 +216,8 @@ export async function handleMcp(
         name?: string;
         code?: string;
         note_id?: string;
+        origin?: unknown;
+        import_ix?: unknown;
         note_path?: string | null;
         current_updated_at?: string | null;
         expected_updated_at?: string;
@@ -396,6 +398,17 @@ export async function handleMcp(
           error_type: "parent_cycle",
           tag: e.tag,
           cycle: e.cycle ?? [],
+        });
+      }
+      if (e?.code === "HISTORY_UNRECOVERABLE") {
+        const imported = e.origin === "git-import"
+          && typeof e.import_ix === "number"
+          && Number.isSafeInteger(e.import_ix) && e.import_ix >= 0;
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
+          error_type: "history_unrecoverable",
+          ...(imported ? { origin: "git-import", import_ix: e.import_ix } : {
+            field: e.field, hint: e.hint,
+          }),
         });
       }
       // Generic catch-all (vault#554): any remaining error that carries a

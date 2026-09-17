@@ -29,6 +29,7 @@ const { handleScopedMcp } = await import("./mcp-http.ts");
 const { getServerInstruction } = await import("./mcp-tools.ts");
 const { writeVaultConfig } = await import("./config.ts");
 const { getVaultStore } = await import("./vault-store.ts");
+const { clearScribeUrlCache } = await import("./scribe-discovery.ts");
 const {
   getSharedAttachmentTicketProvider,
   InProcessAttachmentTicketProvider,
@@ -275,33 +276,54 @@ describe("attachment tickets — upload lifecycle", () => {
   // exactly what a new box looks like. The upload must not come back looking
   // like an ordinary file: it carries a `failed` status and an actionable
   // reason, so the state is visible in the API and the admin SPA.
-  test("audio + auto-transcribe on + NO provider → attachment records the failure, not silence", async () => {
-    const vaultName = freshVault("tickets-no-provider");
-    const store = getVaultStore(vaultName);
-    const note = await store.createNote("# Voice memo\n", { path: "memo-noprov" });
+  //
+  // Fixture: select the remote provider so the presence/absence of a local
+  // whisper-cpp install on the host cannot change the message. With no
+  // SCRIBE_URL configured, auto-transcribe is still unavailable and reports
+  // the same actionable no-provider error on every box.
+  test("audio + auto-transcribe on + scribe-http without URL → attachment records the failure, not silence", async () => {
+    const prevProvider = process.env.TRANSCRIPTION_PROVIDER;
+    const prevScribeUrl = process.env.SCRIBE_URL;
+    process.env.TRANSCRIPTION_PROVIDER = "scribe-http";
+    delete process.env.SCRIBE_URL;
+    clearScribeUrlCache();
+    try {
+      const vaultName = freshVault("tickets-no-provider");
+      const store = getVaultStore(vaultName);
+      const note = await store.createNote("# Voice memo\n", { path: "memo-noprov" });
 
-    const mint = await callTool(vaultName, "request-attachment-upload", {
-      note: note.id,
-      filename: "memo.webm",
-      size_bytes: 4,
-      // NO `transcribe: true` — this is the AUTO path, the one that used to
-      // silently do nothing.
-    });
-    const res = await routeReq(
-      new Request(mint.url, {
-        method: "PUT",
-        headers: { "content-type": "audio/webm" },
-        body: new Uint8Array([1, 2, 3, 4]),
-      }),
-    );
-    expect(res.status).toBe(201);
-    const attachment = (await res.json()) as any;
-    expect(attachment.metadata.transcribe_status).toBe("failed");
-    expect(attachment.metadata.transcribe_error).toMatch(/no transcription provider configured/i);
-    // The reason has to be actionable — naming both routes out of it.
-    expect(attachment.metadata.transcribe_error).toMatch(/TRANSCRIPTION_PROVIDER/);
-    expect(attachment.metadata.transcribe_error).toMatch(/SCRIBE_URL/);
-    expect(attachment.metadata.transcribe_origin).toBe("auto");
+      const mint = await callTool(vaultName, "request-attachment-upload", {
+        note: note.id,
+        filename: "memo.webm",
+        size_bytes: 4,
+        // NO `transcribe: true` — this is the AUTO path, the one that used to
+        // silently do nothing.
+      });
+      const res = await routeReq(
+        new Request(mint.url, {
+          method: "PUT",
+          headers: { "content-type": "audio/webm" },
+          body: new Uint8Array([1, 2, 3, 4]),
+        }),
+      );
+      expect(res.status).toBe(201);
+      const attachment = (await res.json()) as any;
+      expect(attachment.metadata.transcribe_status).toBe("failed");
+      expect(attachment.metadata.transcribe_error).toMatch(/no transcription provider configured/i);
+      // The reason has to be actionable — naming both routes out of it.
+      expect(attachment.metadata.transcribe_error).toMatch(/TRANSCRIPTION_PROVIDER/);
+      expect(attachment.metadata.transcribe_error).toMatch(/SCRIBE_URL/);
+      expect(attachment.metadata.transcribe_origin).toBe("auto");
+      const unchanged = await store.getNote(note.id);
+      expect(unchanged!.content).toBe("# Voice memo\n");
+      expect((unchanged!.metadata as any)?.transcribe_stub).toBeUndefined();
+    } finally {
+      if (prevProvider === undefined) delete process.env.TRANSCRIPTION_PROVIDER;
+      else process.env.TRANSCRIPTION_PROVIDER = prevProvider;
+      if (prevScribeUrl === undefined) delete process.env.SCRIBE_URL;
+      else process.env.SCRIBE_URL = prevScribeUrl;
+      clearScribeUrlCache();
+    }
   });
 
   // The counter-case: turning auto-transcribe OFF must stay silent. The

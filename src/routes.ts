@@ -1,3 +1,4 @@
+import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHistoryRow, ImportedHistoryUnrecoverableError } from "../core/src/history-import.js";
 /**
  * REST API route handlers for the multi-vault server.
  *
@@ -273,7 +274,7 @@ function conflictResponse(e: any): Response | null {
     hint: "this note exceeds the 2 MB version-history ceiling, so it cannot be updated while history is enabled; delete it, or shrink it out-of-band, or disable history for this vault",
   }, 413);
   if (e && e.code === "HISTORY_UNRECOVERABLE") return json({
-    error_type: "history_unrecoverable", note_id: e.note_id, version_ix: e.version_ix, message: e.message,
+    error_type: "history_unrecoverable", note_id: e.note_id, ...(e.origin === "git-import" ? { origin: e.origin, import_ix: e.import_ix } : { version_ix: e.version_ix }), message: e.message,
     hint: e.reason === "delta_orphan" ? "this version's stored delta cannot be rebuilt — its base blob is missing or corrupt; run GET /api/doctor for the `history_delta_orphan` finding" : "this version is an overflow tombstone — the note's size and deletion were recorded but its content never was",
   }, 409);
   return null;
@@ -2923,7 +2924,8 @@ async function handleNotesInner(
   }
 
   const verMatch = sub.match(/^\/versions\/([^/]+)$/);
-  if (sub === "/versions" || verMatch || sub === "/restore") {
+  const importMatch = sub.match(/^\/imports\/([^/]+)$/);
+  if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
     const note = await resolveNote(store, idOrPath);
     if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -2940,11 +2942,22 @@ async function handleNotesInner(
         const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0);
         const versions = await store.listNoteVersions(id, { limit, offset });
         const total = await store.countNoteVersions(id);
-        return json({ versions, total });
+        return json({ versions: versions.map(projectHistoryRow), total });
       }
       if (method === "DELETE") {
         const result = await store.eraseNoteHistory(id);
         return json({ erased: true, id, versions_deleted: result.versionsDeleted, blobs_deleted: result.blobsDeleted });
+      }
+    } else if (importMatch && method === "GET") {
+      const index = Number(importMatch[1]);
+      if (!/^\d+$/.test(importMatch[1]!) || !Number.isSafeInteger(index) || index < 0) return json({ error: "Invalid import_ix", error_type: "invalid_request" }, 400);
+      try {
+        const version = getImportedVersion(db, id, index);
+        return version ? json(projectHistoryRow(version)) : json({ error: "Not found", error_type: "not_found", origin: "git-import", import_ix: index }, 404);
+      } catch (e) {
+        const response = conflictResponse(e);
+        if (response) return response;
+        throw e;
       }
     } else if (verMatch && method === "GET") {
       const ix = Number(verMatch[1]);
@@ -2961,16 +2974,21 @@ async function handleNotesInner(
       const parsed = await parseJsonBody(req);
       if (!parsed.ok) return parsed.response;
       const body = parsed.body;
-      if (body.version_ix === undefined) return json({ error: "version_ix is required", error_type: "missing_required_field" }, 400);
-      if (!Number.isInteger(body.version_ix) || (body.version_ix as number) < 0) return json({ error: "Invalid version_ix", error_type: "invalid_request" }, 400);
+      let selector: ReturnType<typeof parseHistorySelector>;
+      try { selector = parseHistorySelector(body); } catch {
+        return json({ error: "Invalid history selector", error_type: "invalid_request" }, 400);
+      }
+      if (!selector) return json({ error: "History selector is required", error_type: "missing_required_field" }, 400);
+      const imported = "import_ix" in selector;
+      const storageIndex = "import_ix" in selector ? importStorageIndex(selector.import_ix) : selector.version_ix;
       try {
-        const version = await store.getNoteVersion(id, body.version_ix as number);
-        if (!version) throw new HistoryNotFoundError(id, body.version_ix as number);
+        const version = "import_ix" in selector ? getImportedVersion(db, id, selector.import_ix) : await store.getNoteVersion(id, storageIndex);
+        if (!version) return json({ error: "Not found", error_type: "not_found", ...(imported ? selector : {}) }, 404);
         gateStrictWrite(store, writeCtx, {
           path: note ? note.path : latestTombstone(db, id)?.path,
           tags: note?.tags ?? [], metadata: version.metadata,
         });
-        const restored = await store.restoreNoteVersion(id, body.version_ix as number, {
+        const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
           ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
         });
@@ -2981,8 +2999,9 @@ async function handleNotesInner(
           if (vs === undefined) { const { validation_status: _d, ...rest } = validated; validated = rest; }
           else validated = { ...validated, validation_status: vs };
         }
-        return json({ ...validated, restored_from: body.version_ix, recreated: !note });
+        return json({ ...validated, restored_from: "import_ix" in selector ? selector : selector.version_ix, recreated: !note });
       } catch (e: any) {
+        if ("import_ix" in selector && e?.code === "HISTORY_UNRECOVERABLE" && e.origin !== "git-import") e = new ImportedHistoryUnrecoverableError(id, selector.import_ix, e.reason);
         const r = conflictResponse(e);
         if (r) return r;
         throw e;

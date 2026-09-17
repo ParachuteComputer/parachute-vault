@@ -541,6 +541,12 @@ function applyTagScopeWrappers(
 
   wrapReadTool(tools, "query-notes", async (orig, params) => {
     const allowed = await getAllowed();
+    // Check history visibility before materialisation can throw a content error.
+    const historyId = (params as any)?.versions?.note_id;
+    if (allowed && typeof historyId === "string") {
+      const note = resolveNote(store.db, historyId);
+      if (note && !noteWithinTagScope(note, allowed, rawTags)) return { error: "Note not found", error_type: "not_found", id: historyId };
+    }
     const result = await orig(scopeQueryTagParams(params, allowed));
     if (!allowed) return result;
     // `aggregate` mode returns `[{group, value}]` rollup rows — no `.tags`
@@ -568,7 +574,7 @@ function applyTagScopeWrappers(
     }
     if (result && typeof result === "object" && (
       ("versions" in result && Array.isArray((result as any).versions) && "total" in result)
-      || ("version_ix" in result && "content" in result)
+      || ("version_ix" in result && "content" in result) || ("origin" in result && result.origin === "git-import" && "import_ix" in result)
       || ("version_ix" in result && "error" in result)
     )) {
       const id = (params as any).versions.note_id;

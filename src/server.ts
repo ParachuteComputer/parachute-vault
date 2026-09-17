@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { assertVaultNotPaused, VaultImportPausedError, MirrorRetiredError } from "./mirror-config.ts";
 /**
  * Multi-vault HTTP server using Bun.serve().
  *
@@ -144,7 +145,7 @@ function wireTranscriptionWorker(worker: TranscriptionWorker): void {
     worker,
     (store) => getVaultNameForStore(store as never),
   );
-  setTranscriptionWorker(worker);
+  setTranscriptionWorker(worker, providerName);
 }
 
 // Fields the worker needs regardless of provider (queue/retention/context).
@@ -156,8 +157,8 @@ const commonWorkerOpts = {
   getContextPredicates: (vault: string) => readVaultConfig(vault)?.transcription?.context,
 };
 
-// Provider selection (scribe-fold Phase 2a). Default is `scribe-http` — unset
-// TRANSCRIPTION_PROVIDER means the existing scribe-http path runs unchanged.
+// Provider selection uses the shared resolver (local whisper-cpp by default
+// without legacy remote discovery). Bind this identity when wiring the worker.
 const providerName = resolveTranscriptionProviderName();
 if (providerName === "whisper-cpp") {
   // whisper.cpp's prebuilt CLIs — the local, no-Python path that actually
@@ -288,9 +289,10 @@ if (providerName === "whisper-cpp") {
     console.warn(
       "[transcribe] NO transcription provider is reachable — audio attachments " +
         "will be accepted but never transcribed. " +
-        `Provider resolved to "${providerName}". Fix with either: ` +
-        "`parachute-vault transcription install` + TRANSCRIPTION_PROVIDER=<local provider>, " +
-        "or point SCRIBE_URL at a transcription service. " +
+        `Provider resolved to "${providerName}". The standalone Scribe service is retired. ` +
+        "For explicit transcription, use `parachute-vault transcription install` and " +
+        "check `parachute-vault transcription status`. Automatic uploads require " +
+        "the selected worker to be active and ready. " +
         "Set `auto_transcribe.enabled: false` to silence this if you don't want transcription.",
     );
   }
@@ -430,22 +432,27 @@ for (const warning of reservedNameSquatWarnings(listVaults())) {
 // Migrate tag schemas from vault.yaml → DB for each vault.
 // Only inserts schemas that don't already exist in the DB (safe across restarts).
 for (const vaultName of listVaults()) {
-  const vaultConfig = readVaultConfig(vaultName);
-  if (vaultConfig?.tag_schemas && Object.keys(vaultConfig.tag_schemas).length > 0) {
-    const store = getVaultStore(vaultName);
-    const existingTags = new Set((await store.listTagSchemas()).map((s) => s.tag));
-    let migrated = 0;
-    for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
-      if (!existingTags.has(tag)) {
-        await store.upsertTagSchema(tag, schema);
-        migrated++;
+  try {
+    const vaultConfig = readVaultConfig(vaultName);
+    if (vaultConfig?.tag_schemas && Object.keys(vaultConfig.tag_schemas).length > 0) {
+      const store = getVaultStore(vaultName);
+      const existingTags = new Set((await store.listTagSchemas()).map((s) => s.tag));
+      let migrated = 0;
+      for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
+        if (!existingTags.has(tag)) {
+          await store.upsertTagSchema(tag, schema);
+          migrated++;
+        }
+      }
+      if (migrated > 0) {
+        console.log(`[migration] migrated ${migrated} tag schema(s) from vault.yaml to DB for vault "${vaultName}"`);
+      } else {
+        console.log(`[migration] vault "${vaultName}" has tag_schemas in vault.yaml (already in DB — vault.yaml section can be removed)`);
       }
     }
-    if (migrated > 0) {
-      console.log(`[migration] migrated ${migrated} tag schema(s) from vault.yaml to DB for vault "${vaultName}"`);
-    } else {
-      console.log(`[migration] vault "${vaultName}" has tag_schemas in vault.yaml (already in DB — vault.yaml section can be removed)`);
-    }
+  } catch (err) {
+    if (!(err instanceof VaultImportPausedError)) throw err;
+    console.warn(`[history-import] vault "${vaultName}" is paused; skipping tag-schema migration`);
   }
 }
 
@@ -633,6 +640,16 @@ const server = Bun.serve({
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
+    // Refuse before WS upgrade and before any route can open/maintain a paused DB.
+    const vaultSegment = /^\/vault\/([^/]+)/.exec(path)?.[1];
+    if (vaultSegment && listVaults().includes(vaultSegment)) {
+      try { assertVaultNotPaused(vaultSegment); }
+      catch (err) {
+        if (!(err instanceof VaultImportPausedError)) throw err;
+        return Response.json({ error_type: err.error_type, message: err.message }, { status: 503, headers: corsHeaders });
+      }
+    }
+
     // Live-query WebSocket upgrade — detected BEFORE the fetch pipeline because
     // WS upgrades don't traverse `route()`. Non-upgrade requests (incl. a
     // straggler non-WS GET /subscribe, which now gets a 410 Gone in routing.ts —
@@ -659,6 +676,9 @@ const server = Bun.serve({
       }
       return response;
     } catch (err) {
+      if (err instanceof VaultImportPausedError || err instanceof MirrorRetiredError) {
+        return Response.json({ error_type: err.error_type, message: err.message }, { status: err.status, headers: corsHeaders });
+      }
       console.error(`[${req.method} ${path}]`, err);
       return Response.json(
         { error: "Internal server error" },
@@ -737,4 +757,3 @@ setInterval(() => {
   }
   void shutdown("STOP_SIGNAL");
 }, STOP_POLL_MS).unref();
-

@@ -1,3 +1,4 @@
+import { assertVaultNotPaused } from "./mirror-config.ts";
 /**
  * Vault store management — opens and caches per-vault SQLite stores.
  *
@@ -92,6 +93,7 @@ export function resetSharedEmbeddingProviderForTests(): void {
 
 /** Get or create a store for a vault. */
 export function getVaultStore(name: string): SqliteStore {
+  assertVaultNotPaused(name);
   let store = stores.get(name);
   if (!store) {
     const db = openVaultDb(name);

@@ -992,3 +992,7 @@ wizard, `parachute init --vault-name <name>`, or `parachute-vault create
 ## License
 
 AGPL-3.0
+
+### Importing legacy git history
+
+`parachute-vault history-import plan` reports a local mirror archive's recoverable history and retention effects. The offline `prepare`, `apply`, and `retire` commands import it without rewriting live notes, preserve the static archive, and prevent retired mirrors from restarting. See [the cutover and recovery procedure](UPGRADING.md#git-history-import-schema-v30--v31). Audited duplicate trees can use explicit `--selections` on plan/prepare; apply uses the embedded manifest, and unresolved notes stay quarantined. Nothing imports or retires automatically on upgrade.

@@ -1,3 +1,4 @@
+import { assertMirrorActive } from "./mirror-config.ts";
 /**
  * Mirror lifecycle manager — boot-time bootstrap + event-driven exports.
  *
@@ -649,6 +650,7 @@ export class MirrorManager {
     // a fn returning `null` to exercise the git-not-installed start path.
     which?: (cmd: string) => string | null,
   ): Promise<MirrorStatus> {
+    assertMirrorActive(this.deps.vaultName);
     this.startCount++;
     await this.stop({ preserveStatus: true });
 
@@ -846,6 +848,7 @@ export class MirrorManager {
     // Test seam forwarded to `start()` — see `start(which)`.
     which?: (cmd: string) => string | null,
   ): Promise<MirrorStatus> {
+    assertMirrorActive(this.deps.vaultName);
     this.deps.writeMirrorConfig(newConfig);
     return this.start(which);
   }
@@ -861,6 +864,7 @@ export class MirrorManager {
    * effect anyway.
    */
   async runNow(): Promise<MirrorStatus> {
+    assertMirrorActive(this.deps.vaultName);
     if (!this.status.enabled) {
       return this.getStatus();
     }
@@ -1024,6 +1028,7 @@ export class MirrorManager {
    * dispatcher (would kill the loop).
    */
   private async runOneCycle(opts: { isInitial: boolean; prune: boolean }): Promise<void> {
+    assertMirrorActive(this.deps.vaultName);
     const nextCursor = new Date().toISOString();
     const path = this.status.mirror_path!;
     const sinceCursor = opts.isInitial ? undefined : this.cursor;
@@ -1162,6 +1167,7 @@ export class MirrorManager {
     | { fired: false; reason: "not_enabled" | "no_mirror_path" }
     | { fired: true; pushed: boolean; sha?: string; error?: string }
   > {
+    assertMirrorActive(this.deps.vaultName);
     if (!this.status.enabled) return { fired: false, reason: "not_enabled" };
     if (!this.status.mirror_path) return { fired: false, reason: "no_mirror_path" };
     const path = this.status.mirror_path;

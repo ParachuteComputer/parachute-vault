@@ -227,3 +227,60 @@ describe("vault#524 history retention and blob integrity", () => {
     expect(await store.getNote(n.id)).toBeNull();
   });
 });
+
+describe("vault#743 whole-blob integrity", () => {
+  it("reads valid whole blobs including empty and multibyte text", async () => {
+    const empty = await store.createNote("placeholder");
+    await store.updateNote(empty.id, { content: "" });
+    await store.updateNote(empty.id, { content: "final" });
+    expect((await store.getNoteVersion(empty.id, 1))!.content).toBe("");
+
+    const multi = await store.createNote("é".repeat(1000));
+    await store.updateNote(multi.id, { content: "next" });
+    expect((await store.getNoteVersion(multi.id, 0))!.content).toBe("é".repeat(1000));
+
+    const plain = await store.createNote("whole body");
+    await store.updateNote(plain.id, { content: "updated" });
+    expect((await store.getNoteVersion(plain.id, 0))!.content).toBe("whole body");
+  });
+  it("rejects a corrupted whole blob on direct read", async () => {
+    const n = await store.createNote("original");
+    await store.updateNote(n.id, { content: "live" });
+    const hash = (await store.listNoteVersions(n.id))[0]!.content_hash;
+    db.prepare("UPDATE note_blobs SET content = ? WHERE hash = ?").run(
+      "tampered",
+      hash,
+    );
+    expect(() => history!.readBlobContent(db, hash!)).toThrow(
+      history!.HistoryDeltaOrphanError,
+    );
+  });
+  it("rejects a corrupted whole blob through version read", async () => {
+    const n = await store.createNote("original");
+    await store.updateNote(n.id, { content: "live" });
+    const hash = (await store.listNoteVersions(n.id))[0]!.content_hash;
+    db.prepare("UPDATE note_blobs SET content = ? WHERE hash = ?").run(
+      "tampered",
+      hash,
+    );
+    await expect(store.getNoteVersion(n.id, 0)).rejects.toMatchObject({
+      code: "HISTORY_UNRECOVERABLE",
+      reason: "delta_orphan",
+    });
+  });
+  it("rejects restoring a corrupted whole blob and leaves live note and history unchanged", async () => {
+    const n = await store.createNote("original");
+    await store.updateNote(n.id, { content: "live" });
+    const versionsBefore = await store.listNoteVersions(n.id);
+    const hash = versionsBefore[0]!.content_hash;
+    db.prepare("UPDATE note_blobs SET content = ? WHERE hash = ?").run(
+      "tampered",
+      hash,
+    );
+    await expect(store.restoreNoteVersion(n.id, 0, {})).rejects.toMatchObject({
+      code: "HISTORY_UNRECOVERABLE",
+    });
+    expect((await store.getNote(n.id))!.content).toBe("live");
+    expect(await store.listNoteVersions(n.id)).toEqual(versionsBefore);
+  });
+});
