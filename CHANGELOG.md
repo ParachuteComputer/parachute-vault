@@ -4,7 +4,9 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.7.9-rc.7] - 2026-09-17
+
+**Local audio transcription and stronger history reads.** Audio uploads can use the selected local transcription worker without the retired standalone Scribe service. Historical whole-blob reads now verify their content hash before returning data (#749). This release adds no database migration beyond rc.6's schema 31.
 
 - Automatic audio uploads now use the selected, active and ready transcription worker, including local providers, instead of requiring legacy Scribe discovery (#751). Auto-transcribe defaults to on; installations with a ready local worker will therefore start processing new eligible audio uploads. Per-vault/global opt-outs and REST explicit opt-out remain respected. Existing failed audio is not retried or backfilled. Explicit remote-provider compatibility remains supported; the standalone Scribe service remains retired.
 - Whisper automatic uploads require binary, model and ffmpeg readiness. Explicit transcription retains its existing enqueue behavior, including when runtime dependencies are missing; this change does not make that path readiness-gated.
