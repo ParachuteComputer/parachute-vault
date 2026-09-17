@@ -17,6 +17,7 @@ import type { TagScopeCtx } from "./routes.ts";
 import { extractApiKey } from "./auth.ts";
 import { startTranscriptionWorker } from "./transcription-worker.ts";
 import { setTranscriptionWorker } from "./transcription-registry.ts";
+import { clearScribeUrlCache } from "./scribe-discovery.ts";
 import type { Store } from "../core/src/types.ts";
 
 let db: Database;
@@ -3314,23 +3315,45 @@ describe("HTTP /notes", async () => {
     // left looking like an ordinary upload — it records WHY nothing happened.
     // It is still not `pending` (nothing was enqueued) and the note is still
     // untouched (no stub, since the caller never asked for one).
-    test("audio with no flag + no provider records the failure; note untouched", async () => {
-      await store.createNote("note body", { id: "v2" });
-      const res = await handleNotes(
-        mkReq("POST", "/notes/v2/attachments", {
-          path: "memos/memo-2.webm",
-          mimeType: "audio/webm",
-        }),
-        store,
-        "/v2/attachments",
-      );
-      expect(res.status).toBe(201);
-      const att = await res.json() as any;
-      expect(att.metadata?.transcribe_status).toBe("failed");
-      expect(att.metadata?.transcribe_error).toMatch(/no transcription provider configured/i);
+    //
+    // Fixture: select the remote provider so the presence/absence of a local
+    // whisper-cpp install on the host cannot change the message. With no
+    // SCRIBE_URL configured, auto-transcribe is still unavailable and reports
+    // the same actionable no-provider error on every box.
+    test("audio with no flag + scribe-http without URL records the failure; note untouched", async () => {
+      const prevProvider = process.env.TRANSCRIPTION_PROVIDER;
+      const prevScribeUrl = process.env.SCRIBE_URL;
+      process.env.TRANSCRIPTION_PROVIDER = "scribe-http";
+      delete process.env.SCRIBE_URL;
+      clearScribeUrlCache();
+      try {
+        await store.createNote("note body", { id: "v2" });
+        const res = await handleNotes(
+          mkReq("POST", "/notes/v2/attachments", {
+            path: "memos/memo-2.webm",
+            mimeType: "audio/webm",
+          }),
+          store,
+          "/v2/attachments",
+        );
+        expect(res.status).toBe(201);
+        const att = await res.json() as any;
+        expect(att.metadata?.transcribe_status).toBe("failed");
+        expect(att.metadata?.transcribe_error).toMatch(/no transcription provider configured/i);
+        expect(att.metadata?.transcribe_error).toMatch(/TRANSCRIPTION_PROVIDER/);
+        expect(att.metadata?.transcribe_error).toMatch(/SCRIBE_URL/);
+        expect(att.metadata?.transcribe_origin).toBe("auto");
 
-      const note = await store.getNote("v2");
-      expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+        const note = await store.getNote("v2");
+        expect(note!.content).toBe("note body");
+        expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+      } finally {
+        if (prevProvider === undefined) delete process.env.TRANSCRIPTION_PROVIDER;
+        else process.env.TRANSCRIPTION_PROVIDER = prevProvider;
+        if (prevScribeUrl === undefined) delete process.env.SCRIBE_URL;
+        else process.env.SCRIBE_URL = prevScribeUrl;
+        clearScribeUrlCache();
+      }
     });
 
     // The explicit opt-out. `transcribe: false` is a caller saying no, and it
