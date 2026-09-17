@@ -12,7 +12,7 @@ import { getTranscriptionWorker, getTranscriptionWorkerProvider, setTranscriptio
 for (const door of ["rest", "ticket"] as const) {
   for (const mode of ["local", "remote", "missing", "mismatch", "unready", "disabled", "explicit", "non-audio"] as const) {
     test(`${door}: ${mode} automatic worker eligibility`, async () => {
-      const previous = { provider: process.env.TRANSCRIPTION_PROVIDER, url: process.env.SCRIBE_URL, model: process.env.TRANSCRIPTION_MODEL };
+      const previous = { provider: process.env.TRANSCRIPTION_PROVIDER, url: process.env.SCRIBE_URL, model: process.env.TRANSCRIPTION_MODEL, assets: process.env.ASSETS_DIR };
       const oldWorker = getTranscriptionWorker();
       const oldProvider = getTranscriptionWorkerProvider();
       const vault = `auto-worker-${crypto.randomUUID()}`;
@@ -24,6 +24,9 @@ for (const door of ["rest", "ticket"] as const) {
       const store = getVaultStore(vault);
       const unregister = registerTranscriptionHook(defaultHookRegistry, worker, (s) => s === store ? vault : undefined);
       try {
+        // Sibling files may set a process-global storage root. These uploads
+        // belong only to this unique vault, not that shared test directory.
+        delete process.env.ASSETS_DIR;
         process.env.TRANSCRIPTION_PROVIDER = mode === "remote" ? "scribe-http" : mode === "unready" ? "whisper-cpp" : "transcribe-cpp";
         // A stale URL must never make an absent/mismatched local worker ready.
         if (mode === "local") delete process.env.SCRIBE_URL;
@@ -70,7 +73,7 @@ for (const door of ["rest", "ticket"] as const) {
         await defaultHookRegistry.drain();
         unregister();
         setTranscriptionWorker(oldWorker, oldProvider);
-        for (const [key, value] of [["TRANSCRIPTION_PROVIDER", previous.provider], ["SCRIBE_URL", previous.url], ["TRANSCRIPTION_MODEL", previous.model]] as const) {
+        for (const [key, value] of [["TRANSCRIPTION_PROVIDER", previous.provider], ["SCRIBE_URL", previous.url], ["TRANSCRIPTION_MODEL", previous.model], ["ASSETS_DIR", previous.assets]] as const) {
           if (value === undefined) delete process.env[key]; else process.env[key] = value;
         }
       }
