@@ -119,6 +119,14 @@ export class HistoryUnrecoverableError extends Error {
     this.name = "HistoryUnrecoverableError";
   }
 }
+export class HistoryPreconditionRequiredError extends Error {
+  readonly code = "PRECONDITION_REQUIRED";
+  readonly error_type = "precondition_required";
+  constructor(readonly note_id: string) {
+    super("Restoring an existing note requires if_updated_at from the note you reviewed.");
+  }
+}
+
 export class HistoryNotFoundError extends Error {
   code = "HISTORY_NOT_FOUND" as const;
   note_id: string;

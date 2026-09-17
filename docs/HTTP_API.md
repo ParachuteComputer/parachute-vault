@@ -1481,7 +1481,7 @@ Folding options:
 
 Imported history appears in existing version lists with `origin: "git-import"` and nonnegative `import_ix`, omitting `version_ix`. The newest imported observation is `import_ix: 0`; older observations increase that index. Native rows keep their existing `version_ix` shape and appear before imported rows. For example: native 1, native 0, import 0, import 1. The boundary is provenance, not a claim about exact edit chronology.
 
-`GET /vault/{name}/api/notes/{idOrPath}/imports/{import_ix}` reads a retained imported observation. Paths use the same URL encoding and tag-scope checks as `/versions/{version_ix}`. Restore uses the existing POST `/notes/{idOrPath}/restore` with `{ "origin": "git-import", "import_ix": 0 }`, optionally `if_updated_at`. `restored_from` is that reference object for imports. Native `{version_ix}` remains unchanged. Mixed, incomplete, negative, fractional or unsafe selectors are rejected. Pruned imports return 404 with their public reference; unrecoverable imports return 409 `history_unrecoverable` with the reference, never an internal storage index.
+`GET /vault/{name}/api/notes/{idOrPath}/imports/{import_ix}` reads a retained imported observation. Paths use the same URL encoding and tag-scope checks as `/versions/{version_ix}`. Restore uses the existing POST `/notes/{idOrPath}/restore` with `{ "origin": "git-import", "import_ix": 0 }` and requires `if_updated_at` when the note currently exists (omit it for deleted-note recovery). `restored_from` is that reference object for imports. Native `{version_ix}` remains unchanged. Mixed, incomplete, negative, fractional or unsafe selectors are rejected. Pruned imports return 404 with their public reference; unrecoverable imports return 409 `history_unrecoverable` with the reference, never an internal storage index.
 
 MCP `query-notes` accepts `versions: {note_id, origin:"git-import", import_ix:0}` for reads. It preserves existing live-note and tag-scope restrictions. Corrupt imported content produces a JSON-RPC error with `error.data.error_type`, `origin`, and `import_ix`; it is not a successful tool result containing an error string. There is no new MCP restore operation.
 
@@ -1506,8 +1506,10 @@ Versions are **not** full-text searchable.
 - `GET /vault/{name}/api/notes/{idOrPath}/versions/{version_ix}`
   (`vault:read`) returns one version with its content; missing versions are 404.
 - `POST /vault/{name}/api/notes/{idOrPath}/restore` (`vault:write`)
-  accepts `{version_ix, if_updated_at?}` and returns the note with
-  `restored_from` and `recreated`. A stale token is 409 `conflict`.
+  accepts `{version_ix, if_updated_at}` for an existing note and returns the note with
+  `restored_from` and `recreated`. A stale token is 409 `conflict`; an omitted
+  token is 428 `precondition_required`, even with `force:true`. Deleted-note
+  recovery omits the token because no current note exists to compare.
 - `DELETE /vault/{name}/api/notes/{idOrPath}/versions` is **`vault:admin`
   and irreversible**. It returns `{erased:true, id, versions_deleted,
   blobs_deleted}` without deleting a live note.

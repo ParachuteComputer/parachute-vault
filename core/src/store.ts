@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { HistoryPreconditionRequiredError } from "./history.js";
 import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow, SemanticSearchResult } from "./types.js";
 import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
 import { initSchema } from "./schema.js";
@@ -834,6 +835,7 @@ export class BunSqliteStore implements Store {
       const v = getVersion(this.db, id, versionIx);
       if (!v) throw new HistoryNotFoundError(id, versionIx);
       if (v.encoding === "overflow") throw new HistoryUnrecoverableError(id, versionIx);
+      if (opts.if_updated_at === undefined) throw new HistoryPreconditionRequiredError(id);
       return await this.updateNote(id, {
         content: v.content!, metadata: v.metadata, extension: v.extension ?? undefined,
         actor: opts.actor ?? null, via: opts.via ?? null,

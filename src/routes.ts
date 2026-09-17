@@ -269,6 +269,7 @@ function conflictResponse(e: any): Response | null {
       400,
     );
   }
+  if (e && e.code === "PRECONDITION_REQUIRED") return json({ error_type: "precondition_required", note_id: e.note_id, message: e.message }, 428);
   if (e && e.code === "HISTORY_NOT_FOUND") return json({ error: e.message, error_type: "not_found" }, 404);
   if (e && e.code === "HISTORY_OVERFLOW") return json({
     error_type: "history_overflow", note_id: e.note_id, byte_size: e.byte_size, limit: e.limit, message: e.message,
