@@ -13,6 +13,7 @@ import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHi
  */
 
 import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
+import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import { ULID_REGEX } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
@@ -2942,7 +2943,7 @@ async function handleNotesInner(
         const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0);
         const versions = await store.listNoteVersions(id, { limit, offset });
         const total = await store.countNoteVersions(id);
-        return json({ versions: versions.map(projectHistoryRow), total });
+        return json({ versions: versions.map(row => projectHistoryProvenance(projectHistoryRow(row), tagScope.allowed !== null)), total });
       }
       if (method === "DELETE") {
         const result = await store.eraseNoteHistory(id);
@@ -2953,7 +2954,7 @@ async function handleNotesInner(
       if (!/^\d+$/.test(importMatch[1]!) || !Number.isSafeInteger(index) || index < 0) return json({ error: "Invalid import_ix", error_type: "invalid_request" }, 400);
       try {
         const version = getImportedVersion(db, id, index);
-        return version ? json(projectHistoryRow(version)) : json({ error: "Not found", error_type: "not_found", origin: "git-import", import_ix: index }, 404);
+        return version ? json(projectHistoryProvenance(projectHistoryRow(version), tagScope.allowed !== null)) : json({ error: "Not found", error_type: "not_found", origin: "git-import", import_ix: index }, 404);
       } catch (e) {
         const response = conflictResponse(e);
         if (response) return response;
@@ -2964,7 +2965,7 @@ async function handleNotesInner(
       if (!/^\d+$/.test(verMatch[1]!) || !Number.isInteger(ix) || ix < 0) return json({ error: "Invalid version_ix", error_type: "invalid_request" }, 400);
       try {
         const version = await store.getNoteVersion(id, ix);
-        return version ? json(version) : json({ error: "Not found", error_type: "not_found" }, 404);
+        return version ? json(projectHistoryProvenance(version, tagScope.allowed !== null)) : json({ error: "Not found", error_type: "not_found" }, 404);
       } catch (e) {
         const response = conflictResponse(e);
         if (response) return response;
