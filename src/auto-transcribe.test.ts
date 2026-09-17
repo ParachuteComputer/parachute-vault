@@ -302,9 +302,7 @@ describe("the unavailable message tells the truth about the local install", () =
   const audio = "audio/webm";
   const noScribe = () => undefined;
 
-  test("nothing runnable locally → the original message, unchanged", () => {
-    // The fresh-install case the old string was written for, and it is still
-    // exactly right there. Byte-identical so a fresh install sees no churn.
+  test("nothing runnable locally → guidance distinguishes explicit from automatic transcription", () => {
     const d = classifyAutoTranscribe(audio, {
       perVaultEnabled: true,
       getCachedScribeUrlImpl: noScribe,
@@ -314,6 +312,20 @@ describe("the unavailable message tells the truth about the local install", () =
     expect(noProviderErrorFor(d.kind === "unavailable" ? d.localProvider : null)).toBe(
       NO_PROVIDER_ERROR,
     );
+    expect(NO_PROVIDER_ERROR).toContain("For explicit transcription");
+    expect(NO_PROVIDER_ERROR).toContain("transcription install");
+    expect(NO_PROVIDER_ERROR).toContain("transcription status");
+    expect(NO_PROVIDER_ERROR).toContain("does not enable automatic uploads");
+  });
+
+  test("neither unavailable message recommends reviving the retired service", () => {
+    for (const local of [null, "whisper-cpp"]) {
+      const message = noProviderErrorFor(local);
+      expect(message).toContain("standalone Scribe service is retired");
+      expect(message).not.toContain("point SCRIBE_URL");
+      expect(message).toContain("explicit");
+      expect(message).toContain("transcription status");
+    }
   });
 
   test("a runnable local provider → a message that does not contradict the box", () => {

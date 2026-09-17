@@ -174,18 +174,17 @@ export function classifyAutoTranscribe(
 
 /**
  * The `transcribe_error` written when auto-transcribe is on but no provider is
- * reachable AND nothing local is configured. Deliberately actionable — the
- * operator needs to know which of the two things to do, not just that something
- * went wrong.
- *
- * Correct only when the resolved provider is `scribe-http`. On a box that HAS a
- * local provider this sentence is false in the most expensive way — see
- * `noProviderErrorFor`.
+ * reachable AND the selected provider probe reports no local installation.
+ * Distinguish installing a provider for explicit requests from enabling this
+ * legacy automatic-upload path; the former does not fix the latter.
  */
 export const NO_PROVIDER_ERROR =
-  "no transcription provider configured — set TRANSCRIPTION_PROVIDER to a local " +
-  "provider (see `parachute-vault transcription install`), or point SCRIBE_URL at " +
-  "a transcription service";
+  "no transcription provider configured for automatic uploads — this path still " +
+  "requires legacy remote discovery (SCRIBE_URL or services.json), not a local provider. " +
+  "The standalone Scribe service is retired. For explicit transcription, configure " +
+  "TRANSCRIPTION_PROVIDER with `parachute-vault transcription install`, then check " +
+  "`parachute-vault transcription status`. Installing a local provider does not " +
+  "enable automatic uploads on this path.";
 
 /**
  * The `transcribe_error` for an `unavailable` decision, told truthfully.
@@ -216,8 +215,8 @@ export function noProviderErrorFor(localProvider: string | null): string {
     `(SCRIBE_URL, or a \`parachute-scribe\` entry in services.json), and neither is set. ` +
     `A local ${localProvider} install IS present here and explicit transcription requests ` +
     `are routed to it — this path does not consult it. Reinstalling ${localProvider} will ` +
-    `not change this. To auto-transcribe uploads, point SCRIBE_URL at a transcription ` +
-    `service; otherwise request transcription explicitly on the attachment. ` +
+    `not change this. The standalone Scribe service is retired; request transcription ` +
+    `explicitly on the attachment instead of reinstalling that service. ` +
     `\`parachute-vault transcription status\` reports the local install's own state.`
   );
 }

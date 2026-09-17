@@ -289,9 +289,10 @@ if (providerName === "whisper-cpp") {
     console.warn(
       "[transcribe] NO transcription provider is reachable — audio attachments " +
         "will be accepted but never transcribed. " +
-        `Provider resolved to "${providerName}". Fix with either: ` +
-        "`parachute-vault transcription install` + TRANSCRIPTION_PROVIDER=<local provider>, " +
-        "or point SCRIBE_URL at a transcription service. " +
+        `Provider resolved to "${providerName}". The standalone Scribe service is retired. ` +
+        "For explicit transcription, use `parachute-vault transcription install` and " +
+        "check `parachute-vault transcription status`. Automatic uploads still require " +
+        "legacy remote discovery; installing a local provider does not enable that path. " +
         "Set `auto_transcribe.enabled: false` to silence this if you don't want transcription.",
     );
   }
@@ -756,4 +757,3 @@ setInterval(() => {
   }
   void shutdown("STOP_SIGNAL");
 }, STOP_POLL_MS).unref();
-
