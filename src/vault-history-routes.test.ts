@@ -125,6 +125,11 @@ test("tag-scoped REST and MCP history omit provenance without changing stored ro
 test("P5 REST restore rejects stale optimistic tokens without capture", async () => {
   const n = await fixture();
   const before = await store.listNoteVersions(n.id);
+  for (const extra of [{}, { force: true }]) {
+    const missing = await call(n.id, "/restore", "POST", { version_ix: 0, ...extra });
+    expect(missing.status).toBe(428);
+    expect(missing.body.error_type).toBe("precondition_required");
+  }
   const r = await call(n.id, "/restore", "POST", {
     version_ix: 0,
     if_updated_at: "1999-01-01T00:00:00.000Z",
@@ -437,7 +442,7 @@ test("P24 migration bypass restores, captures once, and emits the bypass log", a
   const n = await strictFixture();
   const log = spyOn(console, "warn").mockImplementation(() => {});
   try {
-    const r = await call(n.id, "/restore", "POST", { version_ix: 0 }, false, {
+    const r = await call(n.id, "/restore", "POST", { version_ix: 0, if_updated_at: (await store.getNote(n.id))!.updatedAt }, false, {
       actor: "migrator",
       via: "api",
       bypassStrict: true,

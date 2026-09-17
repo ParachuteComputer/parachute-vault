@@ -6,6 +6,8 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+- Restoring an existing note now requires its last-reviewed `if_updated_at`; omission returns 428 instead of performing an unconditional replacement. Native and imported restores share the core guard. Stale timestamps still return 409, and deleted-note recovery still omits the timestamp. This intentionally tightens the restore contract before app integration; `force:true` does not bypass it.
+
 - Git-history import now aborts on SQLite staging/cache failures instead of reporting valid archive entries as malformed metadata. No import manifest is produced from an interrupted database walk; malformed source diagnostics remain separate.
 - Tag-restricted REST/MCP history reads omit historical `actor` and `via` fields (#736). Stored provenance and unrestricted access are unchanged; native/imported references, content and restore behavior remain available. See [history privacy](docs/history-privacy.md).
 

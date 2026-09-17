@@ -84,7 +84,11 @@ test("imported REST references restore by ID or encoded path and preserve native
   expect(list.body.versions.map((v: any) => v.version_ix ?? v.origin)).toEqual([0, "git-import"]);
   for (const body of [{ origin: "git-import" }, { import_ix: 0 }, { origin: "git-import", import_ix: 0, version_ix: 0 }, { origin: "git-import", import_ix: -1 }]) expect((await call(`/notes/${note.id}/restore`, "POST", body)).status).toBe(400);
   expect((await call(`/notes/${note.id}/versions/-1`)).status).toBe(400);
-  const restored = await call(`/notes/${note.id}/restore`, "POST", { origin: "git-import", import_ix: 0 });
+  const beforeRestore = await store.getNote(note.id);
+  const missingStamp = await call(`/notes/${note.id}/restore`, "POST", { origin: "git-import", import_ix: 0 });
+  expect(missingStamp.status).toBe(428);
+  expect(await store.getNote(note.id)).toEqual(beforeRestore);
+  const restored = await call(`/notes/${note.id}/restore`, "POST", { origin: "git-import", import_ix: 0, if_updated_at: beforeRestore!.updatedAt });
   expect(restored.status).toBe(200);
   expect(restored.body.restored_from).toEqual({ origin: "git-import", import_ix: 0 });
   expect((await store.getNote(note.id))!.content).toBe("archive");

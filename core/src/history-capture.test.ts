@@ -86,8 +86,16 @@ it("P5 restore reads its source before a one-version prune", async () => {
   });
   const n = await store.createNote("one");
   await store.updateNote(n.id, { content: "two" });
-  expect((await store.restoreNoteVersion(n.id, 0, {})).content).toBe("one");
+  expect((await store.restoreNoteVersion(n.id, 0, { if_updated_at: (await store.getNote(n.id))!.updatedAt })).content).toBe("one");
   expect(await store.listNoteVersions(n.id)).toHaveLength(1);
+});
+it("live restore requires a precondition and leaves current note and history unchanged without one", async () => {
+  const n = await store.createNote("old");
+  await store.updateNote(n.id, { content: "new" });
+  const before = await store.getNote(n.id), versions = await store.listNoteVersions(n.id);
+  await expect(store.restoreNoteVersion(n.id, 0, {})).rejects.toMatchObject({ code: "PRECONDITION_REQUIRED" });
+  expect(await store.getNote(n.id)).toEqual(before);
+  expect(await store.listNoteVersions(n.id)).toEqual(versions);
 });
 it("P8a tag rename captures only rewritten notes", async () => {
   await store.upsertTagRecord("old", {});
