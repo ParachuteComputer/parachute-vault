@@ -1489,6 +1489,11 @@ History erasure removes retained content through the existing GC rules. Minimal 
 
 ### Version history
 
+Tag-restricted sessions receive version lists and native/imported version reads
+without top-level `actor` or `via`. Stored provenance and unrestricted reads are
+unchanged. This does not anonymize note content or user-authored metadata; see
+[history privacy](history-privacy.md).
+
 Self-hosted only in PR 1 of #524; the hosted door follows in PR 4. History
 begins at the v29 upgrade (**no backfill** — the git mirror repo is the only
 pre-v29 record). A **create** writes no version. Each later mutation captures

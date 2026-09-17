@@ -11,6 +11,8 @@ import {
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { generateScopedMcpTools } from "./mcp-tools.ts";
 import { runDoctorScan } from "../core/src/doctor.ts";
+import { applyImportedNote, beginImportRun, importTargetDigest } from "../core/src/history-import.ts";
+import { resolveHistoryPolicy } from "../core/src/history.ts";
 let taskDir: string,
   savedHome: string | undefined,
   store: ReturnType<typeof getVaultStore>;
@@ -78,6 +80,48 @@ async function fixture() {
   await store.updateNote(n.id, { content: "two" });
   return n;
 }
+test("tag-scoped REST and MCP history omit provenance without changing stored rows", async () => {
+  const n = await store.createNote("original", { path: "history-visible", tags: ["journal"] });
+  await store.updateNote(n.id, { content: "current", actor: "PRIVATE_EDITOR", via: "PRIVATE_INTERFACE" });
+  const run = { run_id: "visibility", source_fingerprint: "source", tip: "tip", options_digest: "options" };
+  beginImportRun(store.db, run);
+  applyImportedNote(store.db, { run, noteId: n.id, targetDigest: importTargetDigest(store.db, n.id),
+    policy: resolveHistoryPolicy({ min_versions: 20 }), now: Date.now(),
+    observations: [{ content: "archive", path: "old/path", metadata: {}, extension: "md", created_at: null,
+      observed_at: new Date().toISOString(), commit: "commit", blob: "blob" }] });
+  const before = await store.listNoteVersions(n.id);
+  const full = (await call(n.id, "/versions")).body;
+  expect(full.versions[0]).toMatchObject({ actor: "PRIVATE_EDITOR", via: "PRIVATE_INTERFACE" });
+  for (const scoped of [false, true]) {
+    const rest = (await call(n.id, "/versions", "GET", undefined, scoped)).body;
+    const mcp = await query(scoped ? ["journal"] : null)({ versions: { note_id: n.id } });
+    expect(mcp).toEqual(rest);
+    expect(rest.total).toBe(2);
+    expect(rest.versions[0].version_ix).toBe(0);
+    expect(rest.versions[1]).toMatchObject({ origin: "git-import", import_ix: 0 });
+    for (const row of rest.versions) {
+      expect(Object.hasOwn(row, "actor")).toBe(!scoped);
+      expect(Object.hasOwn(row, "via")).toBe(!scoped);
+    }
+    for (const [path, selector, content] of [
+      ["/versions/0", { version_ix: 0 }, "original"],
+      ["/imports/0", { origin: "git-import", import_ix: 0 }, "archive"],
+    ] as const) {
+      const one = await call(n.id, path, "GET", undefined, scoped);
+      expect(one.status).toBe(200);
+      expect(one.body.content).toBe(content);
+      expect(await query(scoped ? ["journal"] : null)({ versions: { note_id: n.id, ...selector } })).toEqual(one.body);
+      expect(Object.hasOwn(one.body, "actor")).toBe(!scoped);
+      expect(Object.hasOwn(one.body, "via")).toBe(!scoped);
+    }
+  }
+  expect(await store.listNoteVersions(n.id)).toEqual(before);
+  expect((await store.getNote(n.id))!.content).toBe("current");
+  // Empty tag lists mean unrestricted in the existing authorization contract.
+  expect(await query([])({ versions: { note_id: n.id } })).toEqual(full);
+  const denied = await query(["unrelated"])({ versions: { note_id: n.id } });
+  expect(denied).toMatchObject({ error_type: "not_found" });
+});
 test("P5 REST restore rejects stale optimistic tokens without capture", async () => {
   const n = await fixture();
   const before = await store.listNoteVersions(n.id);
