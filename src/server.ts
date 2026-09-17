@@ -145,7 +145,7 @@ function wireTranscriptionWorker(worker: TranscriptionWorker): void {
     worker,
     (store) => getVaultNameForStore(store as never),
   );
-  setTranscriptionWorker(worker);
+  setTranscriptionWorker(worker, providerName);
 }
 
 // Fields the worker needs regardless of provider (queue/retention/context).
@@ -157,8 +157,8 @@ const commonWorkerOpts = {
   getContextPredicates: (vault: string) => readVaultConfig(vault)?.transcription?.context,
 };
 
-// Provider selection (scribe-fold Phase 2a). Default is `scribe-http` — unset
-// TRANSCRIPTION_PROVIDER means the existing scribe-http path runs unchanged.
+// Provider selection uses the shared resolver (local whisper-cpp by default
+// without legacy remote discovery). Bind this identity when wiring the worker.
 const providerName = resolveTranscriptionProviderName();
 if (providerName === "whisper-cpp") {
   // whisper.cpp's prebuilt CLIs — the local, no-Python path that actually
@@ -291,8 +291,8 @@ if (providerName === "whisper-cpp") {
         "will be accepted but never transcribed. " +
         `Provider resolved to "${providerName}". The standalone Scribe service is retired. ` +
         "For explicit transcription, use `parachute-vault transcription install` and " +
-        "check `parachute-vault transcription status`. Automatic uploads still require " +
-        "legacy remote discovery; installing a local provider does not enable that path. " +
+        "check `parachute-vault transcription status`. Automatic uploads require " +
+        "the selected worker to be active and ready. " +
         "Set `auto_transcribe.enabled: false` to silence this if you don't want transcription.",
     );
   }
