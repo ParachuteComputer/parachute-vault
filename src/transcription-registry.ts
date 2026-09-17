@@ -1,21 +1,23 @@
 /**
  * Process-singleton holder for the active TranscriptionWorker (vault#353).
  *
- * Mirrors `mirror-registry.ts`: `server.ts` constructs the worker on boot
- * (when scribe is discoverable), and the REST retry endpoint
- * (`/api/notes/:id/retry-transcription`) picks it up here to call `kick()`
- * for an event-driven re-run. Absent the worker (no scribe), the retry
- * endpoint still flips the attachment back to `pending` so the sweep would
- * pick it up — but it'll just sit there until scribe shows up.
+ * The server registers its selected local or remote worker at boot after
+ * wiring the attachment hook. Retry endpoints use the worker to kick jobs;
+ * automatic-upload eligibility also checks the startup provider identity.
  */
 
 import type { TranscriptionWorker } from "./transcription-worker.ts";
 
 let activeWorker: TranscriptionWorker | null = null;
+let activeProvider: string | null = null;
 
-export function setTranscriptionWorker(worker: TranscriptionWorker | null): void {
+export function setTranscriptionWorker(worker: TranscriptionWorker | null, provider: string | null = null): void {
   activeWorker = worker;
+  activeProvider = worker ? provider : null;
 }
+
+/** Provider bound at worker startup, not a newly edited environment value. */
+export function getTranscriptionWorkerProvider(): string | null { return activeProvider; }
 
 export function getTranscriptionWorker(): TranscriptionWorker | null {
   return activeWorker;

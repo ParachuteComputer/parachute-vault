@@ -4,6 +4,11 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+- Automatic audio uploads now use the selected, active and ready transcription worker, including local providers, instead of requiring legacy Scribe discovery (#751). Auto-transcribe defaults to on; installations with a ready local worker will therefore start processing new eligible audio uploads. Per-vault/global opt-outs and REST explicit opt-out remain respected. Existing failed audio is not retried or backfilled. Explicit remote-provider compatibility remains supported; the standalone Scribe service remains retired.
+- Whisper automatic uploads require binary, model and ffmpeg readiness. Explicit transcription retains its existing enqueue behavior, including when runtime dependencies are missing; this change does not make that path readiness-gated.
+
 ## [0.7.9-rc.6] - 2026-09-16
 
 **Offline Git-history import and per-vault mirror retirement (#746, #747; refs #524).** Schema 30 → 31 adds import provenance and erasure-safe receipts. Plan on a database copy, prepare a verified archive with the vault offline, apply the exact manifest, then retire that vault's live mirror. Existing mirrors remain active until explicitly retired; archives and manual portable export remain available.
