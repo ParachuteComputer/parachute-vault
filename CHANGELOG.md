@@ -6,6 +6,7 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+- Git-history import now aborts on SQLite staging/cache failures instead of reporting valid archive entries as malformed metadata. No import manifest is produced from an interrupted database walk; malformed source diagnostics remain separate.
 - Automatic audio uploads now use the selected, active and ready transcription worker, including local providers, instead of requiring legacy Scribe discovery (#751). Auto-transcribe defaults to on; installations with a ready local worker will therefore start processing new eligible audio uploads. Per-vault/global opt-outs and REST explicit opt-out remain respected. Existing failed audio is not retried or backfilled. Explicit remote-provider compatibility remains supported; the standalone Scribe service remains retired.
 - Whisper automatic uploads require binary, model and ffmpeg readiness. Explicit transcription retains its existing enqueue behavior, including when runtime dependencies are missing; this change does not make that path readiness-gated.
 

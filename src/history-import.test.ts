@@ -1,6 +1,6 @@
-import { test, expect } from "bun:test";
+import { test, expect, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
-import { Database } from "bun:sqlite";
+import { Database, SQLiteError } from "bun:sqlite";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -118,6 +118,38 @@ test("ambiguous sidecars quarantine both identities; malformed YAML diagnostics 
     expect(JSON.stringify(stage.query("SELECT * FROM issues").all())).not.toContain("PRIVATE_SENTINEL");
   } finally { stage.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+for (const format of ["inline", "sidecar"] as const) for (const cache of ["object_cache", "parsed_cache"] as const) {
+  test(`staging SQLite failure in ${format} ${cache} aborts without blaming source notes`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "import-stage-failure-")), stage = new Database(":memory:");
+    const exec = stage.exec.bind(stage);
+    const setup = spyOn(stage, "exec").mockImplementation((sql) => {
+      const result = exec(sql);
+      if (sql.startsWith("CREATE TABLE selection_failures")) {
+        exec(`CREATE TRIGGER fail_cache BEFORE INSERT ON ${cache} BEGIN SELECT RAISE(ABORT, 'staging write failed'); END`);
+      }
+      return result;
+    });
+    try {
+      const repo = repoAt(join(dir, "repo"));
+      if (format === "inline") commit(repo, "valid body");
+      else {
+        mkdirSync(join(repo, ".parachute/notes-meta"), { recursive: true });
+        writeFileSync(join(repo, `.parachute/notes-meta/${noteId}.yaml`), `id: ${noteId}\npath: entry\nextension: json\n`);
+        writeFileSync(join(repo, "entry.json"), '{"valid":true}');
+        git(repo, "add", "."); git(repo, "commit", "-m", "valid sidecar");
+      }
+      let failure: unknown;
+      try { stageArchive(repo, git(repo, "rev-parse", "HEAD"), stage); }
+      catch (error) { failure = error; }
+      expect(failure).toBeInstanceOf(SQLiteError);
+      expect((failure as Error).message).toContain("staging write failed");
+      expect(stage.query("SELECT * FROM issues").all()).toEqual([]);
+      expect(stage.query("SELECT * FROM quarantine").all()).toEqual([]);
+      expect(stage.query("SELECT * FROM observations").all()).toEqual([]);
+    } finally { setup.mockRestore(); stage.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
 
 test("running daemon refuses prepare before creating a pause marker or backup", async () => {
   const dir = mkdtempSync(join(tmpdir(), "import-busy-")), saved = process.env.PARACHUTE_HOME;

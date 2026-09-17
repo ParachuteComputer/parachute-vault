@@ -1,5 +1,5 @@
 /** Offline git-history import. Git objects are data; no working tree is checked out. */
-import { Database } from "bun:sqlite";
+import { Database, SQLiteError } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -182,6 +182,9 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
       collect(id, state, () => JSON.parse((parsedBody.get(cacheKey) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash, sidecar });
     };
     const failure = (entry: typeof entries[number], error: unknown, id?: unknown) => {
+      // Staging/cache failures are operational, not evidence of malformed source.
+      // Abort so no diagnostic manifest can bless an incomplete archive walk.
+      if (error instanceof SQLiteError) throw error;
       const message = error instanceof Error ? error.message : "invalid_observation";
       const reason = /^[a-z_]+$/.test(message) ? message : "invalid_metadata_or_utf8";
       if (error instanceof GitArchiveError || message === "Archive byte limit exceeded" || message === "Archive note limit exceeded") throw error;
