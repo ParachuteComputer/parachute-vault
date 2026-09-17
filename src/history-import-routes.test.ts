@@ -45,6 +45,24 @@ async function call(path: string, method = "GET", body?: unknown, verb = "admin"
 }
 
 import { applyImportedNote, beginImportRun, importTargetDigest } from "../core/src/history-import.ts";
+test("authenticated history REST redacts scoped provenance for read/write/admin tokens", async () => {
+  const note = await store.createNote("before", { tags: ["journal"] });
+  await store.updateNote(note.id, { content: "after", actor: "HISTORICAL_EDITOR", via: "HISTORICAL_INTERFACE" });
+  for (const verb of ["read", "write", "admin"]) {
+    for (const scoped of [false, true]) {
+      for (const suffix of ["/versions", "/versions/0"]) {
+        const got = await call(`/notes/${note.id}${suffix}`, "GET", undefined, verb, scoped);
+        expect(got.status).toBe(200);
+        const row = got.body.versions?.[0] ?? got.body;
+        expect(Object.hasOwn(row, "actor")).toBe(!scoped);
+        expect(Object.hasOwn(row, "via")).toBe(!scoped);
+        if (!scoped) expect(row.actor).toBe("HISTORICAL_EDITOR");
+        expect(row.version_ix).toBe(0);
+      }
+    }
+  }
+  expect((await store.getNoteVersion(note.id, 0))!.actor).toBe("HISTORICAL_EDITOR");
+});
 test("imported REST references restore by ID or encoded path and preserve native keys", async () => {
   const note = await store.createNote("native", { path: "folder/imported", tags: ["journal"] });
   await store.updateNote(note.id, { content: "current" });
