@@ -64,7 +64,7 @@ test("P9/P18 compacted REST and MCP versions roundtrip with exact keys", async (
   expect(mcp).toEqual(get.body);
   const ml = await query()({ versions: { note_id: n.id, limit: 2 } }) as any;
   expect(ml.total).toBe(list.body.total);
-  const restore = await call(`/notes/${n.id}/restore`, "POST", { version_ix: 0 });
+  const restore = await call(`/notes/${n.id}/restore`, "POST", { version_ix: 0, if_updated_at: (await store.getNote(n.id))!.updatedAt });
   expect(restore.status).toBe(200);
   expect((await store.getNote(n.id))!.content).toBe(before.content);
 });

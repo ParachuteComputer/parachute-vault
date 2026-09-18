@@ -45,6 +45,24 @@ async function call(path: string, method = "GET", body?: unknown, verb = "admin"
 }
 
 import { applyImportedNote, beginImportRun, importTargetDigest } from "../core/src/history-import.ts";
+test("authenticated history REST redacts scoped provenance for read/write/admin tokens", async () => {
+  const note = await store.createNote("before", { tags: ["journal"] });
+  await store.updateNote(note.id, { content: "after", actor: "HISTORICAL_EDITOR", via: "HISTORICAL_INTERFACE" });
+  for (const verb of ["read", "write", "admin"]) {
+    for (const scoped of [false, true]) {
+      for (const suffix of ["/versions", "/versions/0"]) {
+        const got = await call(`/notes/${note.id}${suffix}`, "GET", undefined, verb, scoped);
+        expect(got.status).toBe(200);
+        const row = got.body.versions?.[0] ?? got.body;
+        expect(Object.hasOwn(row, "actor")).toBe(!scoped);
+        expect(Object.hasOwn(row, "via")).toBe(!scoped);
+        if (!scoped) expect(row.actor).toBe("HISTORICAL_EDITOR");
+        expect(row.version_ix).toBe(0);
+      }
+    }
+  }
+  expect((await store.getNoteVersion(note.id, 0))!.actor).toBe("HISTORICAL_EDITOR");
+});
 test("imported REST references restore by ID or encoded path and preserve native keys", async () => {
   const note = await store.createNote("native", { path: "folder/imported", tags: ["journal"] });
   await store.updateNote(note.id, { content: "current" });
@@ -66,7 +84,11 @@ test("imported REST references restore by ID or encoded path and preserve native
   expect(list.body.versions.map((v: any) => v.version_ix ?? v.origin)).toEqual([0, "git-import"]);
   for (const body of [{ origin: "git-import" }, { import_ix: 0 }, { origin: "git-import", import_ix: 0, version_ix: 0 }, { origin: "git-import", import_ix: -1 }]) expect((await call(`/notes/${note.id}/restore`, "POST", body)).status).toBe(400);
   expect((await call(`/notes/${note.id}/versions/-1`)).status).toBe(400);
-  const restored = await call(`/notes/${note.id}/restore`, "POST", { origin: "git-import", import_ix: 0 });
+  const beforeRestore = await store.getNote(note.id);
+  const missingStamp = await call(`/notes/${note.id}/restore`, "POST", { origin: "git-import", import_ix: 0 });
+  expect(missingStamp.status).toBe(428);
+  expect(await store.getNote(note.id)).toEqual(beforeRestore);
+  const restored = await call(`/notes/${note.id}/restore`, "POST", { origin: "git-import", import_ix: 0, if_updated_at: beforeRestore!.updatedAt });
   expect(restored.status).toBe(200);
   expect(restored.body.restored_from).toEqual({ origin: "git-import", import_ix: 0 });
   expect((await store.getNote(note.id))!.content).toBe("archive");

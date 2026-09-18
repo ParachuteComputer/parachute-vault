@@ -4,6 +4,15 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.9-rc.8] - 2026-09-17
+
+**History integration safety.** Restricted readers no longer receive historical editor identities; database failures stop imports; live restore requires the timestamp the person reviewed. No archive import or mirror retirement runs on upgrade. The coordinated app/hosted release adds the browsing and recovery experience separately.
+
+- Restoring an existing note now requires its last-reviewed `if_updated_at`; omission returns 428 instead of performing an unconditional replacement. Native and imported restores share the core guard. Stale timestamps still return 409, and deleted-note recovery still omits the timestamp. This intentionally tightens the restore contract before app integration; `force:true` does not bypass it.
+
+- Git-history import now aborts on SQLite staging/cache failures instead of reporting valid archive entries as malformed metadata. No import manifest is produced from an interrupted database walk; malformed source diagnostics remain separate.
+- Tag-restricted REST/MCP history reads omit historical `actor` and `via` fields (#736). Stored provenance and unrestricted access are unchanged; native/imported references, content and restore behavior remain available. See [history privacy](docs/history-privacy.md).
+
 ## [0.7.9-rc.7] - 2026-09-17
 
 **Local audio transcription and stronger history reads.** Audio uploads can use the selected local transcription worker without the retired standalone Scribe service. Historical whole-blob reads now verify their content hash before returning data (#749). This release adds no database migration beyond rc.6's schema 31.

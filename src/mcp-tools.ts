@@ -6,6 +6,7 @@
  */
 
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
+import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { getNote, getNoteTags, getVaultMap } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
@@ -579,8 +580,13 @@ function applyTagScopeWrappers(
     )) {
       const id = (params as any).versions.note_id;
       const note = resolveNote(store.db, id);
-      return note && noteWithinTagScope(note, allowed, rawTags)
-        ? result : { error: "Note not found", error_type: "not_found", id };
+      if (!note || !noteWithinTagScope(note, allowed, rawTags)) {
+        return { error: "Note not found", error_type: "not_found", id };
+      }
+      if ("versions" in result && Array.isArray(result.versions)) {
+        return { ...result, versions: result.versions.map(row => projectHistoryProvenance(row, true)) };
+      }
+      return projectHistoryProvenance(result, true);
     }
     // Possible response shapes (vault#550 added the `warnings` variants):
     //   - Array (legacy list, no cursor, no warnings)
