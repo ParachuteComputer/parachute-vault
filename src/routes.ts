@@ -4453,11 +4453,21 @@ export function handleUnresolvedWikilinks(
  * catalog.
  */
 export async function handleDoctor(
-  _req: Request,
+  req: Request,
   store: Store,
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): Promise<Response> {
-  const report = await store.doctor({ allowedTags: tagScope.allowed });
+  const q = new URL(req.url).searchParams;
+  if (q.has("deep") && !["true", "false"].includes(q.get("deep")!)) return json({ error: "deep must be true or false" }, 400);
+  const deep = q.get("deep") === "true";
+  if (deep && tagScope.allowed !== null) return json({ error: "deep history audit requires an unrestricted session" }, 403);
+  const after = q.get("history_after") ?? undefined;
+  const maxBlobs = q.has("history_max_blobs") ? Number(q.get("history_max_blobs")) : undefined;
+  const budgetMs = q.has("history_budget_ms") ? Number(q.get("history_budget_ms")) : undefined;
+  if ((after !== undefined && !/^[a-f0-9]{64}$/.test(after)) ||
+      (maxBlobs !== undefined && (!Number.isInteger(maxBlobs) || maxBlobs < 1 || maxBlobs > 500)) ||
+      (budgetMs !== undefined && (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > 1000))) return json({ error: "invalid history audit bounds or cursor" }, 400);
+  const report = await store.doctor({ allowedTags: tagScope.allowed, deep, history_after: after, history_max_blobs: maxBlobs, history_budget_ms: budgetMs });
   return json(report);
 }
 

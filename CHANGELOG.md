@@ -6,10 +6,20 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+- Doctor REST/MCP gains an opt-in, read-only deep history-content audit for unrestricted sessions. Bounded pages materialize and hash-check whole/delta blobs, report corruption and explicit continuation, and never repair or erase data. A live multi-page run is not a consistent snapshot; use a database backup for snapshot assurance.
+
+## [0.7.9-rc.8] - 2026-09-17
+
+**History integration safety.** Restricted readers no longer receive historical editor identities; database failures stop imports; live restore requires the timestamp the person reviewed. No archive import or mirror retirement runs on upgrade. The coordinated app/hosted release adds the browsing and recovery experience separately.
+
 - Restoring an existing note now requires its last-reviewed `if_updated_at`; omission returns 428 instead of performing an unconditional replacement. Native and imported restores share the core guard. Stale timestamps still return 409, and deleted-note recovery still omits the timestamp. This intentionally tightens the restore contract before app integration; `force:true` does not bypass it.
 
 - Git-history import now aborts on SQLite staging/cache failures instead of reporting valid archive entries as malformed metadata. No import manifest is produced from an interrupted database walk; malformed source diagnostics remain separate.
 - Tag-restricted REST/MCP history reads omit historical `actor` and `via` fields (#736). Stored provenance and unrestricted access are unchanged; native/imported references, content and restore behavior remain available. See [history privacy](docs/history-privacy.md).
+
+## [0.7.9-rc.7] - 2026-09-17
+
+**Local audio transcription and stronger history reads.** Audio uploads can use the selected local transcription worker without the retired standalone Scribe service. Historical whole-blob reads now verify their content hash before returning data (#749). This release adds no database migration beyond rc.6's schema 31.
 
 - Automatic audio uploads now use the selected, active and ready transcription worker, including local providers, instead of requiring legacy Scribe discovery (#751). Auto-transcribe defaults to on; installations with a ready local worker will therefore start processing new eligible audio uploads. Per-vault/global opt-outs and REST explicit opt-out remain respected. Existing failed audio is not retried or backfilled. Explicit remote-provider compatibility remains supported; the standalone Scribe service remains retired.
 - Whisper automatic uploads require binary, model and ffmpeg readiness. Explicit transcription retains its existing enqueue behavior, including when runtime dependencies are missing; this change does not make that path readiness-gated.

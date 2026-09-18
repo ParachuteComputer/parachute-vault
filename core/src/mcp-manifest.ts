@@ -705,7 +705,12 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       requiredVerb: "read",
       description:
         "Read-only integrity scan across the tag/metadata taxonomy — run this after any bulk tag reorg (rename/merge/delete/subtree move) to confirm nothing leaked. Returns {findings, summary, scanned_at} — findings is an array, each entry {type, severity, subject, detail, remedy} — NEVER auto-fixes; apply the suggested remedy (usually rename-tag/merge-tags/update-tag/prune-schema) yourself. Finding types: dangling_parent_name (a parent_names entry naming a tag with no identity row), parent_names_cycle (a tag reaching itself through its ancestor chain — traversal tolerates this, but it's dishonest hierarchy state), mixed_type_indexed_field (a note's metadata value for an indexed field has a JSON type disagreeing with the field's declared storage type — the ordering/filtering-goes-silently-wrong precursor), orphaned_indexed_field_declarer (an indexed field naming a dead declarer tag — see prune-schema), and dead_tag_metadata_reference (HEURISTIC, always carries heuristic:true — a metadata value that looks like a stale reference to a renamed/merged/deleted tag, inferred from sibling notes using the same metadata key with values that ARE live tags; can never be certain since vault keeps no tag-rename history).",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: {
+        deep: { type: "boolean", description: "Opt-in, unrestricted sessions only: materialize and hash-check a bounded history blob page. Check history_audit.complete; incomplete is not a clean audit." },
+        history_after: { type: "string", description: "Resume after history_audit.next_after. Pages are not a snapshot; audit a consistent backup for snapshot assurance." },
+        history_max_blobs: { type: "integer", minimum: 1, maximum: 500, description: "Maximum blobs in a deep page; default 100." },
+        history_budget_ms: { type: "integer", minimum: 1, maximum: 1000, description: "Between-blob budget; default 250ms. One blob may exceed it." },
+      } },
       condition: "core",
     },
     {
