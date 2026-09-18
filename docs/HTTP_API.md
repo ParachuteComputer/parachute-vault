@@ -1525,7 +1525,19 @@ transparent: the content returned is always the full body. A deltified version's
 `encoding` is `"fossil-delta"` on the individual GET, but null in the list view,
 which does not resolve storage. A missing base or unknown encoding returns 409
 `history_unrecoverable`; unscoped doctor reports `history_delta_orphan`.
-The doctor census checks structure, not content checksums; it is not a content audit.
+The default doctor census checks structure, not content checksums. Opt in to
+`GET /api/doctor?deep=true` (unrestricted sessions only; scoped sessions get 403)
+for a bounded content audit. MCP `doctor` accepts the same `deep` option.
+`history_audit` reports `checked`, `corrupt`, up to five example hashes,
+`complete`, and `next_after`. An incomplete page is not a clean bill of health:
+continue with `history_after=next_after` and aggregate counts across all pages.
+`history_max_blobs` defaults to 100 (1–500); `history_budget_ms` defaults to 250
+(1–1000). The time budget is checked between blobs, not within one decode; the
+ordinary taxonomy/structural census is outside this budget. Operational database
+errors abort rather than being counted as corrupt content. This never repairs or
+erases history. Pages over a live database are not one snapshot; use a consistent
+backup for an exhaustive point-in-time audit. This is the vault data doctor,
+not the installation-health CLI `parachute-vault doctor`.
 
 ```json
 {"version_ix": 3, "if_updated_at": "2026-09-14T20:00:00.000Z"}

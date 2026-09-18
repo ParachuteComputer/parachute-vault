@@ -4,6 +4,10 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+- Doctor REST/MCP gains an opt-in, read-only deep history-content audit for unrestricted sessions. Bounded pages materialize and hash-check whole/delta blobs, report corruption and explicit continuation, and never repair or erase data. A live multi-page run is not a consistent snapshot; use a database backup for snapshot assurance.
+
 ## [0.7.9-rc.8] - 2026-09-17
 
 **History integration safety.** Restricted readers no longer receive historical editor identities; database failures stop imports; live restore requires the timestamp the person reviewed. No archive import or mirror retirement runs on upgrade. The coordinated app/hosted release adds the browsing and recovery experience separately.
