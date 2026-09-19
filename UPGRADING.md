@@ -4,6 +4,47 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## History compaction scheduling: schema v31 → v32
+
+v32 adds one table, `history_compact_state` — per-note scheduling hints
+(version count, stored bytes, live bytes, a refusal flag and a refresh
+timestamp) used to pick compaction candidates with an indexed query instead of
+re-aggregating every note's whole history. No existing table is altered and no
+note, version or blob is rewritten.
+
+The first open after upgrading backfills the table once. On a 10,000-note /
+120,000-version database the backfill measured 371 ms; candidate selection
+dropped to ~4 ms and the post-write refresh to well under 1 ms. There is no
+configuration to disable the backfill, and no operator step is required.
+
+**Downgrade and re-upgrade is handled automatically.** If a v32 database is
+opened by an older build, that build writes history without maintaining the
+hints, which would otherwise leave them permanently stale — the compaction pass
+would then skip notes that are genuinely eligible. On the next v32 open, the
+schema ledger is read *before* this open's row is written; if the previous
+writer was older than 32, the hint table is dropped and rebuilt from the live
+history. Rebuilding clears per-note refusal flags, which costs at most one
+wasted compaction attempt per note.
+
+If doctor ever reports `history_compact_state_drift`, repair it on a
+self-hosted install with:
+
+```sh
+parachute-vault history rebuild-state --vault NAME [--json]
+```
+
+That command rebuilds the derived hint table inside a single transaction and
+touches nothing else; notes, versions and blobs are untouched and there is no
+REST equivalent. Doctor itself remains read-only and repairs nothing. On hosted
+vaults the remedy is a numbered core-pin migration, not an operator action.
+
+Doctor also gains an opt-in, read-only deep history-content audit
+(`GET /api/doctor?deep=true`, or the MCP `doctor` tool's `deep` option) for
+unrestricted sessions. It materializes and hash-checks bounded pages of
+whole/delta blobs and reports corruption with explicit continuation; it never
+repairs or erases. A live multi-page run is not a consistent snapshot — use a
+database backup for snapshot assurance.
+
 ## Git history import: schema v30 → v31
 
 v31 adds import runs, receipts and source references. Opening a vault does not import or retire its mirror. Native history remains usable; automatic mirror exports continue until an explicit cutover.
