@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { isNoteIdShape } from "../core/src/ulid.ts";
 import { applyImportedNote, beginImportRun, canonicalJson, importObservationDigest, importTargetDigest, readImportReceipt, type ImportedObservation, type ImportRun } from "../core/src/history-import.ts";
 import { hashContent, resolveHistoryPolicy, VERSION_MAX_BYTES, type HistoryPolicy } from "../core/src/history.ts";
 import { applyConnectionPragmas, initSchema } from "../core/src/schema.ts";
@@ -16,7 +17,6 @@ const MAX_OUTPUT = 32 * 1024 * 1024;
 const MAX_COMMITS = 100_000;
 const MAX_OBJECTS = 10_000_000;
 const MAX_BYTES = 2 * 1024 * 1024 * 1024;
-const ID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 class GitArchiveError extends Error {}
 function git(repo: string, args: string[]): Buffer {
@@ -47,7 +47,7 @@ function inline(raw: string): { meta: Record<string, unknown>; content: string }
   return { meta: yaml(match[1]!), content: raw.slice(match[0].length) };
 }
 function observation(meta: Record<string, unknown>, content: string, commit: string, blob: string, time: string): { id: string; row: ImportedObservation } {
-  if (typeof meta.id !== "string" || !ID.test(meta.id)) throw new Error("invalid_id");
+  if (!isNoteIdShape(meta.id)) throw new Error("invalid_id");
   if (Buffer.byteLength(content) > VERSION_MAX_BYTES) throw new Error("oversized_body");
   const path = meta.path ?? null, extension = meta.extension ?? "md", created = meta.created_at ?? null;
   if (path !== null && (typeof path !== "string" || path.includes("\0") || path.split("/").includes(".."))) throw new Error("invalid_path");
@@ -88,7 +88,7 @@ export function normalizeHistorySelections(input: unknown): HistorySelections {
   const seen = new Set<string>();
   const selections = value.selections.map(raw => {
     const entry = selectionObject(raw, ["note_id", "commit", "selected", "rejected", "reason"]);
-    if (typeof entry.note_id !== "string" || !ID.test(entry.note_id) || typeof entry.commit !== "string" || !OBJECT_ID.test(entry.commit) || !Array.isArray(entry.rejected) || !entry.rejected.length) throw new Error("Invalid selection entry");
+    if (!isNoteIdShape(entry.note_id) || typeof entry.commit !== "string" || !OBJECT_ID.test(entry.commit) || !Array.isArray(entry.rejected) || !entry.rejected.length) throw new Error("Invalid selection entry");
     const key = `${entry.note_id}:${entry.commit}`;
     if (seen.has(key)) throw new Error("Duplicate selection note/commit");
     seen.add(key);
@@ -188,7 +188,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
       const message = error instanceof Error ? error.message : "invalid_observation";
       const reason = /^[a-z_]+$/.test(message) ? message : "invalid_metadata_or_utf8";
       if (error instanceof GitArchiveError || message === "Archive byte limit exceeded" || message === "Archive note limit exceeded") throw error;
-      if (typeof id === "string" && ID.test(id)) stage.prepare("INSERT OR REPLACE INTO quarantine VALUES(?,?)").run(id, reason);
+      if (isNoteIdShape(id)) stage.prepare("INSERT OR REPLACE INTO quarantine VALUES(?,?)").run(id, reason);
       else stage.prepare("INSERT INTO issues VALUES(?,?,?)").run(commit, entry.path, reason);
     };
     const format = files.get(".parachute/vault.yaml");
@@ -198,7 +198,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
       try {
         meta = yaml(read(entry));
         const extension = meta.extension;
-        if (typeof meta.id !== "string" || !ID.test(meta.id) || typeof extension !== "string") throw new Error("invalid_sidecar");
+        if (!isNoteIdShape(meta.id) || typeof extension !== "string") throw new Error("invalid_sidecar");
         const contentPath = `${meta.path ?? `_unpathed/${meta.id}`}.${extension}`;
         const body = files.get(contentPath);
         if (!body) throw new Error("missing_sidecar_body");
@@ -321,7 +321,7 @@ function project(vault: string, repo: string, tip: string, dir: string, opts: { 
     const selections = opts.selections ?? null;
     const source = stageArchive(repo, tip, stage, selections), policy = resolveHistoryPolicy(config.history);
     const waivers = opts.waivers ?? {};
-    for (const [id, reason] of Object.entries(waivers)) if (!ID.test(id) || typeof reason !== "string" || !reason.trim()) throw new Error("Waivers require note IDs and reasons");
+    for (const [id, reason] of Object.entries(waivers)) if (!isNoteIdShape(id) || typeof reason !== "string" || !reason.trim()) throw new Error("Waivers require note IDs and reasons");
     const options_digest = optionsDigest(policy, waivers, selections);
     const run = { run_id: "projection", source_fingerprint: source.source_fingerprint, tip, options_digest };
     beginImportRun(db, run);

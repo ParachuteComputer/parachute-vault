@@ -114,3 +114,10 @@ export function generateUlid(): string {
 
 /** 26-char Crockford base32 (`0-9A-HJKMNP-TV-Z`, case-insensitive by spec — we always emit uppercase). */
 export const ULID_REGEX = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
+const NOTE_ID_SHAPE = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$/;
+/** Accepted history identity shape, including legacy IDs; never normalizes an ID. */
+export function isNoteIdShape(value: unknown): value is string {
+  // Comparing the entire match also rejects a final newline (JS `$` permits one).
+  return typeof value === "string" && NOTE_ID_SHAPE.exec(value)?.[0] === value;
+}

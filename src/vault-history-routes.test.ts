@@ -369,6 +369,21 @@ test("P19 overflow deletion remains possible but its tombstone cannot restore", 
   expect(r.status).toBe(409);
   expect(r.body.error_type).toBe("history_unrecoverable");
 });
+test("legacy deleted IDs resolve exact history and restore without exposing scoped tombstones", async () => {
+  for (const id of ["2020-01-02-03-04-05", "legacy:abc123", "shortid"]) {
+    await store.createNote("original", { id, path: `legacy/${id}` });
+    await store.updateNote(id, { content: "current" });
+    await store.deleteNote(id);
+    expect((await call(id, "/versions", "GET", undefined, true)).status).toBe(404);
+    expect((await call(id, "/restore", "POST", { version_ix: 0 }, true)).status).toBe(404);
+    expect((await call(id, "/versions")).status).toBe(200);
+    const restored = await call(id, "/restore", "POST", { version_ix: 0 });
+    expect(restored.status).toBe(200);
+    expect(restored.body).toMatchObject({ id, content: "original", recreated: true });
+  }
+  expect((await call("not-a-tombstone", "/versions")).status).toBe(404);
+  expect((await call("not-a-tombstone", "/restore", "POST", { version_ix: 0 })).status).toBe(404);
+});
 test("P20 REST recreates untagged at the tombstone path and guards conflicts", async () => {
   const n = await fixture();
   await store.deleteNote(n.id);
