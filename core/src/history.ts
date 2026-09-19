@@ -674,7 +674,7 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
   if (budget !== null && budget <= 0)
     return { ...result, stopped_by: "budget" };
   const started = performance.now();
-  const predicate = `refused=0 AND live>0 AND ((versions >= ? AND stored > ? * MAX(live,1)) OR (? IS NOT NULL AND stored > ?))`;
+  const predicate = `refused=0 AND ((live>0 AND versions >= ? AND stored > ? * MAX(live,1)) OR (? IS NOT NULL AND stored > ?))`;
   const args = [policy.compact_min_versions, policy.compact_ratio, policy.max_bytes_per_note, policy.max_bytes_per_note];
   const total = opts?.noteId !== undefined ? 1 : (db.prepare(`SELECT COUNT(*) AS n FROM history_compact_state WHERE ${predicate}`).get(...args) as { n: number }).n;
   const candidates = opts?.noteId !== undefined ? [{ note_id: opts.noteId }] : db.prepare(`SELECT note_id FROM history_compact_state WHERE ${predicate} ORDER BY stored DESC LIMIT ?`).all(...args, max === null ? -1 : max * 4) as {

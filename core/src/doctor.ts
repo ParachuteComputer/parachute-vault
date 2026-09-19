@@ -49,6 +49,12 @@
 
 import { historyTablesPresent, deletedHistoryStats, historyStorageStats, topNotesByHistoryBytes } from "./history.js";
 import { readCompactState, type CompactState } from "./history-compact-state.js";
+import { Database } from "bun:sqlite";
+import { loadTagHierarchy, findHierarchyCycles } from "./tag-hierarchy.js";
+import { listIndexedFields } from "./indexed-fields.js";
+import { pruneOrphanedIndexedFields } from "./indexed-fields.js";
+import { loadSchemaConfig } from "./schema-defaults.js";
+import { readBlobContent, hashContent, HistoryDeltaOrphanError } from "./history.js";
 
 function scanCompactStateDrift(db: Database): DoctorFinding[] {
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get()) return [];
@@ -61,12 +67,6 @@ function scanCompactStateDrift(db: Database): DoctorFinding[] {
     detail: `${drift} of ${sample.length} sampled hint rows differ from history. Sample is bounded to the 200 largest hints; this is not a full audit.`,
     remedy: "Investigate missed history-write refreshes. Scheduling hints do not replace authoritative history; this scan does not repair them." }] : [];
 }
-import { Database } from "bun:sqlite";
-import { loadTagHierarchy, findHierarchyCycles } from "./tag-hierarchy.js";
-import { listIndexedFields } from "./indexed-fields.js";
-import { pruneOrphanedIndexedFields } from "./indexed-fields.js";
-import { loadSchemaConfig } from "./schema-defaults.js";
-import { readBlobContent, hashContent, HistoryDeltaOrphanError } from "./history.js";
 
 export interface HistoryAuditPage {
   checked: number;

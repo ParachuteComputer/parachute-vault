@@ -1599,7 +1599,8 @@ Compaction runs synchronously at first vault open, with budgets checked between
 notes: one note can overshoot the time budget. Zero boot budget skips the pass.
 Schema 32 backfills per-note scheduling hints once. Later opens select hints by
 stored size without aggregating all history. A no-op attempt marks a note refused;
-new capture, pruning or import re-arms it. Notes with zero live bytes are excluded.
+new capture, pruning or import re-arms it. Notes with zero live bytes are excluded
+from ratio-based selection, but remain eligible when over the byte ceiling.
 The bounded selection window is four times the note budget; `remaining_candidates`
 is the total eligible count at selection time minus notes attempted, not the window
 size. Shared-blob rewrites refresh affected hints without re-arming other notes.

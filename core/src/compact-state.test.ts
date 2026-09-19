@@ -114,3 +114,16 @@ test("failed enclosing write rolls back history and scheduling state together", 
   expect(state(n.id)).toEqual(before);
   expect(await store.countNoteVersions(n.id)).toBe(1);
 });
+test("empty live content still obeys the history byte ceiling", async () => {
+  store = new BunSqliteStore(db, { history: { min_versions: 1, max_bytes_per_note: 65536, compact_min_versions: 2 } });
+  const body = () => Buffer.from(crypto.getRandomValues(new Uint8Array(15000))).toString("hex");
+  const n = await store.createNote(body());
+  for(let i=0;i<5;i++) await store.updateNote(n.id, { content: body() });
+  await store.updateNote(n.id, { content: "" });
+  expect(state(n.id)?.stored).toBe(180000);
+  const pass = store.compactHistory({ budgetMs: null, maxNotes: null });
+  expect(pass.notes_scanned).toBe(1);
+  expect(pass.versions_dropped).toBe(4);
+  expect(state(n.id)).toMatchObject({ stored: 60000, live: 0, refused: 0 });
+  expect(store.compactHistory({ budgetMs: null, maxNotes: null }).notes_scanned).toBe(0);
+});
