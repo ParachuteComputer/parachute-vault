@@ -14,7 +14,7 @@ import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHi
 
 import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
-import { ULID_REGEX } from "../core/src/ulid.js";
+import { isNoteIdShape } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
@@ -2932,7 +2932,7 @@ async function handleNotesInner(
     if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
-    if (!note && (tagScope.raw !== null || !ULID_REGEX.test(idOrPath) ||
+    if (!note && (tagScope.raw !== null || !isNoteIdShape(idOrPath) ||
       !(await store.listNoteVersions(idOrPath, { limit: 1 })).length)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
@@ -4453,11 +4453,21 @@ export function handleUnresolvedWikilinks(
  * catalog.
  */
 export async function handleDoctor(
-  _req: Request,
+  req: Request,
   store: Store,
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): Promise<Response> {
-  const report = await store.doctor({ allowedTags: tagScope.allowed });
+  const q = new URL(req.url).searchParams;
+  if (q.has("deep") && !["true", "false"].includes(q.get("deep")!)) return json({ error: "deep must be true or false" }, 400);
+  const deep = q.get("deep") === "true";
+  if (deep && tagScope.allowed !== null) return json({ error: "deep history audit requires an unrestricted session" }, 403);
+  const after = q.get("history_after") ?? undefined;
+  const maxBlobs = q.has("history_max_blobs") ? Number(q.get("history_max_blobs")) : undefined;
+  const budgetMs = q.has("history_budget_ms") ? Number(q.get("history_budget_ms")) : undefined;
+  if ((after !== undefined && !/^[a-f0-9]{64}$/.test(after)) ||
+      (maxBlobs !== undefined && (!Number.isInteger(maxBlobs) || maxBlobs < 1 || maxBlobs > 500)) ||
+      (budgetMs !== undefined && (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > 1000))) return json({ error: "invalid history audit bounds or cursor" }, 400);
+  const report = await store.doctor({ allowedTags: tagScope.allowed, deep, history_after: after, history_max_blobs: maxBlobs, history_budget_ms: budgetMs });
   return json(report);
 }
 

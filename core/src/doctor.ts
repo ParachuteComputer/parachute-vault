@@ -48,11 +48,67 @@
  */
 
 import { historyTablesPresent, deletedHistoryStats, historyStorageStats, topNotesByHistoryBytes } from "./history.js";
+import { readCompactState, type CompactState } from "./history-compact-state.js";
 import { Database } from "bun:sqlite";
 import { loadTagHierarchy, findHierarchyCycles } from "./tag-hierarchy.js";
 import { listIndexedFields } from "./indexed-fields.js";
 import { pruneOrphanedIndexedFields } from "./indexed-fields.js";
 import { loadSchemaConfig } from "./schema-defaults.js";
+import { readBlobContent, hashContent, HistoryDeltaOrphanError } from "./history.js";
+
+function scanCompactStateDrift(db: Database): DoctorFinding[] {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get()) return [];
+  const sample = db.prepare("SELECT note_id,versions,stored,live FROM history_compact_state ORDER BY stored DESC LIMIT 200").all() as CompactState[];
+  const drift = sample.filter(row => {
+    const actual = readCompactState(db, row.note_id);
+    return !actual || actual.versions !== row.versions || actual.stored !== row.stored || actual.live !== row.live;
+  }).length;
+  return drift ? [{ type: "history_compact_state_drift", severity: "warning", subject: "history compaction scheduling hints",
+    detail: `${drift} of ${sample.length} sampled hint rows differ from history. Sample is bounded to the 200 largest hints; this is not a full audit.`,
+    remedy: "Investigate missed history-write refreshes. Self-hosted: history rebuild-state --vault <name>. Cloud: deploy a core-pin migration that rebuilds hints; no operator repair API. This scan does not repair them." }] : [];
+}
+
+export interface HistoryAuditPage {
+  checked: number;
+  corrupt: number;
+  examples: string[];
+  complete: boolean;
+  next_after: string | null;
+}
+
+/** Read-only keyset page. Budgets apply between blobs, not inside one decode.
+ * A sequence of pages is not a snapshot: use a consistent backup for a complete audit.
+ */
+export function auditHistoryBlobs(db: Database, after = "", maxBlobs = 100, budgetMs = 250): HistoryAuditPage {
+  if (after !== "" && !/^[a-f0-9]{64}$/.test(after)) throw new Error("history_after must be a SHA-256 hash");
+  if (!Number.isInteger(maxBlobs) || maxBlobs < 1 || maxBlobs > 500) throw new Error("history_max_blobs must be an integer from 1 to 500");
+  if (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > 1000) throw new Error("history_budget_ms must be an integer from 1 to 1000");
+  const page: HistoryAuditPage = { checked: 0, corrupt: 0, examples: [], complete: true, next_after: null };
+  if (!historyTablesPresent(db)) return page;
+  const start = performance.now();
+  const rows = db.prepare("SELECT hash FROM note_blobs WHERE hash > ? ORDER BY hash LIMIT ?").all(after, maxBlobs + 1) as { hash: string }[];
+  let cursor = after;
+  for (const row of rows) {
+    if (page.checked >= maxBlobs || (page.checked > 0 && performance.now() - start >= budgetMs)) {
+      page.complete = false;
+      page.next_after = cursor;
+      break;
+    }
+    let damaged = false;
+    try {
+      const body = readBlobContent(db, row.hash);
+      damaged = body === null || hashContent(body) !== row.hash;
+    } catch (error) {
+      // Operational database failures must abort, not masquerade as corruption.
+      if (!(error instanceof HistoryDeltaOrphanError)) throw error;
+      damaged = true;
+    }
+    page.checked++;
+    cursor = row.hash;
+    if (damaged) { page.corrupt++; if (page.examples.length < 5) page.examples.push(row.hash); }
+  }
+  return page;
+}
 
 export type DoctorFindingType =
   | "dangling_parent_name"
@@ -62,7 +118,9 @@ export type DoctorFindingType =
   | "dead_tag_metadata_reference"
   | "deleted_note_history"
   | "history_storage"
-  | "history_delta_orphan";
+  | "history_delta_orphan"
+  | "history_content_audit"
+  | "history_compact_state_drift";
 
 export type DoctorSeverity = "error" | "warning" | "info";
 
@@ -86,6 +144,7 @@ export interface DoctorReport {
   findings: DoctorFinding[];
   summary: string;
   scanned_at: string;
+  history_audit?: HistoryAuditPage;
 }
 
 export interface DoctorScanOpts {
@@ -95,6 +154,10 @@ export interface DoctorScanOpts {
    * each finding type is scoped.
    */
   allowedTags?: Set<string> | null;
+  deep?: boolean;
+  history_after?: string;
+  history_max_blobs?: number;
+  history_budget_ms?: number;
 }
 
 /** Cap on exemplar note IDs embedded in a finding's `detail` (vault#552 — keep report bodies bounded). */
@@ -124,6 +187,7 @@ function makeNoteInScope(db: Database, allowedTags: Set<string> | null): (id: st
 
 export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport {
   const allowedTags = opts?.allowedTags ?? null;
+  if (opts?.deep && allowedTags !== null) throw new Error("deep history audit requires an unrestricted session");
   const findings: DoctorFinding[] = [
     ...scanDanglingParentNames(db, allowedTags),
     ...scanParentNamesCycles(db, allowedTags),
@@ -133,7 +197,14 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
     ...(allowedTags === null ? scanDeletedNoteHistory(db) : []),
     ...(allowedTags === null ? scanHistoryStorage(db) : []),
     ...(allowedTags === null ? scanDeltaOrphans(db) : []),
+    ...(allowedTags === null ? scanCompactStateDrift(db) : []),
   ];
+
+  const audit = opts?.deep ? auditHistoryBlobs(db, opts.history_after, opts.history_max_blobs, opts.history_budget_ms) : undefined;
+  if (audit) findings.push({ type: "history_content_audit", severity: audit.corrupt ? "error" : audit.complete ? "info" : "warning",
+    subject: "history content audit page",
+    detail: `Checked ${audit.checked} blob(s); ${audit.corrupt} corrupt. ${audit.complete ? "End of scan reached." : "Incomplete: continue with next_after."} Examples: ${audit.examples.join(", ") || "none"}.`,
+    remedy: "Continue incomplete scans with history_after=next_after. For snapshot-level assurance, audit a consistent backup. Preserve backups and investigate corruption; this audit never repairs or erases history." });
 
   const errors = findings.filter((f) => f.severity === "error").length;
   const warnings = findings.filter((f) => f.severity === "warning").length;
@@ -143,7 +214,8 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
       ? "clean — no integrity findings"
       : `${findings.length} finding(s): ${errors} error(s), ${warnings} warning(s), ${infos} info(s)`;
 
-  return { findings, summary, scanned_at: new Date().toISOString() };
+  return { findings, summary, scanned_at: new Date().toISOString(),
+    ...(audit ? { history_audit: audit } : {}) };
 }
 
 // ---------------------------------------------------------------------------

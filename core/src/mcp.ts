@@ -2619,8 +2619,12 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     // =====================================================================
     {
       name: "doctor",
-      execute: async () => {
-        return await store.doctor();
+      execute: async (params) => {
+        if (params.deep !== undefined && typeof params.deep !== "boolean") throw new Error("deep must be boolean");
+        if (params.history_after !== undefined && typeof params.history_after !== "string") throw new Error("history_after must be a string");
+        if (params.history_max_blobs !== undefined && typeof params.history_max_blobs !== "number") throw new Error("history_max_blobs must be a number");
+        if (params.history_budget_ms !== undefined && typeof params.history_budget_ms !== "number") throw new Error("history_budget_ms must be a number");
+        return await store.doctor({ deep: params.deep, history_after: params.history_after, history_max_blobs: params.history_max_blobs, history_budget_ms: params.history_budget_ms });
       },
     },
 

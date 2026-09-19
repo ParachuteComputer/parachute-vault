@@ -65,6 +65,24 @@ async function toolsFor(vaultName: string, scopedTags: string[] | null, verb: "r
   return generateScopedMcpTools(vaultName, authFor(vaultName, scopedTags, verb));
 }
 
+test("deep doctor REST/MCP parity and scoped refusal", async () => {
+  seedVault("journal");
+  const store = getVaultStore("journal");
+  await store.upsertTagRecord("mine", {});
+  const doctor = (await toolsFor("journal", null, "read")).find(t => t.name === "doctor")!;
+  const mcp: any = await doctor.execute({ deep: true, history_max_blobs: 1 });
+  const rest = await handleDoctor(new Request("http://localhost/api/doctor?deep=true&history_max_blobs=1"), store);
+  expect(rest.status).toBe(200);
+  expect((await rest.json() as any).history_audit).toEqual(mcp.history_audit);
+  expect(mcp.history_audit.complete).toBe(true);
+  const scoped = (await toolsFor("journal", ["mine"], "admin")).find(t => t.name === "doctor")!;
+  expect((await scoped.execute({ deep: true }) as any).error_type).toBe("tag_scope_violation");
+  expect((await handleDoctor(new Request("http://localhost/api/doctor?deep=true"), store, { allowed: new Set(["mine"]), raw: ["mine"] })).status).toBe(403);
+  for (const q of ["deep=1", "deep=true&history_after=oops", "deep=true&history_max_blobs=501", "deep=true&history_budget_ms=0"]) {
+    expect((await handleDoctor(new Request("http://localhost/api/doctor?" + q), store)).status).toBe(400);
+  }
+});
+
 describe("rename-tag / merge-tags — tag-scope gating (vault#552)", () => {
   test("rename-tag: old_name or new_name outside the allowlist is refused before reaching core", async () => {
     seedVault("journal");

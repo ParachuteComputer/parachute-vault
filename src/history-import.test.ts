@@ -11,6 +11,42 @@ import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { getImportedVersion } from "../core/src/history-import.ts";
 import { historyMirrorStatePath, readHistoryMirrorPhase, mirrorConfigPath } from "./mirror-config.ts";
 const noteId = "01M2KT1VQBHNZ99V5KSGXP6VSE";
+for (const id of ["legacy:abc123", "2020-01-02-03-04-05", "shortid"]) {
+  for (const sidecar of [false, true]) test(`legacy ID staging: ${id}, sidecar=${sidecar}`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "legacy-stage-")), db = new Database(":memory:");
+    try {
+      const repo = repoAt(join(dir, "repo"));
+      if (sidecar) {
+        mkdirSync(join(repo, ".parachute/notes-meta"), { recursive: true });
+        writeFileSync(join(repo, ".parachute/notes-meta/entry.yaml"), `id: ${id}\npath: entry\nextension: json\n`);
+        writeFileSync(join(repo, "entry.json"), '{}');
+        git(repo, "add", "."); git(repo, "commit", "-m", "sidecar");
+      } else commit(repo, "legacy body", id);
+      stageArchive(repo, git(repo, "rev-parse", "HEAD"), db);
+      expect(db.query("SELECT note_id FROM observations").all()).toEqual([{ note_id: id }]);
+      expect(db.query("SELECT * FROM issues").all()).toEqual([]);
+      expect(db.query("SELECT * FROM quarantine").all()).toEqual([]);
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+for (const id of ["a b", "a/b", "a.b", "a".repeat(65), "", "-leading"]) {
+  for (const sidecar of [false, true]) test(`invalid ID staging: ${JSON.stringify(id)}, sidecar=${sidecar}`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "invalid-stage-")), db = new Database(":memory:");
+    try {
+      const repo = repoAt(join(dir, "repo"));
+      const meta = `id: ${JSON.stringify(id)}\npath: entry\n`;
+      if (sidecar) {
+        mkdirSync(join(repo, ".parachute/notes-meta"), { recursive: true });
+        writeFileSync(join(repo, ".parachute/notes-meta/entry.yaml"), meta + "extension: json\n");
+        writeFileSync(join(repo, "entry.json"), '{}');
+      } else writeFileSync(join(repo, "entry.md"), `---\n${meta}---\nbody`);
+      git(repo, "add", "."); git(repo, "commit", "-m", "invalid");
+      stageArchive(repo, git(repo, "rev-parse", "HEAD"), db);
+      expect(db.query("SELECT * FROM observations").all()).toEqual([]);
+      expect(db.query("SELECT reason FROM issues").all()).toContainEqual({ reason: sidecar ? "invalid_sidecar" : "invalid_id" });
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
 function git(dir: string, ...args: string[]) {
   const p = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "test@example.test", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "test@example.test" } });
   if (p.status !== 0) throw new Error(p.stderr); return p.stdout.trim();
@@ -35,6 +71,57 @@ test("git staging preserves exported CRLF bodies and A-B-A while quarantining du
     try { stageArchive(repo, duplicate, second); expect(second.query("SELECT reason FROM quarantine").all()).toEqual([{ reason: "duplicate_id" }]); expect(second.query("SELECT * FROM observations").all()).toEqual([]); } finally { second.close(); }
   } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+test("legacy duplicate IDs still quarantine and selection entries preserve exact identity", () => {
+  const dir = mkdtempSync(join(tmpdir(), "legacy-duplicate-")), db = new Database(":memory:");
+  try {
+    const repo = repoAt(join(dir, "repo")), id = "legacy:duplicate";
+    commit(repo, "first", id); const tip = commit(repo, "second", id, "duplicate.md");
+    stageArchive(repo, tip, db);
+    expect(db.query("SELECT * FROM quarantine").all()).toEqual([{ note_id: id, reason: "duplicate_id" }]);
+    expect(db.query("SELECT * FROM observations").all()).toEqual([]);
+    const selections = normalizeHistorySelections({ format: 1, tip, source_fingerprint: "a".repeat(64), selections: [{
+      note_id: id, commit: tip, selected: { git_path: "entry.md", blob: git(repo, "rev-parse", `${tip}:entry.md`) },
+      rejected: [{ git_path: "duplicate.md", blob: git(repo, "rev-parse", `${tip}:duplicate.md`), reason: "explicit choice" }], reason: "explicit choice",
+    }] });
+    expect(selections.selections[0]!.note_id).toBe(id);
+  } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+test("legacy imports preserve exact IDs, receipts and idempotency; case mismatch never merges", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "legacy-import-")), saved = process.env.PARACHUTE_HOME;
+  process.env.PARACHUTE_HOME = join(dir, "home");
+  try {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response() }); const port = probe.port!; probe.stop(true);
+    writeGlobalConfig({ port });
+    writeVaultConfig({ name: "test", api_keys: [], created_at: new Date().toISOString() });
+    const ids = ["legacy:abc123", "2020-01-02-03-04-05", "shortid"];
+    const store = getVaultStore("test");
+    for (const id of [...ids, "CaseId"]) await store.createNote("native", { id });
+    clearVaultStoreCache();
+    const repo = repoAt(join(dir, "repo"));
+    for (const [i, id] of [...ids, "caseid"].entries()) commit(repo, "archive", id, `entry${i}.md`);
+    let tip = git(repo, "rev-parse", "HEAD");
+    const output = join(dir, "plan.json");
+    await runHistoryImport(["plan", "--vault", "test", "--source", repo, "--through", tip, "--output", output]);
+    const plan = JSON.parse(readFileSync(output, "utf8"));
+    expect(plan.skipped).toEqual(["caseid"]);
+    expect(plan.missing_at_tip).toEqual(["CaseId"]);
+    expect(plan.notes.map((n: any) => n.id).sort()).toEqual([...ids].sort());
+    // Resolve the fixture mismatch explicitly before prepare, never via coercion.
+    commit(repo, "archive", "CaseId", "entry3.md"); tip = git(repo, "rev-parse", "HEAD");
+    const manifest = join(dir, "final.json"), archive = join(dir, "archive.bundle");
+    await runHistoryImport(["prepare", "--vault", "test", "--source", repo, "--through", tip, "--archive", archive, "--output", manifest]);
+    await runHistoryImport(["apply", "--vault", "test", "--manifest", manifest, "--archive", archive]);
+    const db = new Database(vaultDbPath("test"));
+    try {
+      const before = db.query("SELECT * FROM history_import_receipts ORDER BY note_id").all();
+      expect(before).toHaveLength(4);
+      for (const id of ids) expect(getImportedVersion(db, id, 0)?.content).toBe("archive");
+      await runHistoryImport(["apply", "--vault", "test", "--manifest", manifest, "--archive", archive]);
+      expect(db.query("SELECT * FROM history_import_receipts ORDER BY note_id").all()).toEqual(before);
+      expect(db.query("SELECT id FROM notes ORDER BY id").all()).toEqual([...ids, "CaseId"].sort().map(id => ({ id })));
+    } finally { db.close(); }
+  } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
 test("offline prepare applies verified bundle, retries without resurrection, then retires", async () => {
   const dir = mkdtempSync(join(tmpdir(), "import-cutover-")), saved = process.env.PARACHUTE_HOME;
   process.env.PARACHUTE_HOME = join(dir, "home");

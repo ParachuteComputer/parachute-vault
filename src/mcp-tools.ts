@@ -911,6 +911,7 @@ function applyTagScopeWrappers(
   wrapReadTool(tools, "doctor", async (orig, params) => {
     const allowed = await getAllowed();
     if (!allowed) return await orig(params);
+    if (params.deep) return forbidden("deep history audit requires an unrestricted session");
     return runDoctorScan(store.db, { allowedTags: allowed });
   });
 }

@@ -1525,7 +1525,19 @@ transparent: the content returned is always the full body. A deltified version's
 `encoding` is `"fossil-delta"` on the individual GET, but null in the list view,
 which does not resolve storage. A missing base or unknown encoding returns 409
 `history_unrecoverable`; unscoped doctor reports `history_delta_orphan`.
-The doctor census checks structure, not content checksums; it is not a content audit.
+The default doctor census checks structure, not content checksums. Opt in to
+`GET /api/doctor?deep=true` (unrestricted sessions only; scoped sessions get 403)
+for a bounded content audit. MCP `doctor` accepts the same `deep` option.
+`history_audit` reports `checked`, `corrupt`, up to five example hashes,
+`complete`, and `next_after`. An incomplete page is not a clean bill of health:
+continue with `history_after=next_after` and aggregate counts across all pages.
+`history_max_blobs` defaults to 100 (1–500); `history_budget_ms` defaults to 250
+(1–1000). The time budget is checked between blobs, not within one decode; the
+ordinary taxonomy/structural census is outside this budget. Operational database
+errors abort rather than being counted as corrupt content. This never repairs or
+erases history. Pages over a live database are not one snapshot; use a consistent
+backup for an exhaustive point-in-time audit. This is the vault data doctor,
+not the installation-health CLI `parachute-vault doctor`.
 
 ```json
 {"version_ix": 3, "if_updated_at": "2026-09-14T20:00:00.000Z"}
@@ -1585,8 +1597,24 @@ numeric values, including zero, are clamped to at least 65,536 bytes.
 `compact_enabled: false` also disables byte-ceiling enforcement.
 Compaction runs synchronously at first vault open, with budgets checked between
 notes: one note can overshoot the time budget. Zero boot budget skips the pass.
-An incompressible note remains a candidate on subsequent opens and may precede
-other notes under the note budget because candidates are ordered by stored size.
+Schema 32 backfills per-note scheduling hints once. Later opens select hints by
+stored size without aggregating all history. A no-op attempt marks a note refused;
+new capture, pruning or import re-arms it. Notes with zero live bytes are excluded
+from ratio-based selection, but remain eligible when over the byte ceiling.
+The bounded selection window is four times the note budget; `remaining_candidates`
+is the total eligible count at selection time minus notes attempted, not the window
+size. Shared-blob rewrites refresh affected hints without re-arming other notes.
+Doctor checks up to 200 largest hint rows and reports `history_compact_state_drift`
+as a warning when their counters disagree with history. This read-only sample is
+not a full audit and does not repair hints. Scoped sessions do not receive it.
+On re-upgrade after an older writer, the newest schema-ledger entry triggers an
+atomic hint rebuild (timestamp ties prefer the lower version). Ordinary v32
+reopens preserve refusal flags. Self-hosted operators can run
+`parachute-vault history rebuild-state --vault <name> [--json]` to rebuild hints
+without compacting history. The current server may remain running; write
+transactions serialize. Rebuilding resets refusals, not notes or versions.
+Cloud has no operator repair endpoint: other hint-drift bugs are repaired through
+a numbered core migration delivered by a core-pin update. Doctor remains read-only.
 The unbounded admin route visits every candidate and completes even when some
 bodies cannot be reduced. Byte totals attribute directly referenced blobs to a
 note; shared blobs can count for multiple notes, and indirect bases are excluded.

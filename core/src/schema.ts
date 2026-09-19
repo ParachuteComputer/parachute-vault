@@ -5,8 +5,18 @@ import { findMixedTypeIndexedFieldNotes } from "./doctor.js";
 import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
+import { rebuildCompactState } from "./history-compact-state.js";
 
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 32;
+
+function migrateToV32(db: Database): void {
+    const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
+    // Read before initSchema records this open. On a timestamp tie, prefer
+    // a harmless rebuild over missing an older writer's stale hints.
+    const previous = db.prepare("SELECT version FROM schema_version ORDER BY applied_at DESC, version ASC LIMIT 1").get() as { version: number } | null;
+    if (exists && (!previous || previous.version >= 32)) return;
+    rebuildCompactState(db);
+}
 
 /**
  * Deterministic last-resort epoch for a note whose `updated_at` AND
@@ -742,6 +752,7 @@ export function initSchema(db: Database): void {
   // v30: depth-one history deltas and captured creation time, no backfill.
   migrateToV30(db);
   migrateToV31(db);
+  migrateToV32(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
