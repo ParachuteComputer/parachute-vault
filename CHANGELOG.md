@@ -6,6 +6,8 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+- Schema 32 adds per-note history compaction scheduling hints: bounded indexed selection replaces repeated whole-history aggregation, no-op attempts wait for another history write, and zero-live-byte notes are excluded. Deleted-note history remains eligible; doctor reports bounded hint-drift warnings without repair.
+- Git-history import and deleted-note recovery accept legacy note IDs while preserving exact case-sensitive matching, duplicate checks and scope restrictions. No IDs are rewritten and no archive import runs on upgrade.
 - Doctor REST/MCP gains an opt-in, read-only deep history-content audit for unrestricted sessions. Bounded pages materialize and hash-check whole/delta blobs, report corruption and explicit continuation, and never repair or erase data. A live multi-page run is not a consistent snapshot; use a database backup for snapshot assurance.
 
 ## [0.7.9-rc.8] - 2026-09-17

@@ -5,8 +5,24 @@ import { findMixedTypeIndexedFieldNotes } from "./doctor.js";
 import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
+import { COMPACT_STATE_AGGREGATE } from "./history-compact-state.js";
 
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 32;
+
+function migrateToV32(db: Database): void {
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get()) return;
+  transaction(db, () => {
+    db.exec(`CREATE TABLE history_compact_state (
+      note_id TEXT PRIMARY KEY, versions INTEGER NOT NULL, stored INTEGER NOT NULL,
+      live INTEGER NOT NULL, refused INTEGER NOT NULL DEFAULT 0, refreshed_at INTEGER NOT NULL
+    );
+    CREATE INDEX idx_history_compact_candidates ON history_compact_state(refused, stored DESC);
+    CREATE INDEX IF NOT EXISTS idx_note_versions_note_hash ON note_versions(note_id, content_hash);`);
+    // One-time backfill, deliberately not repeated on reopen (which would re-arm refusals).
+    db.prepare(`INSERT INTO history_compact_state(note_id,versions,stored,live,refused,refreshed_at)
+      SELECT note_id,versions,stored,live,0,? FROM (${COMPACT_STATE_AGGREGATE.replace("__FILTER__", "")})`).run(Date.now());
+  });
+}
 
 /**
  * Deterministic last-resort epoch for a note whose `updated_at` AND
@@ -742,6 +758,7 @@ export function initSchema(db: Database): void {
   // v30: depth-one history deltas and captured creation time, no backfill.
   migrateToV30(db);
   migrateToV31(db);
+  migrateToV32(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.

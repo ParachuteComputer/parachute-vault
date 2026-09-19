@@ -1,6 +1,7 @@
 /** Git-independent import primitives. Callers own source parsing and offline access. */
 import type { Database } from "bun:sqlite";
 import { transaction } from "./txn.js";
+import { refreshCompactState } from "./history-compact-state.js";
 import { HistoryUnrecoverableError, hashContent, byteLength, VERSION_MAX_BYTES, pruneVersions, compactNote, getVersion, type HistoryPolicy, type VersionRow } from "./history.js";
 
 export interface ImportedObservation {
@@ -112,7 +113,7 @@ export function applyImportedNote(db: Database, opts: {
         VALUES(?,?,?,?,?,?,?,NULL,'git-import','import',?,NULL,?)`).run(opts.noteId, storage, hash, row.path, canonicalJson(row.metadata), row.extension, row.observed_at, size, row.created_at);
       db.prepare("INSERT INTO history_import_refs VALUES(?,?,?,?)").run(opts.noteId, index, row.commit, row.blob);
     }
-    if (opts.policy.enabled) pruneVersions(db, opts.noteId, opts.policy, opts.now);
+    if (opts.policy.enabled) pruneVersions(db, opts.noteId, opts.policy, opts.now, false);
     compactNote(db, opts.noteId, opts.policy);
     const after = new Set((db.prepare("SELECT version_ix FROM note_versions WHERE note_id=?").all(opts.noteId) as { version_ix: number }[]).map(r => r.version_ix));
     for (let i = 0; i < opts.observations.length; i++) {
@@ -125,6 +126,7 @@ export function applyImportedNote(db: Database, opts: {
     receipt.pruned_imported = receipt.imported_count - receipt.retained_count;
     receipt.pruned_native = nativeDrops.length;
     db.prepare("UPDATE history_import_receipts SET retained_count=?,pruned_imported=?,pruned_native=? WHERE note_id=?").run(receipt.retained_count, receipt.pruned_imported, receipt.pruned_native, opts.noteId);
+    refreshCompactState(db, opts.noteId);
     return { receipt, nativeDrops, skipped: false };
   });
 }

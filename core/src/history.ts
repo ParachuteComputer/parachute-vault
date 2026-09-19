@@ -14,6 +14,7 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { encodeDelta, decodeDelta } from "./delta.js";
 import { transaction } from "./txn.js";
+import { refreshCompactState } from "./history-compact-state.js";
 
 export type HistoryOp =
   | "import"
@@ -212,7 +213,7 @@ export function captureVersion(
       size,
       prior.created_at,
     );
-    pruneVersions(db, prior.id, opts.policy);
+    pruneVersions(db, prior.id, opts.policy, Date.now(), false);
     return;
   }
   const hash = hashContent(text);
@@ -237,7 +238,7 @@ export function captureVersion(
     size,
     prior.created_at,
   );
-  pruneVersions(db, prior.id, opts.policy);
+  pruneVersions(db, prior.id, opts.policy, Date.now(), false);
 }
 export function appendRestoreMarker(
   db: Database,
@@ -261,13 +262,14 @@ export function appendRestoreMarker(
     noteId,
     tombstone.version_ix,
   );
-  pruneVersions(db, noteId, policy);
+  pruneVersions(db, noteId, policy, Date.now(), false);
 }
 export function pruneVersions(
   db: Database,
   noteId: string,
   policy: HistoryPolicy,
   now = Date.now(),
+  refresh = true,
 ): { versionsDeleted: number; blobsDeleted: number } {
   const rows = db
     .prepare(
@@ -301,6 +303,7 @@ export function pruneVersions(
       )
       .run(hash, hash, hash).changes;
   }
+  if (refresh) refreshCompactState(db, noteId);
   return { versionsDeleted, blobsDeleted };
 }
 export function gcBlobs(db: Database): { blobsDeleted: number } {
@@ -331,10 +334,12 @@ export function sweepDeletedHistory(
     .all(cutoff) as { note_id: string }[];
   return transaction(db, () => {
     let versionsDeleted = 0;
-    for (const v of victims)
+    for (const v of victims) {
       versionsDeleted += db
         .prepare("DELETE FROM note_versions WHERE note_id = ?")
         .run(v.note_id).changes;
+      db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(v.note_id);
+    }
     return { notesSwept: victims.length, versionsDeleted, ...gcBlobs(db) };
   });
 }
@@ -406,6 +411,7 @@ export function eraseHistory(
     const versionsDeleted = db
       .prepare("DELETE FROM note_versions WHERE note_id = ?")
       .run(noteId).changes;
+    db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(noteId);
     return { versionsDeleted, ...gcBlobs(db) };
   });
 }
@@ -553,6 +559,23 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
   const result: CompactResult = { blobs_deltified: 0, blobs_skipped_too_large: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0 };
   if (!policy.enabled || !policy.compact_enabled || !historyTablesPresent(db))
     return result;
+  return transaction(db, () => {
+  const changedHashes = new Set<string>();
+  const finish = () => {
+    // A blob can be referenced by several notes. Refresh each affected hint,
+    // without treating another note's compaction as a new history write.
+    const affected = new Set<string>();
+    for (const hash of changedHashes) {
+      for (const row of db.prepare("SELECT DISTINCT note_id FROM note_versions WHERE content_hash=?").all(hash) as { note_id: string }[]) affected.add(row.note_id);
+    }
+    for (const id of affected) {
+      if (id === noteId) continue;
+      const prior = db.prepare("SELECT refused FROM history_compact_state WHERE note_id=?").get(id) as { refused: number } | null;
+      refreshCompactState(db, id, { refused: prior?.refused === 1 });
+    }
+    refreshCompactState(db, noteId, { refused: result.blobs_deltified === 0 && result.versions_dropped === 0 });
+    return result;
+  };
   const rows = db.prepare("SELECT version_ix, content_hash, content_len FROM note_versions WHERE note_id = ? AND content_hash IS NOT NULL ORDER BY version_ix DESC").all(noteId) as {
     version_ix: number;
     content_hash: string;
@@ -569,10 +592,9 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
   const live = current?.content == null ? newest?.content_len ?? 0 : byteLength(current.content);
   const overBytes = policy.max_bytes_per_note !== null && stored > policy.max_bytes_per_note;
   if (!overBytes && rows.length < policy.compact_min_versions)
-    return result;
+    return finish();
   if (!overBytes && stored <= policy.compact_ratio * Math.max(live, 1))
-    return result;
-  return transaction(db, () => {
+    return finish();
     for (let start = 0; start < rows.length; start += policy.compact_run_length) {
       const run = rows.slice(start, start + policy.compact_run_length);
       const baseRow = db.prepare("SELECT hash, encoding, delta_of FROM note_blobs WHERE hash = ?").get(run[0]!.content_hash) as {
@@ -614,13 +636,15 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
           result.blobs_skipped_too_large++;
           continue;
         }
-        result.blobs_deltified += db.prepare("UPDATE note_blobs SET content = ?, byte_size = ?, encoding = 'fossil-delta', delta_of = ? WHERE hash = ? AND encoding IS NULL").run(payload, payload.length, baseHash, b.hash).changes;
+        const changed = db.prepare("UPDATE note_blobs SET content = ?, byte_size = ?, encoding = 'fossil-delta', delta_of = ? WHERE hash = ? AND encoding IS NULL").run(payload, payload.length, baseHash, b.hash).changes;
+        result.blobs_deltified += changed;
+        if (changed) changedHashes.add(b.hash);
       }
     }
     if (policy.max_bytes_per_note !== null)
       result.versions_dropped = enforceByteCeiling(db, noteId, policy);
     result.bytes_after = noteHistoryBytes(db, noteId);
-    return result;
+    return finish();
   });
 }
 function enforceByteCeiling(db: Database, noteId: string, policy: HistoryPolicy): number {
@@ -650,15 +674,10 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
   if (budget !== null && budget <= 0)
     return { ...result, stopped_by: "budget" };
   const started = performance.now();
-  const candidates = opts?.noteId !== undefined ? [{ note_id: opts.noteId }] : db.prepare(`SELECT v.note_id, SUM(b.byte_size) AS stored,
-  (SELECT COUNT(*) FROM note_versions n WHERE n.note_id = v.note_id AND n.content_hash IS NOT NULL) AS versions,
-  COALESCE(LENGTH(CAST(live_note.content AS BLOB)),
-   (SELECT content_len FROM note_versions newest WHERE newest.note_id = v.note_id ORDER BY version_ix DESC LIMIT 1),0) AS live
-  FROM (SELECT DISTINCT note_id, content_hash FROM note_versions WHERE content_hash IS NOT NULL) v
-  JOIN note_blobs b ON b.hash = v.content_hash LEFT JOIN notes live_note ON live_note.id = v.note_id
-  GROUP BY v.note_id
-  HAVING (versions >= ? AND stored > ? * MAX(live,1)) OR (? IS NOT NULL AND stored > ?)
-  ORDER BY stored DESC`).all(policy.compact_min_versions, policy.compact_ratio, policy.max_bytes_per_note, policy.max_bytes_per_note) as {
+  const predicate = `refused=0 AND live>0 AND ((versions >= ? AND stored > ? * MAX(live,1)) OR (? IS NOT NULL AND stored > ?))`;
+  const args = [policy.compact_min_versions, policy.compact_ratio, policy.max_bytes_per_note, policy.max_bytes_per_note];
+  const total = opts?.noteId !== undefined ? 1 : (db.prepare(`SELECT COUNT(*) AS n FROM history_compact_state WHERE ${predicate}`).get(...args) as { n: number }).n;
+  const candidates = opts?.noteId !== undefined ? [{ note_id: opts.noteId }] : db.prepare(`SELECT note_id FROM history_compact_state WHERE ${predicate} ORDER BY stored DESC LIMIT ?`).all(...args, max === null ? -1 : max * 4) as {
     note_id: string;
   }[];
   for (const candidate of candidates) {
@@ -686,7 +705,7 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
       console.warn("[history] compaction failed", candidate.note_id, err);
     }
   }
-  result.remaining_candidates = candidates.length - result.notes_scanned;
+  result.remaining_candidates = total - result.notes_scanned;
   result.duration_ms = performance.now() - started;
   return result;
 }

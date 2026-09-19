@@ -48,6 +48,19 @@
  */
 
 import { historyTablesPresent, deletedHistoryStats, historyStorageStats, topNotesByHistoryBytes } from "./history.js";
+import { readCompactState, type CompactState } from "./history-compact-state.js";
+
+function scanCompactStateDrift(db: Database): DoctorFinding[] {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get()) return [];
+  const sample = db.prepare("SELECT note_id,versions,stored,live FROM history_compact_state ORDER BY stored DESC LIMIT 200").all() as CompactState[];
+  const drift = sample.filter(row => {
+    const actual = readCompactState(db, row.note_id);
+    return !actual || actual.versions !== row.versions || actual.stored !== row.stored || actual.live !== row.live;
+  }).length;
+  return drift ? [{ type: "history_compact_state_drift", severity: "warning", subject: "history compaction scheduling hints",
+    detail: `${drift} of ${sample.length} sampled hint rows differ from history. Sample is bounded to the 200 largest hints; this is not a full audit.`,
+    remedy: "Investigate missed history-write refreshes. Scheduling hints do not replace authoritative history; this scan does not repair them." }] : [];
+}
 import { Database } from "bun:sqlite";
 import { loadTagHierarchy, findHierarchyCycles } from "./tag-hierarchy.js";
 import { listIndexedFields } from "./indexed-fields.js";
@@ -106,7 +119,8 @@ export type DoctorFindingType =
   | "deleted_note_history"
   | "history_storage"
   | "history_delta_orphan"
-  | "history_content_audit";
+  | "history_content_audit"
+  | "history_compact_state_drift";
 
 export type DoctorSeverity = "error" | "warning" | "info";
 
@@ -183,6 +197,7 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
     ...(allowedTags === null ? scanDeletedNoteHistory(db) : []),
     ...(allowedTags === null ? scanHistoryStorage(db) : []),
     ...(allowedTags === null ? scanDeltaOrphans(db) : []),
+    ...(allowedTags === null ? scanCompactStateDrift(db) : []),
   ];
 
   const audit = opts?.deep ? auditHistoryBlobs(db, opts.history_after, opts.history_max_blobs, opts.history_budget_ms) : undefined;
