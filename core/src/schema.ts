@@ -10,14 +10,12 @@ import { rebuildCompactState } from "./history-compact-state.js";
 export const SCHEMA_VERSION = 32;
 
 function migrateToV32(db: Database): void {
-  transaction(db, () => {
     const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
     // Read before initSchema records this open. On a timestamp tie, prefer
     // a harmless rebuild over missing an older writer's stale hints.
     const previous = db.prepare("SELECT version FROM schema_version ORDER BY applied_at DESC, version ASC LIMIT 1").get() as { version: number } | null;
     if (exists && (!previous || previous.version >= 32)) return;
     rebuildCompactState(db);
-  });
 }
 
 /**

@@ -3511,7 +3511,7 @@ async function cmdHistory(args: string[]) {
     const { Database } = await import("bun:sqlite");
     const { initSchema } = await import("../core/src/schema.js");
     const { rebuildCompactState } = await import("../core/src/history-compact-state.js");
-    const db = new Database(path, { create: false });
+    const db = new Database(path, { readwrite: true, create: false });
     try {
       initSchema(db);
       const rebuilt_notes = rebuildCompactState(db);
