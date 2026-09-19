@@ -14,7 +14,7 @@ import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHi
 
 import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
-import { ULID_REGEX } from "../core/src/ulid.js";
+import { isNoteIdShape } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
@@ -2932,7 +2932,7 @@ async function handleNotesInner(
     if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
-    if (!note && (tagScope.raw !== null || !ULID_REGEX.test(idOrPath) ||
+    if (!note && (tagScope.raw !== null || !isNoteIdShape(idOrPath) ||
       !(await store.listNoteVersions(idOrPath, { limit: 1 })).length)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
