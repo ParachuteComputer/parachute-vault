@@ -1607,6 +1607,14 @@ size. Shared-blob rewrites refresh affected hints without re-arming other notes.
 Doctor checks up to 200 largest hint rows and reports `history_compact_state_drift`
 as a warning when their counters disagree with history. This read-only sample is
 not a full audit and does not repair hints. Scoped sessions do not receive it.
+On re-upgrade after an older writer, the newest schema-ledger entry triggers an
+atomic hint rebuild (timestamp ties prefer the lower version). Ordinary v32
+reopens preserve refusal flags. Self-hosted operators can run
+`parachute-vault history rebuild-state --vault <name> [--json]` to rebuild hints
+without compacting history. The current server may remain running; write
+transactions serialize. Rebuilding resets refusals, not notes or versions.
+Cloud has no operator repair endpoint: other hint-drift bugs are repaired through
+a numbered core migration delivered by a core-pin update. Doctor remains read-only.
 The unbounded admin route visits every candidate and completes even when some
 bodies cannot be reduced. Byte totals attribute directly referenced blobs to a
 note; shared blobs can count for multiple notes, and indirect bases are excluded.

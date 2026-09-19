@@ -1,4 +1,23 @@
 import type { Database } from "bun:sqlite";
+import { transaction } from "./txn.js";
+
+/** Rebuild derived hints only, atomically; authoritative history is untouched. */
+export function rebuildCompactState(db: Database): number {
+  return transaction(db, () => {
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get()) {
+      db.exec("DROP TABLE history_compact_state");
+    }
+    db.exec(`CREATE TABLE history_compact_state (
+      note_id TEXT PRIMARY KEY, versions INTEGER NOT NULL, stored INTEGER NOT NULL,
+      live INTEGER NOT NULL, refused INTEGER NOT NULL DEFAULT 0, refreshed_at INTEGER NOT NULL
+    );
+    CREATE INDEX idx_history_compact_candidates ON history_compact_state(refused, stored DESC);
+    CREATE INDEX IF NOT EXISTS idx_note_versions_note_hash ON note_versions(note_id, content_hash);`);
+    db.prepare(`INSERT INTO history_compact_state(note_id,versions,stored,live,refused,refreshed_at)
+      SELECT note_id,versions,stored,live,0,? FROM (${COMPACT_STATE_AGGREGATE.replace("__FILTER__", "")})`).run(Date.now());
+    return (db.prepare("SELECT COUNT(*) AS n FROM history_compact_state").get() as { n: number }).n;
+  });
+}
 
 // Scheduling hints only. History remains authoritative, including for deleted notes.
 export const COMPACT_STATE_AGGREGATE = `SELECT v.note_id,
