@@ -3432,6 +3432,8 @@ async function cmdExport(args: string[]) {
  * a past revision (`git show <sha>:<path>.md`).
  */
 async function cmdHistory(args: string[]) {
+  const rebuild = args[0] === "rebuild-state";
+  if (rebuild) args = args.slice(1);
   let vaultName = "default";
   let notePath: string | undefined;
   let limit: number | undefined;
@@ -3485,6 +3487,10 @@ async function cmdHistory(args: string[]) {
     }
   }
 
+  if (rebuild && (showSha || notePath || limit !== undefined)) {
+    console.error("rebuild-state accepts only --vault and --json.");
+    process.exit(1);
+  }
   if (showSha && !notePath) {
     console.error("--show <sha> requires --note <path> (which file to read at that revision).");
     process.exit(1);
@@ -3494,6 +3500,25 @@ async function cmdHistory(args: string[]) {
   if (!config) {
     console.error(`Vault "${vaultName}" not found. Available: ${listVaults().join(", ") || "(none)"}.`);
     process.exit(1);
+  }
+
+  if (rebuild) {
+    const path = vaultDbPath(vaultName);
+    if (!existsSync(path)) {
+      console.error(`Vault database not found: ${path}`);
+      process.exit(1);
+    }
+    const { Database } = await import("bun:sqlite");
+    const { initSchema } = await import("../core/src/schema.js");
+    const { rebuildCompactState } = await import("../core/src/history-compact-state.js");
+    const db = new Database(path, { create: false });
+    try {
+      initSchema(db);
+      const rebuilt_notes = rebuildCompactState(db);
+      console.log(asJson ? JSON.stringify({ vault: vaultName, rebuilt_notes }) :
+        `Rebuilt compaction hints for ${rebuilt_notes} notes in vault "${vaultName}". History unchanged.`);
+    } finally { db.close(); }
+    return;
   }
 
   // Resolve the mirror dir the same way the server does: per-vault mirror
@@ -3558,6 +3583,10 @@ async function cmdHistory(args: string[]) {
 }
 
 function printHistoryUsage(): void {
+  console.error("Usage: parachute-vault history rebuild-state [--vault <name>] [--json]");
+  console.error("Rebuild compaction hints and reset refusals; does not compact or change history.");
+  console.error("The current server may stay running: writes serialize with the rebuild transaction.");
+  console.error("Stop the server optionally to avoid write contention; do not run older writers concurrently.\n");
   console.error(
     "Usage: parachute-vault history [--note <path>] [--limit N] [--vault <name>] [--json]\n" +
       "                              [--note <path> --show <sha>]",

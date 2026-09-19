@@ -65,7 +65,7 @@ function scanCompactStateDrift(db: Database): DoctorFinding[] {
   }).length;
   return drift ? [{ type: "history_compact_state_drift", severity: "warning", subject: "history compaction scheduling hints",
     detail: `${drift} of ${sample.length} sampled hint rows differ from history. Sample is bounded to the 200 largest hints; this is not a full audit.`,
-    remedy: "Investigate missed history-write refreshes. Scheduling hints do not replace authoritative history; this scan does not repair them." }] : [];
+    remedy: "Investigate missed history-write refreshes. Self-hosted: history rebuild-state --vault <name>. Cloud: deploy a core-pin migration that rebuilds hints; no operator repair API. This scan does not repair them." }] : [];
 }
 
 export interface HistoryAuditPage {
