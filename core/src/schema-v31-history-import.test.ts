@@ -13,7 +13,7 @@ test("v30 to v31 retains native history and matches fresh import tables; reopeni
     db.exec("UPDATE schema_version SET version=30");
     const before = db.query("SELECT * FROM note_versions").all();
     initSchema(db); initSchema(fresh); initSchema(db);
-    expect(db.query("SELECT MAX(version) AS version FROM schema_version").get()).toEqual({ version: 31 });
+    expect(db.query("SELECT MAX(version) AS version FROM schema_version").get()).toEqual({ version: 32 });
     expect(db.query("SELECT * FROM note_versions").all()).toEqual(before);
     for (const table of tables) {
       expect(db.query(`PRAGMA table_info(${table})`).all()).toEqual(fresh.query(`PRAGMA table_info(${table})`).all());

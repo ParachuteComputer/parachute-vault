@@ -1597,8 +1597,16 @@ numeric values, including zero, are clamped to at least 65,536 bytes.
 `compact_enabled: false` also disables byte-ceiling enforcement.
 Compaction runs synchronously at first vault open, with budgets checked between
 notes: one note can overshoot the time budget. Zero boot budget skips the pass.
-An incompressible note remains a candidate on subsequent opens and may precede
-other notes under the note budget because candidates are ordered by stored size.
+Schema 32 backfills per-note scheduling hints once. Later opens select hints by
+stored size without aggregating all history. A no-op attempt marks a note refused;
+new capture, pruning or import re-arms it. Notes with zero live bytes are excluded
+from ratio-based selection, but remain eligible when over the byte ceiling.
+The bounded selection window is four times the note budget; `remaining_candidates`
+is the total eligible count at selection time minus notes attempted, not the window
+size. Shared-blob rewrites refresh affected hints without re-arming other notes.
+Doctor checks up to 200 largest hint rows and reports `history_compact_state_drift`
+as a warning when their counters disagree with history. This read-only sample is
+not a full audit and does not repair hints. Scoped sessions do not receive it.
 The unbounded admin route visits every candidate and completes even when some
 bodies cannot be reduced. Byte totals attribute directly referenced blobs to a
 note; shared blobs can count for multiple notes, and indirect bases are excluded.

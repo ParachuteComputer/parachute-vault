@@ -32,6 +32,7 @@ import {
 } from "./search-query.js";
 import { generateUlid } from "./ulid.js";
 import { captureVersion, readPriorNoteRow, DEFAULT_HISTORY_POLICY, type HistoryPolicy } from "./history.js";
+import { refreshCompactState } from "./history-compact-state.js";
 
 /**
  * Write-attribution context (vault#298) — the two axes of provenance threaded
@@ -2594,6 +2595,7 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
         const prior = readPriorNoteRow(db, row.id);
         if (prior) captureVersion(db, prior, { actor: attr?.actor ?? null, via: attr?.via ?? null, op: "tag-rename", policy });
         updateStmt.run(next, now, nowMs, row.id);
+        refreshCompactState(db, row.id);
         notesRewritten++;
       }
     }
@@ -2618,6 +2620,7 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
         const prior = readPriorNoteRow(db, row.id);
         if (prior) captureVersion(db, prior, { actor: attr?.actor ?? null, via: attr?.via ?? null, op: "tag-rename", policy });
         updateStmt.run(next, now, nowMs, row.id);
+        refreshCompactState(db, row.id);
         pathsRenamed++;
       }
     }

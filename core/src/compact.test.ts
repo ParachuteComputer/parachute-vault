@@ -74,7 +74,7 @@ test("P6 triggers and off switch leave blobs unchanged; writes never compact", a
     const empty = await emptyStore.createNote("empty fixture".repeat(2000));
     await emptyStore.updateNote(empty.id, { append: "one" });
     await emptyStore.updateNote(empty.id, { content: "" });
-    expect(emptyStore.compactHistory({ budgetMs: null, maxNotes: null }).notes_compacted).toBe(1);
+    expect(emptyStore.compactHistory({ budgetMs: null, maxNotes: null }).notes_scanned).toBe(0);
   } finally { emptyDb.close(); }
 });
 test("P7 third encode failure rolls back all changes", async () => {
@@ -115,7 +115,7 @@ test("P8 bounded passes resume and converge; unbounded visits all", async () => 
   expect(all.stopped_by).toBe("complete");
   expect(all.remaining_candidates).toBe(0);
 });
-test("P16/P8 incompressible candidates are refused on every pass", async () => {
+test("P16/P8 explicit retries remain safe; automatic passes skip refused candidates", async () => {
   const bodies = Array.from({ length: 5 }, () => randomHex(20480));
   expect(codec).not.toBeNull();
   expect(codec!.encodeDelta(bodies[1]!, bodies[0]!).length).toBeGreaterThanOrEqual(20480 * .9);
@@ -129,7 +129,7 @@ test("P16/P8 incompressible candidates are refused on every pass", async () => {
     expect(result.blobs_deltified).toBe(0);
     expect(result.blobs_skipped_too_large).toBeGreaterThanOrEqual(1);
     expect(blobs()).toEqual(before);
-    expect(h.compactVault(db, p, { budgetMs: null, maxNotes: null })).toMatchObject({ notes_scanned: 1, stopped_by: "complete" });
+    expect(h.compactVault(db, p, { budgetMs: null, maxNotes: null })).toMatchObject({ notes_scanned: 0, stopped_by: "complete" });
   }
   const twin = await seed();
   expect(store.compactNote(twin.id)).toMatchObject({ blobs_skipped_too_large: 0 });

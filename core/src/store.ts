@@ -3,6 +3,7 @@ import { HistoryPreconditionRequiredError } from "./history.js";
 import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow, SemanticSearchResult } from "./types.js";
 import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
 import { initSchema } from "./schema.js";
+import { refreshCompactState } from "./history-compact-state.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
@@ -530,7 +531,12 @@ export class BunSqliteStore implements Store {
       if (normalized !== opts.metadata) opts = { ...opts, metadata: normalized };
     }
 
-    const note = noteOps.createNote(this.db, content, opts);
+    const note = this.transaction(() => {
+      const created = noteOps.createNote(this.db, content, opts);
+      // Explicit IDs may recreate a deleted note with retained history.
+      refreshCompactState(this.db, created.id);
+      return created;
+    });
 
     if (content) {
       syncWikilinks(this.db, note.id, content);
@@ -692,6 +698,7 @@ export class BunSqliteStore implements Store {
         this.syncReferenceFieldLinks(note, priorMetadataForRefs);
       }
 
+      refreshCompactState(this.db, id);
       return note;
     });
 
@@ -818,6 +825,7 @@ export class BunSqliteStore implements Store {
         if (prior) captureVersion(this.db, prior, { ...attr, op: "cascade-rename", policy: this.historyPolicy });
         noteOps.updateNote(this.db, sourceId, { content: updated });
         syncWikilinks(this.db, sourceId, updated);
+        refreshCompactState(this.db, sourceId);
       }
     }
   }
@@ -858,6 +866,7 @@ export class BunSqliteStore implements Store {
       appendRestoreMarker(this.db, id, tomb, { actor: opts.actor ?? null, via: opts.via ?? null }, this.historyPolicy);
       if (note.content) syncWikilinks(this.db, id, note.content);
       if (note.path) resolveUnresolvedWikilinks(this.db, note.path, id);
+      refreshCompactState(this.db, id);
       return note;
     });
   }
@@ -910,6 +919,7 @@ export class BunSqliteStore implements Store {
       }
       noteOps.deleteNote(this.db, id);
       refreshAmbiguousLinks(this.db, ambiguityKeys);
+      refreshCompactState(this.db, id);
     });
     if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
     // Dispatch even when `existing` was null — the caller asked for a
@@ -1603,7 +1613,11 @@ export class BunSqliteStore implements Store {
       const normalized = normalizeDateFields(this.getSchemaConfig(), { tags: opts.tags, metadata: opts.metadata });
       if (normalized !== opts.metadata) opts = { ...opts, metadata: normalized };
     }
-    return noteOps.createNote(this.db, content, opts);
+    return this.transaction(() => {
+      const created = noteOps.createNote(this.db, content, opts);
+      refreshCompactState(this.db, created.id);
+      return created;
+    });
   }
 
   /**
