@@ -4,6 +4,55 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.9] - 2026-09-22
+
+**Stable promotion of 0.7.9-rc.9.** No new code. Suffix-drop only. npm `@rc`
+is 0.7.9-rc.9; this is the matching `@latest`.
+
+**Plan the upgrade around the migrations.** The 0.7.9 line (rc.1-rc.9) moves
+the schema 27 → 32: 27 → 28 versions the `unresolved_wikilinks` heal and adds
+the ambiguous-link table (#703, #707); 28 → 29 → 30 adds `note_versions`,
+content-addressed `note_blobs` and the delta compactor's blob columns (#734,
+#740), and the first open after upgrading runs both plus a budgeted,
+synchronous compaction pass — `UPGRADING.md` names the 8 MiB default per-note
+ceiling and how to disable it; 30 → 31 adds Git-history import provenance and
+erasure-safe receipts (#746, #747); 31 → 32 adds per-note compaction
+scheduling hints, backfilled once on first open and rebuilt automatically
+after a downgrade and re-upgrade (#759-#762). No note data is rewritten.
+
+**Note version history is the headline, and it pairs with the app.** Updates,
+append/prepend, deletes, tag renames and linked-note rename cascades capture
+prior state atomically; history defaults to enabled with a 20-version floor,
+a 100-version ceiling and a 180-day age bound, configurable per vault under
+`history:`. Four REST routes list/read/restore/erase, plus read-only
+`versions` on MCP `query-notes`. The browsing and recovery experience ships
+separately in the coordinated app release, so the app's history UI needs a
+vault on this line. Restoring an existing note now **requires** the
+`if_updated_at` the person reviewed — omission returns 428 instead of an
+unconditional replacement, and `force: true` does not bypass it.
+Tag-restricted readers no longer receive historical `actor` / `via` (#736),
+and doctor gains an opt-in, read-only deep history-content audit.
+
+**Mirror retirement is opt-in and offline (#746, #747).** Live git-mirror
+export is switched off and the repo becomes a static archive, the only
+pre-v29 record. Plan on a database copy, prepare a verified archive with the
+vault offline, apply the exact manifest, then retire that vault's live
+mirror; existing mirrors stay active until explicitly retired.
+
+**Also in this line.** Automatic audio uploads now use the selected, active
+and ready transcription worker, including local providers (#751) — with
+auto-transcribe defaulting to on, an installation with a ready local worker
+will start processing new eligible audio uploads. A scoped token naming an
+out-of-scope tag in a query now matches nothing rather than returning its own
+in-scope notes (#702, closes #675); unscoped tokens are unaffected. Scoped
+readers' ambiguous, broken and resolved link answers stop moving with edges
+they cannot see (#707, #712, #717, #718); #714 stays open for the
+appearing-edge direction. Note updates are transactional (#711), a rename
+cascades only over brackets that actually resolved to the renamed note (#710),
+and repeated query params accumulate while path prefixes match literally
+(#694). NIP-98 writes record `created_via` / `last_updated_via` as
+`nostr:<pubkey>` from the hub's `permissions.principal_pubkey` claim (#698).
+
 ## [0.7.9-rc.9] - 2026-09-19
 
 **Compaction scheduling, downgrade recovery, and a read-only deep history audit.** Schema 31 → 32 adds one table of per-note history compaction scheduling hints, backfilled once on the first open; no existing table is altered and no note data is rewritten. A database that is opened by an older build and then upgraded again has its hints rebuilt automatically. Doctor gains an opt-in deep content audit and two new finding types (`history_compact_state_drift`, `history_content_audit`). The four commits on `next` since rc.8 are #759, #760, #761 and #762.
