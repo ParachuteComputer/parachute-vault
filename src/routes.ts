@@ -83,6 +83,7 @@ import {
   filterHydratedLinksByTagScope,
   filterNotesByTagScope,
   noteWithinTagScope,
+  scrubTagCountsForPrivateTags,
   scopeQueryTags,
   scrubIndexedFieldConflictError,
   scrubNotesTagsByScope,
@@ -3636,7 +3637,7 @@ export async function handleTags(
 
     const tags = await store.listTags();
     const filtered = tagScope.allowed
-      ? tags.filter((t) => tagScope.allowed!.has(t.name))
+      ? await scrubTagCountsForPrivateTags(store, tags.filter((t) => tagScope.allowed!.has(t.name)), tagScope.allowed)
       : tags;
     if (parseBool(parseQuery(url, "include_schema"), false)) {
       const records = new Map(
