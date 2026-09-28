@@ -3156,13 +3156,24 @@ export function mergeMetadata(
  *
  * All computation is done via SQL aggregation — no full-table scans into memory.
  * Safe to call on large vaults. Read-only.
+ *
+ * `opts.tagFilter` / `opts.excludeTags` (vault#766 — the scope-aware path for
+ * a tag-scoped caller; core stays scope-unaware): every figure is computed
+ * over only the "visible" notes — those reachable through `tagFilter` (all
+ * notes when `tagFilter` is omitted) that carry none of `excludeTags`.
+ * `tagCount`/`topTags` then count tags on visible notes (restricted to
+ * `tagFilter` when given), `linkCount` only links with BOTH endpoints
+ * visible, `attachmentCount` only attachments of visible notes. An empty
+ * `tagFilter` yields all zeros.
  */
 export function getVaultStats(
   db: Database,
-  opts?: { topTagsLimit?: number },
+  opts?: { topTagsLimit?: number; tagFilter?: string[]; excludeTags?: string[] },
 ): VaultStats {
   const topTagsLimit = opts?.topTagsLimit ?? 20;
-
+  if (opts?.tagFilter !== undefined || (opts?.excludeTags && opts.excludeTags.length > 0)) {
+    return getScopedVaultStats(db, topTagsLimit, opts.tagFilter, opts.excludeTags ?? []);
+  }
   const totalRow = db.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number };
   const totalNotes = totalRow.c;
 
@@ -3225,6 +3236,68 @@ export function getVaultStats(
   };
 }
 
+
+function getScopedVaultStats(
+  db: Database,
+  topTagsLimit: number,
+  tagFilter: string[] | undefined,
+  excludeTags: string[],
+): VaultStats {
+  if (tagFilter !== undefined && tagFilter.length === 0) {
+    return {
+      totalNotes: 0, earliestNote: null, latestNote: null, notesByMonth: [], topTags: [],
+      tagCount: 0, attachmentCount: 0, linkCount: 0, contentBytes: 0,
+    };
+  }
+  const tf = tagFilter ?? [];
+  const inPh = tf.map(() => "?").join(",");
+  const exPh = excludeTags.map(() => "?").join(",");
+  const base = tagFilter !== undefined
+    ? `SELECT DISTINCT note_id AS id FROM note_tags WHERE tag_name IN (${inPh})`
+    : `SELECT id FROM notes WHERE 1`;
+  const idCol = tagFilter !== undefined ? "note_id" : "id";
+  const cte =
+    `WITH visible AS (${base}` +
+    (excludeTags.length > 0 ? ` AND ${idCol} NOT IN (SELECT note_id FROM note_tags WHERE tag_name IN (${exPh}))` : "") +
+    `), vn AS (SELECT n.* FROM notes n JOIN visible v ON v.id = n.id)`;
+  const a = [...tf, ...excludeTags];
+  const tagClause = tagFilter !== undefined ? `WHERE nt.tag_name IN (${inPh})` : "";
+  const one = <T>(sql: string, ...extra: unknown[]) => db.prepare(`${cte} ${sql}`).get(...(a as any[]), ...(extra as any[])) as T;
+  const all = <T>(sql: string, ...extra: unknown[]) => db.prepare(`${cte} ${sql}`).all(...(a as any[]), ...(extra as any[])) as T[];
+
+  const totalNotes = one<{ c: number }>("SELECT COUNT(*) as c FROM vn").c;
+  const earliest = one<{ id: string; created_at: string } | null>("SELECT id, created_at FROM vn ORDER BY created_at ASC, id ASC LIMIT 1");
+  const latest = one<{ id: string; created_at: string } | null>("SELECT id, created_at FROM vn ORDER BY created_at DESC, id DESC LIMIT 1");
+  const notesByMonth = all<{ month: string; count: number }>(
+    `SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS count FROM vn WHERE created_at IS NOT NULL GROUP BY month ORDER BY month ASC`,
+  );
+  const topTags = all<{ tag: string; count: number }>(
+    `SELECT nt.tag_name AS tag, COUNT(*) AS count FROM note_tags nt JOIN visible v ON v.id = nt.note_id
+     ${tagClause} GROUP BY nt.tag_name ORDER BY count DESC, nt.tag_name ASC LIMIT ?`,
+    ...tf, topTagsLimit,
+  );
+  const tagCount = one<{ c: number }>(
+    `SELECT COUNT(DISTINCT nt.tag_name) as c FROM note_tags nt JOIN visible v ON v.id = nt.note_id ${tagClause}`,
+    ...tf,
+  ).c;
+  const attachmentCount = one<{ c: number }>("SELECT COUNT(*) as c FROM attachments at JOIN visible v ON v.id = at.note_id").c;
+  const linkCount = one<{ c: number }>(
+    "SELECT COUNT(*) as c FROM links l WHERE l.source_id IN (SELECT id FROM visible) AND l.target_id IN (SELECT id FROM visible)",
+  ).c;
+  const contentBytes = one<{ b: number }>("SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) as b FROM vn").b;
+  return {
+    totalNotes,
+    earliestNote: earliest ? { id: earliest.id, createdAt: earliest.created_at } : null,
+    latestNote: latest ? { id: latest.id, createdAt: latest.created_at } : null,
+    notesByMonth,
+    topTags,
+    tagCount,
+    attachmentCount,
+    linkCount,
+    contentBytes,
+  };
+}
+
 // ---- Vault map (front-door structural orientation) ----
 
 /** Shared bucket-expression for the top-level path segment: the text before
@@ -3251,54 +3324,70 @@ function pathBucketExpr(pathCol: string): string {
  * meaningful filter — "nothing is in scope" — and short-circuits to an
  * all-zero map WITHOUT falling through to the unfiltered/full-vault query;
  * only OMITTING `tagFilter` entirely computes the vault-wide map.
+ *
+ * `opts.excludeTags` (vault#766 private tags) removes every note carrying ANY
+ * of those exact tag names from all four counts — deny wins over
+ * `tagFilter`. The server layer resolves the caller's denied tag names; core
+ * just subtracts. Only honored alongside `tagFilter`.
  */
 export function getVaultMap(
   db: Database,
-  opts?: { tagFilter?: string[] },
+  opts?: { tagFilter?: string[]; excludeTags?: string[] },
 ): VaultMap {
   const hasFilter = opts !== undefined && opts.tagFilter !== undefined;
   const tagFilter = opts?.tagFilter ?? [];
+  const excludeTags = opts?.excludeTags ?? [];
 
   if (hasFilter && tagFilter.length === 0) {
     return { total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 };
   }
 
   if (hasFilter) {
-    const placeholders = tagFilter.map(() => "?").join(",");
+    // One CTE of visible note ids: reachable through the allowlist, minus any
+    // note carrying an excluded (denied) tag. Every count reads from it.
+    const inPh = tagFilter.map(() => "?").join(",");
+    const exPh = excludeTags.map(() => "?").join(",");
+    const visibleCte =
+      `WITH visible AS (
+         SELECT DISTINCT note_id AS id FROM note_tags WHERE tag_name IN (${inPh})` +
+      (excludeTags.length > 0
+        ? ` AND note_id NOT IN (SELECT note_id FROM note_tags WHERE tag_name IN (${exPh}))`
+        : "") +
+      `)`;
+    const args = [...tagFilter, ...excludeTags];
 
     const totalRow = db
-      .prepare(`SELECT COUNT(DISTINCT note_id) as c FROM note_tags WHERE tag_name IN (${placeholders})`)
-      .get(...tagFilter) as { c: number };
+      .prepare(`${visibleCte} SELECT COUNT(*) as c FROM visible`)
+      .get(...args) as { c: number };
 
     const tagRows = db
       .prepare(
-        `SELECT tag_name AS name, COUNT(*) AS count
-         FROM note_tags
-         WHERE tag_name IN (${placeholders})
-         GROUP BY tag_name
+        `${visibleCte}
+         SELECT nt.tag_name AS name, COUNT(*) AS count
+         FROM note_tags nt JOIN visible v ON v.id = nt.note_id
+         WHERE nt.tag_name IN (${inPh})
+         GROUP BY nt.tag_name
          ORDER BY count DESC, name ASC`,
       )
-      .all(...tagFilter) as { name: string; count: number }[];
+      .all(...args, ...tagFilter) as { name: string; count: number }[];
 
     const bucketRows = db
       .prepare(
-        `SELECT ${pathBucketExpr("n.path")} AS name, COUNT(DISTINCT n.id) AS count
-         FROM notes n
-         JOIN note_tags nt ON nt.note_id = n.id
-         WHERE nt.tag_name IN (${placeholders}) AND n.path IS NOT NULL
+        `${visibleCte}
+         SELECT ${pathBucketExpr("n.path")} AS name, COUNT(*) AS count
+         FROM notes n JOIN visible v ON v.id = n.id
+         WHERE n.path IS NOT NULL
          GROUP BY name
          ORDER BY count DESC, name ASC`,
       )
-      .all(...tagFilter) as { name: string; count: number }[];
+      .all(...args) as { name: string; count: number }[];
 
     const unfiledRow = db
       .prepare(
-        `SELECT COUNT(DISTINCT n.id) as c
-         FROM notes n
-         JOIN note_tags nt ON nt.note_id = n.id
-         WHERE nt.tag_name IN (${placeholders}) AND n.path IS NULL`,
+        `${visibleCte}
+         SELECT COUNT(*) as c FROM notes n JOIN visible v ON v.id = n.id WHERE n.path IS NULL`,
       )
-      .get(...tagFilter) as { c: number };
+      .get(...args) as { c: number };
 
     return {
       total_notes: totalRow.c,

@@ -653,7 +653,7 @@ export interface Store {
   ): Promise<{ merged: Record<string, number>; target: string }>;
 
   // Vault stats (aggregate, read-only)
-  getVaultStats(opts?: { topTagsLimit?: number }): Promise<VaultStats>;
+  getVaultStats(opts?: { topTagsLimit?: number; tagFilter?: string[]; excludeTags?: string[] }): Promise<VaultStats>;
 
   // Links
   createLink(sourceId: string, targetId: string, relationship: string, metadata?: Record<string, unknown>): Promise<Link>;

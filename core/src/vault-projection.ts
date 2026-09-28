@@ -202,7 +202,18 @@ export const QUERY_HINTS: readonly string[] = [
  */
 export function buildVaultProjection(
   db: Database,
-  opts?: { includeStats?: boolean },
+  opts?: {
+    includeStats?: boolean;
+    /**
+     * Scope-aware counts (vault#766): when present, `map` and `stats` are
+     * computed over only the notes reachable through `tagFilter` and carrying
+     * none of `excludeTags` — see `getVaultMap`. The server layer resolves
+     * both from the caller's tag scope; core stays scope-unaware.
+     */
+    countScope?: { tagFilter: string[]; excludeTags: string[] };
+    /** Same, for `stats` only (see `getVaultStats`'s `tagFilter`/`excludeTags`). */
+    statsScope?: { tagFilter?: string[]; excludeTags?: string[] };
+  },
 ): VaultProjection {
   const resolved = loadSchemaConfig(db);
   const records = listTagRecords(db);
@@ -250,7 +261,7 @@ export function buildVaultProjection(
     tags,
     indexed_fields,
     query_hints: [...QUERY_HINTS],
-    map: noteOps.getVaultMap(db),
+    map: opts?.countScope ? noteOps.getVaultMap(db, opts.countScope) : noteOps.getVaultMap(db),
   };
 
   // A2: point any connected AI at the seeded onboarding guide (a path pointer,
@@ -260,7 +271,9 @@ export function buildVaultProjection(
   }
 
   if (opts?.includeStats) {
-    projection.stats = noteOps.getVaultStats(db);
+    projection.stats = opts?.statsScope
+      ? noteOps.getVaultStats(db, opts.statsScope)
+      : noteOps.getVaultStats(db);
   }
 
   return projection;

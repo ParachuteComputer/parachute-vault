@@ -1227,7 +1227,7 @@ export class BunSqliteStore implements Store {
 
   // ---- Vault Stats ----
 
-  async getVaultStats(opts?: { topTagsLimit?: number }) {
+  async getVaultStats(opts?: { topTagsLimit?: number; tagFilter?: string[]; excludeTags?: string[] }) {
     return noteOps.getVaultStats(this.db, opts);
   }
 

@@ -84,6 +84,9 @@ import {
   filterNotesByTagScope,
   noteWithinTagScope,
   scrubTagCountsForPrivateTags,
+  scopedCountFilter,
+  scopedStatsFilter,
+  doctorNoteTagsPredicate,
   scopeQueryTags,
   scrubIndexedFieldConflictError,
   scrubNotesTagsByScope,
@@ -4291,9 +4294,12 @@ export async function handleVault(
     result.map =
       tagScope.raw === null
         ? getVaultMap(store.db)
-        : getVaultMap(store.db, { tagFilter: [...(tagScope.allowed ?? [])] });
+        : getVaultMap(store.db, scopedCountFilter(store, tagScope.allowed));
     if (parseBool(parseQuery(url, "include_stats"), false)) {
-      result.stats = await store.getVaultStats();
+      // vault#766: subtract notes a private tag hides from a scoped caller.
+      result.stats = await store.getVaultStats(
+        tagScope.raw === null ? undefined : scopedStatsFilter(store, tagScope.allowed),
+      );
     }
     return json(result);
   }
@@ -4468,7 +4474,7 @@ export async function handleDoctor(
   if ((after !== undefined && !/^[a-f0-9]{64}$/.test(after)) ||
       (maxBlobs !== undefined && (!Number.isInteger(maxBlobs) || maxBlobs < 1 || maxBlobs > 500)) ||
       (budgetMs !== undefined && (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > 1000))) return json({ error: "invalid history audit bounds or cursor" }, 400);
-  const report = await store.doctor({ allowedTags: tagScope.allowed, deep, history_after: after, history_max_blobs: maxBlobs, history_budget_ms: budgetMs });
+  const report = await store.doctor({ allowedTags: tagScope.allowed, noteTagsInScope: doctorNoteTagsPredicate(tagScope.allowed, tagScope.raw), deep, history_after: after, history_max_blobs: maxBlobs, history_budget_ms: budgetMs });
   return json(report);
 }
 

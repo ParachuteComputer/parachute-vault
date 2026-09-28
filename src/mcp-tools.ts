@@ -8,7 +8,7 @@
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
-import { getNote, getNoteTags, getVaultMap } from "../core/src/notes.ts";
+import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
 import {
@@ -24,6 +24,9 @@ import { refineMcpVia } from "./auth.ts";
 import {
   expandTokenTagScope,
   scrubTagCountsForPrivateTags,
+  scopedCountFilter,
+  scopedStatsFilter,
+  doctorNoteTagsPredicate,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
   scopeQueryTagParam,
@@ -94,7 +97,8 @@ function filterProjectionByScope(
  * tags + descendants before rendering — symmetric with the JSON
  * `vault-info` wrapper, so a tag-scoped token never learns about
  * out-of-scope tags via the connect-time brief either. Aggregate counts
- * pass through unchanged (they were pre-existing leak surface; not new).
+ * stay vault-wide (pre-existing behaviour) EXCEPT that notes hidden by a
+ * private tag are subtracted, and `map` is scope-restricted (vault#766).
  *
  * Async because expanding the tag-scope allowlist hits the store's
  * hierarchy resolver. Returns the orientation block even when the vault
@@ -107,11 +111,20 @@ export async function getServerInstruction(
 ): Promise<string> {
   const config = readVaultConfig(vaultName);
   const store = getVaultStore(vaultName);
-  let projection = buildVaultProjection(store.db, { includeStats: true });
+  let projection: VaultProjection;
 
   if (auth?.scoped_tags && auth.scoped_tags.length > 0) {
     const allowed = await expandTokenTagScope(store, auth.scoped_tags);
+    // vault#766: the brief's counts (stats line, map) must not include notes
+    // a private tag hides from this token — build them scope-aware.
+    projection = buildVaultProjection(store.db, {
+      includeStats: true,
+      countScope: scopedCountFilter(store, allowed),
+      statsScope: scopedStatsFilter(store, allowed),
+    });
     if (allowed) projection = filterProjectionByScope(projection, allowed);
+  } else {
+    projection = buildVaultProjection(store.db, { includeStats: true });
   }
 
   return projectionToMarkdown({
@@ -715,8 +728,14 @@ function applyTagScopeWrappers(
     // tag membership, not just a tag-name allowlist over a precomputed
     // rollup) — so re-run the cheap grouped-count query restricted to the
     // resolved allowlist instead of filtering `orig`'s unscoped result.
+    // vault#766: `scopedCountFilter` also drops notes hidden by a private
+    // tag (deny wins) and zeroes everything for a fail-closed scope.
     if (r.map) {
-      r.map = getVaultMap(store.db, { tagFilter: [...allowed] });
+      r.map = getVaultMap(store.db, scopedCountFilter(store, allowed));
+    }
+    if (r.stats) {
+      const statsScope = scopedStatsFilter(store, allowed);
+      if (statsScope) r.stats = getVaultStats(store.db, statsScope);
     }
     return r;
   });
@@ -913,7 +932,7 @@ function applyTagScopeWrappers(
     const allowed = await getAllowed();
     if (!allowed) return await orig(params);
     if (params.deep) return forbidden("deep history audit requires an unrestricted session");
-    return runDoctorScan(store.db, { allowedTags: allowed });
+    return runDoctorScan(store.db, { allowedTags: allowed, noteTagsInScope: doctorNoteTagsPredicate(allowed, rawTags) });
   });
 }
 

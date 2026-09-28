@@ -202,6 +202,16 @@ export interface VaultConfig {
    */
   private_tags?: string[];
   /**
+   * Set by the parser when a `private_tags:` key IS present but could not be
+   * read as a tag list (vault#766 fail-closed). Tag-scoped tokens then see no
+   * notes at all in this vault until the key is fixed — see
+   * `expandTokenTagScope`. Never serialized; the original text rides
+   * `private_tags_raw` so a config round-trip can't silently erase the key.
+   */
+  private_tags_error?: string;
+  /** Verbatim `private_tags` block when it failed to parse (re-emitted on write). */
+  private_tags_raw?: string;
+  /**
    * What to do with the audio file on disk once the worker is done with it.
    * - `"keep"` (default): leave the file on disk.
    * - `"until_transcribed"`: unlink once the transcript lands successfully;
@@ -559,7 +569,11 @@ function serializeVaultConfig(config: VaultConfig): string {
   if (config.audio_retention) {
     lines.push(`audio_retention: ${config.audio_retention}`);
   }
-  if (config.private_tags && config.private_tags.length > 0) {
+  if (config.private_tags_raw) {
+    // Unparseable key (fail-closed): keep the operator's text verbatim so
+    // writing some other field doesn't drop the key and fail OPEN.
+    lines.push(config.private_tags_raw.replace(/\n+$/, ""));
+  } else if (config.private_tags && config.private_tags.length > 0) {
     lines.push("private_tags:");
     for (const t of config.private_tags) lines.push(`  - ${t}`);
   }
@@ -631,6 +645,137 @@ function serializeVaultConfig(config: VaultConfig): string {
   return lines.join("\n") + "\n";
 }
 
+/** Result of reading the `private_tags` key out of vault.yaml text. */
+export type PrivateTagsParse =
+  | { kind: "absent" }
+  | { kind: "ok"; tags: string[] }
+  | { kind: "invalid"; reason: string; raw: string };
+
+/** A bare tag token: no whitespace, quotes, YAML flow punctuation or `#`. */
+const PRIVATE_TAG_TOKEN = /^[^\s"'#,\[\]{}]+$/;
+
+function unquotePrivateTag(s: string): string | null {
+  let t = s.trim();
+  if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) {
+    t = t.slice(1, -1).trim();
+  }
+  return PRIVATE_TAG_TOKEN.test(t) ? t : null;
+}
+
+/** Strip a YAML end-of-line comment (` # …`) that sits outside quotes. */
+function stripYamlComment(s: string): string {
+  let quote: string | null = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
+    if (quote) {
+      if (c === quote) quote = null;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (c === "#" && (i === 0 || /\s/.test(s[i - 1]!))) {
+      return s.slice(0, i);
+    }
+  }
+  return s;
+}
+
+/**
+ * Parse `private_tags` (vault#766) out of vault.yaml text.
+ *
+ * Accepted shapes (each with optional trailing `# comment`s):
+ *   private_tags: [capture, "transcript"]      flow list
+ *   private_tags:                              block list (items indented,
+ *     - capture                                or at column 0 — both are
+ *     - transcript                             valid YAML)
+ *   private_tags: capture                      scalar → one-element list
+ *   private_tags: []   /  private_tags:       explicit empty / YAML null
+ *
+ * FAIL-CLOSED contract: when the key is present but ANY part of its value
+ * can't be read as a tag list (a duplicate key, an unterminated flow list,
+ * a block line that isn't `- <tag>`, a tag with spaces or YAML punctuation),
+ * this returns `invalid` rather than dropping to `[]`. `expandTokenTagScope`
+ * turns `invalid` into "this vault shows NO notes to tag-scoped tokens" —
+ * a typo in the confidentiality list must never expose what it lists.
+ */
+export function parsePrivateTags(yaml: string): PrivateTagsParse {
+  const lines = yaml.split(/\r?\n/);
+  const keyLines = lines
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => /^private_tags\s*:/.test(l));
+  if (keyLines.length === 0) {
+    // An indented or quoted key is still an attempt to configure privacy.
+    const odd = lines.find((l) => /^\s*["']?private_tags["']?\s*:/.test(l));
+    return odd ? { kind: "invalid", reason: "private_tags key is indented or quoted", raw: odd } : { kind: "absent" };
+  }
+  const first = keyLines[0]!;
+  // Collect the key's block: the key line plus every following line that is
+  // blank, a comment, indented, or a column-0 `- item`.
+  const block: string[] = [first.l];
+  for (let i = first.i + 1; i < lines.length; i++) {
+    const l = lines[i]!;
+    if (l.trim() === "" || /^\s/.test(l) || /^-(\s|$)/.test(l) || /^#/.test(l)) block.push(l);
+    else break;
+  }
+  while (block.length > 1 && block[block.length - 1]!.trim() === "") block.pop();
+  const raw = block.join("\n");
+  const invalid = (reason: string): PrivateTagsParse => ({ kind: "invalid", reason, raw });
+  if (keyLines.length > 1) return invalid("private_tags key appears more than once");
+
+  const inline = stripYamlComment(first.l.replace(/^private_tags\s*:/, "")).trim();
+  const rest = block.slice(1).map((l) => stripYamlComment(l)).filter((l) => l.trim() !== "");
+
+  if (inline.length > 0) {
+    if (rest.length > 0) return invalid("private_tags has both an inline value and indented lines");
+    if (inline.startsWith("[")) {
+      if (!inline.endsWith("]")) return invalid("private_tags flow list is not closed on the same line");
+      const body = inline.slice(1, -1).trim();
+      if (body === "") return { kind: "ok", tags: [] };
+      const tags: string[] = [];
+      for (const part of body.split(",")) {
+        const t = unquotePrivateTag(part);
+        if (t === null) return invalid(`private_tags entry ${JSON.stringify(part.trim())} is not a tag name`);
+        tags.push(t);
+      }
+      return { kind: "ok", tags };
+    }
+    if (inline === "~" || inline === "null") return { kind: "ok", tags: [] };
+    const t = unquotePrivateTag(inline);
+    if (t === null) return invalid(`private_tags value ${JSON.stringify(inline)} is not a tag name or list`);
+    return { kind: "ok", tags: [t] };
+  }
+
+  const tags: string[] = [];
+  for (const l of rest) {
+    const m = l.match(/^\s*-\s+(.*)$/) ?? l.match(/^\s*-()$/);
+    if (!m) return invalid(`private_tags line ${JSON.stringify(l.trim())} is not a "- <tag>" list item`);
+    const t = unquotePrivateTag(m[1] ?? "");
+    if (t === null) return invalid(`private_tags item ${JSON.stringify(l.trim())} is not a tag name`);
+    tags.push(t);
+  }
+  return { kind: "ok", tags };
+}
+
+/**
+ * Read a vault's `private_tags` for enforcement (vault#766). Unlike
+ * `readVaultConfig`, this never swallows errors into "no config": a missing
+ * vault.yaml is `absent` (nothing configured), but a file that exists and
+ * can't be read or parsed is `invalid` so scoped reads fail closed.
+ */
+export function readPrivateTagsConfig(name: string): PrivateTagsParse {
+  const configPath = vaultConfigPath(name);
+  let text: string;
+  try {
+    if (!existsSync(configPath)) return { kind: "absent" };
+    text = readFileSync(configPath, "utf-8");
+  } catch (err) {
+    return { kind: "invalid", reason: `vault.yaml could not be read: ${(err as Error)?.message ?? String(err)}`, raw: "" };
+  }
+  try {
+    return parsePrivateTags(text);
+  } catch (err) {
+    return { kind: "invalid", reason: `vault.yaml could not be parsed: ${(err as Error)?.message ?? String(err)}`, raw: "" };
+  }
+}
+
 function parseVaultConfig(yaml: string, name: string): VaultConfig {
   const config: VaultConfig = {
     name,
@@ -647,22 +792,13 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
   const pubTagMatch = yaml.match(/^published_tag:\s*(\S+)/m);
   if (pubTagMatch) config.published_tag = pubTagMatch[1]!;
 
-  // private_tags (vault#766): block list (`private_tags:\n  - capture`) or
-  // flow list (`private_tags: [capture, transcript]`).
-  const privFlow = yaml.match(/^private_tags:[^\S\r\n]*\[([^\]\n]*)\]/m);
-  if (privFlow) {
-    config.private_tags = privFlow[1]!.split(",").map((t) => t.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
-  } else {
-    const privStart = yaml.match(/^private_tags:\s*$/m);
-    if (privStart) {
-      const tags: string[] = [];
-      for (const line of yaml.slice((privStart.index ?? 0) + privStart[0].length).split("\n")) {
-        if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
-        const m = line.match(/^\s+-\s*["']?([^"'\s#]+)["']?/);
-        if (m) tags.push(m[1]!);
-      }
-      if (tags.length > 0) config.private_tags = tags;
-    }
+  // private_tags (vault#766) — see parsePrivateTags for the grammar and the
+  // fail-closed contract.
+  const priv = parsePrivateTags(yaml);
+  if (priv.kind === "ok") config.private_tags = priv.tags;
+  else if (priv.kind === "invalid") {
+    config.private_tags_error = priv.reason;
+    config.private_tags_raw = priv.raw;
   }
 
   const retentionMatch = yaml.match(/^audio_retention:\s*(\S+)/m);
