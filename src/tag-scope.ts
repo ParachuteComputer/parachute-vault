@@ -24,9 +24,32 @@ import type { TagFieldViolation } from "../core/src/tag-schemas.ts";
 import { ParentCycleError } from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
 import { stripTagHash } from "../core/src/tag-hierarchy.ts";
+import { getVaultNameForStore } from "./vault-store.ts";
+import { readVaultConfig } from "./config.ts";
 
 /** Generic replacement for a redacted out-of-scope tag name — never the real name. */
 const OUT_OF_SCOPE_LABEL = "(outside your token's tag scope)";
+
+/**
+ * The expanded allowlist for a tag-scoped token, carrying the vault's
+ * private-tag deny side (vault#766) alongside it.
+ *
+ * It IS a `Set<string>` of allowed tags (root + descendants), so every
+ * existing `allowed.has(t)` call site is unchanged. The deny side rides on
+ * the same object so that every read path, which already threads `allowed`
+ * into `noteWithinTagScope` / `filterNotesByTagScope`, enforces private tags
+ * without per-path patches.
+ *
+ * `privateTags` is the vault's `private_tags` expanded through descendants,
+ * MINUS anything the token's own allowlist covers. So naming a private tag
+ * (or one of its ancestors) in `scoped_tags` is the only way a scoped token
+ * sees it. `privateRoots` is the raw `private_tags` list for the string-form
+ * sub-tag fallback (`capture/voice` with no declared hierarchy).
+ */
+export class TagScopeSet extends Set<string> {
+  privateTags: Set<string> = new Set();
+  privateRoots: string[] = [];
+}
 
 /**
  * Build the effective tag-allowlist for a token: union of `{root} ∪
@@ -34,13 +57,87 @@ const OUT_OF_SCOPE_LABEL = "(outside your token's tag scope)";
  * token is unscoped (no enforcement needed). An empty array also returns
  * null — defensive parity with the token-store parser, which collapses
  * `[]` to null.
+ *
+ * `privateTags` defaults to the vault's configured `private_tags`
+ * (vault.yaml, vault#766), resolved from the store's vault name. Pass it
+ * explicitly to override (tests, stores not opened via `getVaultStore`).
  */
 export async function expandTokenTagScope(
   store: Store,
   scoped_tags: string[] | null,
-): Promise<Set<string> | null> {
+  privateTags?: string[] | null,
+): Promise<TagScopeSet | null> {
   if (!scoped_tags || scoped_tags.length === 0) return null;
-  return await store.expandTagsWithDescendants(scoped_tags);
+  const out = new TagScopeSet(await store.expandTagsWithDescendants(scoped_tags));
+  const priv = privateTags ?? readPrivateTags(store);
+  if (priv.length > 0) {
+    // Exempt = covered by the token itself: in the expanded allowlist, or
+    // equal to / under a raw `scoped_tags` entry (string-form sub-tags).
+    const named = (t: string) => out.has(t) || scoped_tags.some((s) => t === s || t.startsWith(`${s}/`));
+    for (const t of await store.expandTagsWithDescendants(priv)) {
+      if (!named(t)) out.privateTags.add(t);
+    }
+    out.privateRoots = priv.filter((p) => !named(p));
+  }
+  return out;
+}
+
+/** The vault's configured `private_tags` (vault.yaml), or `[]`. */
+export function readPrivateTags(store: Store): string[] {
+  const name = getVaultNameForStore(store);
+  if (!name) return [];
+  return readVaultConfig(name)?.private_tags ?? [];
+}
+
+/**
+ * Is this tag private to the caller, i.e. denied by the vault's
+ * `private_tags` and not explicitly named in the token's scope? Only
+ * meaningful when `allowed` came from `expandTokenTagScope`; a plain Set
+ * carries no deny side.
+ */
+export function tagDeniedByPrivateTags(tag: string, allowed: Set<string> | null): boolean {
+  if (!(allowed instanceof TagScopeSet)) return false;
+  if (allowed.privateTags.size === 0 && allowed.privateRoots.length === 0) return false;
+  if (allowed.privateTags.has(tag)) return true;
+  const root = tag.split("/")[0];
+  if (!root || !allowed.privateRoots.includes(root) || allowed.has(tag)) return false;
+  return true;
+}
+
+/**
+ * Scoped `list-tags` counts under private tags (vault#766). Core's counts are
+ * vault-wide; once a private tag hides a co-tagged note, an in-scope tag's
+ * `count` / `expanded_count` would still include it and leak its existence.
+ * Subtract the notes the caller can't see. No-op when nothing is private.
+ */
+export async function scrubTagCountsForPrivateTags<T extends { name: string; count: number; expanded_count?: number }>(
+  store: Store,
+  tags: T[],
+  allowed: Set<string> | null,
+): Promise<T[]> {
+  if (!(allowed instanceof TagScopeSet)) return tags;
+  if (allowed.privateTags.size === 0 && allowed.privateRoots.length === 0) return tags;
+  const rows = store.db.prepare("SELECT note_id, tag_name FROM note_tags").all() as { note_id: string; tag_name: string }[];
+  const byNote = new Map<string, string[]>();
+  for (const r of rows) {
+    const l = byNote.get(r.note_id);
+    if (l) l.push(r.tag_name);
+    else byNote.set(r.note_id, [r.tag_name]);
+  }
+  const hidden = [...byNote.values()].filter((ts) => ts.some((t) => tagDeniedByPrivateTags(t, allowed)));
+  if (hidden.length === 0) return tags;
+  const out: T[] = [];
+  for (const t of tags) {
+    const exact = hidden.filter((ts) => ts.includes(t.name)).length;
+    let next = { ...t, count: t.count - exact };
+    if (typeof t.expanded_count === "number") {
+      const expansion = await store.expandTagsWithDescendants([t.name]);
+      const under = hidden.filter((ts) => ts.some((x) => expansion.has(x))).length;
+      next = { ...next, expanded_count: Math.max(0, t.expanded_count - under) };
+    }
+    out.push(next);
+  }
+  return out;
 }
 
 /**
@@ -53,6 +150,9 @@ export async function expandTokenTagScope(
  * allowlist source; `allowed` is just a precomputed expansion for the
  * common (declared-hierarchy) case.
  *
+ * Deny wins (vault#766): a note carrying ANY private tag the token did not
+ * explicitly name is invisible, even when another of its tags is in scope.
+ *
  * Pass `null` for both when the token is unscoped (always permitted).
  */
 export function noteWithinTagScope(
@@ -62,12 +162,17 @@ export function noteWithinTagScope(
 ): boolean {
   if (rawRoots === null) return true;
   if (!note.tags || note.tags.length === 0) return false;
+  let admitted = false;
   for (const t of note.tags) {
-    if (allowed && allowed.has(t)) return true;
-    const root = t.split("/")[0];
-    if (root && rawRoots.includes(root)) return true;
+    if (tagDeniedByPrivateTags(t, allowed)) return false;
+    if (admitted) continue;
+    if (allowed && allowed.has(t)) admitted = true;
+    else {
+      const root = t.split("/")[0];
+      if (root && rawRoots.includes(root)) admitted = true;
+    }
   }
-  return false;
+  return admitted;
 }
 
 /**

@@ -194,6 +194,14 @@ export interface VaultConfig {
   /** Tag name that marks a note as publicly viewable. Default: "published". */
   published_tag?: string;
   /**
+   * Private tags (vault#766). A note carrying any of these tags (or a
+   * descendant) is invisible to every tag-SCOPED token that does not name
+   * the tag, or an ancestor, in its own `scoped_tags`. Deny wins over allow:
+   * a note tagged `project` + `capture` stays hidden from a `project`-scoped
+   * token when `capture` is private. Unscoped tokens are unaffected.
+   */
+  private_tags?: string[];
+  /**
    * What to do with the audio file on disk once the worker is done with it.
    * - `"keep"` (default): leave the file on disk.
    * - `"until_transcribed"`: unlink once the transcript lands successfully;
@@ -551,6 +559,10 @@ function serializeVaultConfig(config: VaultConfig): string {
   if (config.audio_retention) {
     lines.push(`audio_retention: ${config.audio_retention}`);
   }
+  if (config.private_tags && config.private_tags.length > 0) {
+    lines.push("private_tags:");
+    for (const t of config.private_tags) lines.push(`  - ${t}`);
+  }
 
   // Per-vault history policy: serialize only explicitly configured fields.
   if (config.history) {
@@ -634,6 +646,24 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
 
   const pubTagMatch = yaml.match(/^published_tag:\s*(\S+)/m);
   if (pubTagMatch) config.published_tag = pubTagMatch[1]!;
+
+  // private_tags (vault#766): block list (`private_tags:\n  - capture`) or
+  // flow list (`private_tags: [capture, transcript]`).
+  const privFlow = yaml.match(/^private_tags:[^\S\r\n]*\[([^\]\n]*)\]/m);
+  if (privFlow) {
+    config.private_tags = privFlow[1]!.split(",").map((t) => t.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+  } else {
+    const privStart = yaml.match(/^private_tags:\s*$/m);
+    if (privStart) {
+      const tags: string[] = [];
+      for (const line of yaml.slice((privStart.index ?? 0) + privStart[0].length).split("\n")) {
+        if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+        const m = line.match(/^\s+-\s*["']?([^"'\s#]+)["']?/);
+        if (m) tags.push(m[1]!);
+      }
+      if (tags.length > 0) config.private_tags = tags;
+    }
+  }
 
   const retentionMatch = yaml.match(/^audio_retention:\s*(\S+)/m);
   if (retentionMatch) {

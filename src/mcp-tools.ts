@@ -23,6 +23,7 @@ import type { AuthResult } from "./auth.ts";
 import { refineMcpVia } from "./auth.ts";
 import {
   expandTokenTagScope,
+  scrubTagCountsForPrivateTags,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
   scopeQueryTagParam,
@@ -650,7 +651,7 @@ function applyTagScopeWrappers(
     }
     const result = await orig(params);
     if (Array.isArray(result)) {
-      return result.filter((t: any) => allowed.has(t.name));
+      return await scrubTagCountsForPrivateTags(store, result.filter((t: any) => allowed.has(t.name)), allowed);
     }
     // In-scope single-tag miss (nonexistent but allowlisted name): core's
     // tag_not_found may carry a vault-wide `did_you_mean` — keep it only
