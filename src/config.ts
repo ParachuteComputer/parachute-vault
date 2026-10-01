@@ -1814,14 +1814,23 @@ export class UnreadablePrivateTagsError extends Error {
   }
 }
 
-export function writeVaultConfig(config: VaultConfig): void {
-  if (config.private_tags_error && !config.private_tags_raw) {
+export function writeVaultConfig(config: VaultConfig, nameOnlySource?: string): void {
+  // Name-only mode re-emits the original YAML verbatim (only `name:` changes),
+  // so an unreadable private_tags key survives untouched; only a full
+  // reserialization could drop it.
+  if (nameOnlySource === undefined && config.private_tags_error && !config.private_tags_raw) {
     throw new UnreadablePrivateTagsError();
   }
   const dir = vaultDir(config.name);
   mkdirSync(dir, { recursive: true });
   const configPath = vaultConfigPath(config.name);
-  writeFileSync(configPath, serializeVaultConfig(config));
+  // Rename changes only identity. Preserve even unknown fields and raw YAML
+  // (including private_tags) that this version's serializer cannot round-trip.
+  const yaml = nameOnlySource === undefined ? serializeVaultConfig(config)
+    : /^name:.*$/m.test(nameOnlySource)
+      ? nameOnlySource.replace(/^name:.*$/m, `name: ${config.name}`)
+      : `name: ${config.name}\n${nameOnlySource}`;
+  writeFileSync(configPath, yaml);
 }
 
 // ---------------------------------------------------------------------------
