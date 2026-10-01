@@ -159,6 +159,15 @@ describe("dirSize (recursive directory byte sum)", () => {
     expect(dirSize(ROOT, fs)).toBe(100 + 250 + 50);
   });
 
+  test("excludes rename recovery backups but counts ordinary hidden storage", () => {
+    const fs = makeFakeFs({ [ROOT]: dir({
+      "vault.db": file(100),
+      ".rename-backups": dir({ "old": dir({ "vault.db": file(500) }) }),
+      ".git": dir({ objects: file(25) }),
+    }) });
+    expect(dirSize(ROOT, fs)).toBe(125);
+  });
+
   test("empty directory → 0", () => {
     const fs = makeFakeFs({ [ROOT]: dir({}) });
     expect(dirSize(ROOT, fs)).toBe(0);
