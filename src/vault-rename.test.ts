@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { SqliteStore } from "../core/src/store.ts";
-import { assetsDir, readGlobalConfig, readVaultConfig, vaultDbPath, vaultDir, writeGlobalConfig, writeVaultConfig } from "./config.ts";
+import { assetsDir, readGlobalConfig, readPrivateTagsConfig, readVaultConfig, vaultDbPath, vaultDir, writeGlobalConfig, writeVaultConfig } from "./config.ts";
 import { renameVault } from "./vault-rename.ts";
 import { runSubprocess } from "./test-support/spawn.ts";
 import { handleStorage } from "./routes.ts";
@@ -269,4 +269,17 @@ test("--json emits one success object on stdout and human output on stderr", asy
   expect(result.stderr).toContain(`Backup: ${output.backup_path}`);
   expect(result.stderr).toContain('renamed to "after"');
   expect(result.stderr).toContain("you can delete the backup");
+});
+
+test("rename keeps an unreadable private_tags key verbatim and still fail-closed", () => {
+  writeVaultConfig({ name: "privold", description: "", api_keys: [], created_at: "now" });
+  new Database(vaultDbPath("privold")).close();
+  const p = join(vaultDir("privold"), "vault.yaml");
+  writeFileSync(p, readFileSync(p, "utf8") + "  private_tags: [secret]\n\"private_tags\": [other]\n");
+  expect(readPrivateTagsConfig("privold").kind).toBe("invalid");
+  renameVault("privold", "privnew", true, quiet);
+  const after = readFileSync(join(vaultDir("privnew"), "vault.yaml"), "utf8");
+  expect(after).toContain("  private_tags: [secret]\n\"private_tags\": [other]\n");
+  expect(after).toMatch(/^name: privnew$/m);
+  expect(readPrivateTagsConfig("privnew").kind).toBe("invalid");
 });
