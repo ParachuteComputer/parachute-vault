@@ -566,6 +566,29 @@ function applyTagScopeWrappers(
       const note = resolveNote(store.db, historyId);
       if (note && !noteWithinTagScope(note, allowed, rawTags)) return { error: "Note not found", error_type: "not_found", id: historyId };
     }
+    // vault#738 review: scope before any note-dependent resolution/error
+    // path. Otherwise content-range validation and ambiguous-path candidates
+    // distinguish a hidden note from a missing one (and may expose ULIDs).
+    // Incompatible aggregate/versions combinations still reach core's loud
+    // parameter validation before any single-note lookup.
+    const singleRef = (params as any)?.id;
+    if (allowed && typeof singleRef === "string" && singleRef
+        && (params as any).aggregate === undefined && !(params as any).versions) {
+      try {
+        const note = resolveNote(store.db, singleRef);
+        if (!note || !noteWithinTagScope(note, allowed, rawTags)) {
+          return { error: "Note not found", error_type: "not_found", id: singleRef };
+        }
+      } catch (e: any) {
+        // Never surface global ambiguous-path candidates to a scoped caller.
+        // An ambiguous reference is deliberately unresolved; use an explicit
+        // note ID to address an in-scope candidate.
+        if (e?.code === "AMBIGUOUS_PATH") {
+          return { error: "Note not found", error_type: "not_found", id: singleRef };
+        }
+        throw e;
+      }
+    }
     const result = await orig(scopeQueryTagParams(params, allowed));
     if (!allowed) return result;
     // `aggregate` mode returns `[{group, value}]` rollup rows — no `.tags`

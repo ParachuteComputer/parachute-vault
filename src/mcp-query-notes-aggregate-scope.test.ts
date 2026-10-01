@@ -264,3 +264,26 @@ describe("vault#738 — scoped query-notes: no existence oracle, no {id, aggrega
     expect(result.id).toBe(visible.id);
   });
 });
+
+test("vault#738 review: hidden and missing refs have identical content-range error precedence", async () => {
+  seedVault("journal");
+  const store = getVaultStore("journal");
+  const hidden = await store.createNote("private", { path: "secret/exists", tags: ["work"] });
+  const tool = await queryNotesTool("journal", ["health"]);
+  for (const ref of [hidden.path, "secret/missing"]) {
+    const result = await tool.execute({ id: ref, include_content: false, content_offset: 0 });
+    expect(result).toEqual({ error: "Note not found", error_type: "not_found", id: ref });
+  }
+});
+
+test("vault#738 review: ambiguous hidden paths never disclose global candidates", async () => {
+  seedVault("journal");
+  const store = getVaultStore("journal");
+  const a = await store.createNote("private a", { path: "secret/multi", extension: "md", tags: ["work"] });
+  const b = await store.createNote("private b", { path: "secret/multi", extension: "json", tags: ["work"] });
+  const tool = await queryNotesTool("journal", ["health"]);
+  const result = await tool.execute({ id: "secret/multi" });
+  expect(result).toEqual({ error: "Note not found", error_type: "not_found", id: "secret/multi" });
+  expect(JSON.stringify(result)).not.toContain(a.id);
+  expect(JSON.stringify(result)).not.toContain(b.id);
+});
