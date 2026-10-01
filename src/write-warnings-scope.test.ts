@@ -225,7 +225,9 @@ describe("REST write-time link warnings under tag scope (vault#707 twin)", () =>
   });
 
   async function scopeCtx(roots: string[]): Promise<TagScopeCtx> {
-    return { allowed: await expandTokenTagScope(store, roots), raw: roots };
+    // Unbound BunStore: pass private_tags explicitly (an unbound store fails
+    // closed for scoped tokens — vault#766).
+    return { allowed: await expandTokenTagScope(store, roots, []), raw: roots };
   }
   const NO_SCOPE: TagScopeCtx = { allowed: null, raw: null };
 

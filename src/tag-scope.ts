@@ -25,7 +25,7 @@ import { ParentCycleError } from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
 import { stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
-import { readVaultConfig } from "./config.ts";
+import { readPrivateTagsConfig } from "./config.ts";
 
 /** Generic replacement for a redacted out-of-scope tag name — never the real name. */
 const OUT_OF_SCOPE_LABEL = "(outside your token's tag scope)";
@@ -49,6 +49,30 @@ const OUT_OF_SCOPE_LABEL = "(outside your token's tag scope)";
 export class TagScopeSet extends Set<string> {
   privateTags: Set<string> = new Set();
   privateRoots: string[] = [];
+  /**
+   * Fail-closed marker (vault#766 retro-review): the vault's `private_tags`
+   * could not be determined (key present but unparseable, vault.yaml
+   * unreadable, or the store isn't bound to a vault name). The set is then
+   * EMPTY and every predicate here denies: the scoped token sees no notes,
+   * no tags, an all-zero map, and cannot write. Unscoped tokens never get a
+   * TagScopeSet, so they are unaffected.
+   */
+  denyAll = false;
+}
+
+/** Outcome of resolving a vault's private tags for enforcement. */
+export type PrivateTagsResolution = { ok: true; tags: string[] } | { ok: false; reason: string };
+
+const warnedFailClosed = new Set<string>();
+function warnFailClosed(vault: string, reason: string): void {
+  const key = `${vault}\u0000${reason}`;
+  if (warnedFailClosed.has(key)) return;
+  if (warnedFailClosed.size >= 1000) warnedFailClosed.clear();
+  warnedFailClosed.add(key);
+  console.warn(
+    `[vault] private_tags for vault "${vault}" could not be read (${reason}); ` +
+      `failing CLOSED: tag-scoped tokens see no notes in this vault until vault.yaml is fixed. Unscoped tokens are unaffected.`,
+  );
 }
 
 /**
@@ -68,8 +92,18 @@ export async function expandTokenTagScope(
   privateTags?: string[] | null,
 ): Promise<TagScopeSet | null> {
   if (!scoped_tags || scoped_tags.length === 0) return null;
+  let priv: string[];
+  if (privateTags) priv = privateTags;
+  else {
+    const res = resolvePrivateTags(store);
+    if (!res.ok) {
+      const denied = new TagScopeSet();
+      denied.denyAll = true;
+      return denied;
+    }
+    priv = res.tags;
+  }
   const out = new TagScopeSet(await store.expandTagsWithDescendants(scoped_tags));
-  const priv = privateTags ?? readPrivateTags(store);
   if (priv.length > 0) {
     // Exempt = covered by the token itself: in the expanded allowlist, or
     // equal to / under a raw `scoped_tags` entry (string-form sub-tags).
@@ -82,11 +116,73 @@ export async function expandTokenTagScope(
   return out;
 }
 
-/** The vault's configured `private_tags` (vault.yaml), or `[]`. */
-export function readPrivateTags(store: Store): string[] {
+/**
+ * Resolve the vault's configured `private_tags` (vault.yaml) for a store.
+ * Fails CLOSED (`ok: false`, logged once per vault+reason) when the store
+ * isn't bound to a vault name, vault.yaml can't be read, or the
+ * `private_tags` key is present but unparseable. A vault with no vault.yaml
+ * or no `private_tags` key resolves to `[]`.
+ */
+export function resolvePrivateTags(store: Store): PrivateTagsResolution {
   const name = getVaultNameForStore(store);
-  if (!name) return [];
-  return readVaultConfig(name)?.private_tags ?? [];
+  if (!name) {
+    warnFailClosed("(unknown)", "store is not bound to a vault name");
+    return { ok: false, reason: "store is not bound to a vault name" };
+  }
+  const parsed = readPrivateTagsConfig(name);
+  if (parsed.kind === "absent") return { ok: true, tags: [] };
+  if (parsed.kind === "ok") return { ok: true, tags: parsed.tags };
+  warnFailClosed(name, parsed.reason);
+  return { ok: false, reason: parsed.reason };
+}
+
+/** True when `allowed` is a fail-closed scope (see `TagScopeSet.denyAll`). */
+export function scopeDeniesAll(allowed: Set<string> | null): boolean {
+  return allowed instanceof TagScopeSet && allowed.denyAll;
+}
+
+/**
+ * Every tag name currently in use that is denied to this caller by the
+ * vault's private tags (exact private tags, their declared descendants and
+ * string-form sub-tags). Feeds the SQL `excludeTags` of the count surfaces
+ * (vault-info `map`/`stats`, connect-time brief). `[]` when nothing is
+ * private or the caller isn't scoped.
+ */
+export function deniedTagNamesInUse(store: Store, allowed: Set<string> | null): string[] {
+  if (!(allowed instanceof TagScopeSet)) return [];
+  if (allowed.privateTags.size === 0 && allowed.privateRoots.length === 0) return [];
+  const rows = store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[];
+  return rows.map((r) => r.tag_name).filter((t) => tagDeniedByPrivateTags(t, allowed));
+}
+
+/**
+ * The `getVaultStats` filter for a scoped caller. `stats` has always been a
+ * vault-wide aggregate for scoped tokens (pre-#271 behaviour, unchanged
+ * here); vault#766 only subtracts the notes a private tag hides from this
+ * caller. Returns `undefined` (plain vault-wide stats) when unscoped or when
+ * nothing is private; an all-zero filter when the scope failed closed.
+ */
+export function scopedStatsFilter(
+  store: Store,
+  allowed: Set<string> | null,
+): { tagFilter?: string[]; excludeTags?: string[] } | undefined {
+  if (!allowed) return undefined;
+  if (scopeDeniesAll(allowed)) return { tagFilter: [] };
+  const excludeTags = deniedTagNamesInUse(store, allowed);
+  return excludeTags.length > 0 ? { excludeTags } : undefined;
+}
+
+/**
+ * The count-query filter for a scoped caller: the allowlist to count
+ * through, minus notes carrying a denied tag. A fail-closed scope counts
+ * nothing (empty allowlist).
+ */
+export function scopedCountFilter(
+  store: Store,
+  allowed: Set<string> | null,
+): { tagFilter: string[]; excludeTags: string[] } {
+  if (!allowed || scopeDeniesAll(allowed)) return { tagFilter: [], excludeTags: [] };
+  return { tagFilter: [...allowed], excludeTags: deniedTagNamesInUse(store, allowed) };
 }
 
 /**
@@ -97,6 +193,7 @@ export function readPrivateTags(store: Store): string[] {
  */
 export function tagDeniedByPrivateTags(tag: string, allowed: Set<string> | null): boolean {
   if (!(allowed instanceof TagScopeSet)) return false;
+  if (allowed.denyAll) return true;
   if (allowed.privateTags.size === 0 && allowed.privateRoots.length === 0) return false;
   if (allowed.privateTags.has(tag)) return true;
   const root = tag.split("/")[0];
@@ -161,6 +258,7 @@ export function noteWithinTagScope(
   rawRoots: string[] | null,
 ): boolean {
   if (rawRoots === null) return true;
+  if (scopeDeniesAll(allowed)) return false;
   if (!note.tags || note.tags.length === 0) return false;
   let admitted = false;
   for (const t of note.tags) {
@@ -173,6 +271,20 @@ export function noteWithinTagScope(
     }
   }
   return admitted;
+}
+
+/**
+ * The `DoctorScanOpts.noteTagsInScope` predicate for a scoped doctor run
+ * (vault#766): the same `noteWithinTagScope` every read path uses, so the
+ * private-tags deny applies to doctor's per-note findings too. `undefined`
+ * when unscoped.
+ */
+export function doctorNoteTagsPredicate(
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): ((tags: string[]) => boolean) | undefined {
+  if (rawRoots === null) return undefined;
+  return (tags: string[]) => noteWithinTagScope({ tags } as Note, allowed, rawRoots);
 }
 
 /**
@@ -212,6 +324,7 @@ export function tagVisibleInScope(
   rawRoots: string[] | null,
 ): boolean {
   if (rawRoots === null) return true;
+  if (scopeDeniesAll(allowed)) return false;
   if (allowed && allowed.has(tag)) return true;
   const root = tag.split("/")[0];
   return !!root && rawRoots.includes(root);
@@ -272,6 +385,7 @@ export function tagsWithinScope(
   rawRoots: string[] | null,
 ): boolean {
   if (rawRoots === null) return true;
+  if (scopeDeniesAll(allowed)) return false;
   if (!tags || tags.length === 0) return false;
   for (const t of tags) {
     if (allowed && allowed.has(t)) return true;
