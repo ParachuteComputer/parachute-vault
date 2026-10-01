@@ -701,21 +701,26 @@ export function parsePrivateTags(yaml: string): PrivateTagsParse {
   const keyLines = lines
     .map((l, i) => ({ l, i }))
     .filter(({ l }) => /^private_tags\s*:/.test(l));
-  if (keyLines.length === 0) {
+  let first = keyLines[0];
+  if (!first) {
     // An indented or quoted key is still an attempt to configure privacy.
     let inBlockScalar = false;
-    const odd = lines.find((l) => {
+    const oddIndex = lines.findIndex((l) => {
       // Indented text in a top-level literal/folded scalar is content, not
       // a config key (notably descriptions written by serializeVaultConfig).
       if (inBlockScalar && (l.trim() === "" || /^\s/.test(l))) return false;
       inBlockScalar = /^[^\s:#][^:]*:[ \t]*[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(l);
       return /^\s*["']?private_tags["']?\s*:/.test(l);
     });
-    // This text belongs to its parent; re-emitting it as a standalone block
-    // would duplicate it and corrupt the config on every write.
-    return odd ? { kind: "invalid", reason: "private_tags key is indented or quoted", raw: "" } : { kind: "absent" };
+    if (oddIndex === -1) return { kind: "absent" };
+    const l = lines[oddIndex]!;
+    // Indented keys cannot be safely moved out of their parent. The writer
+    // refuses these; quoted column-0 keys can retain their entire block.
+    if (/^\s/.test(l)) {
+      return { kind: "invalid", reason: "private_tags key is indented or quoted", raw: "" };
+    }
+    first = { l, i: oddIndex };
   }
-  const first = keyLines[0]!;
   // Collect the key's block: the key line plus every following line that is
   // blank, a comment, indented, or a column-0 `- item`.
   const block: string[] = [first.l];
@@ -727,6 +732,7 @@ export function parsePrivateTags(yaml: string): PrivateTagsParse {
   while (block.length > 1 && block[block.length - 1]!.trim() === "") block.pop();
   const raw = block.join("\n");
   const invalid = (reason: string): PrivateTagsParse => ({ kind: "invalid", reason, raw });
+  if (keyLines.length === 0) return invalid("private_tags key is indented or quoted");
   if (keyLines.length > 1) return invalid("private_tags key appears more than once");
 
   const inline = stripYamlComment(first.l.replace(/^private_tags\s*:/, "")).trim();
@@ -1802,7 +1808,17 @@ export function readVaultConfig(name: string): VaultConfig | null {
   return null;
 }
 
+export class UnreadablePrivateTagsError extends Error {
+  constructor() {
+    super("vault.yaml has an unreadable private_tags key; fix it by hand before editing this vault's config");
+    this.name = "UnreadablePrivateTagsError";
+  }
+}
+
 export function writeVaultConfig(config: VaultConfig): void {
+  if (config.private_tags_error && !config.private_tags_raw) {
+    throw new UnreadablePrivateTagsError();
+  }
   const dir = vaultDir(config.name);
   mkdirSync(dir, { recursive: true });
   const configPath = vaultConfigPath(config.name);

@@ -24,12 +24,14 @@ import {
   readPrivateTagsConfig,
   parsePrivateTags,
   vaultConfigPath,
+  hashKey,
 } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache, BunStore } from "./vault-store.ts";
 import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
 import { handleNotes, handleVault, handleDoctor, type TagScopeCtx } from "./routes.ts";
 import { expandTokenTagScope, TagScopeSet } from "./tag-scope.ts";
-import type { AuthResult } from "./auth.ts";
+import { authenticateVaultRequest, type AuthResult } from "./auth.ts";
+import { handleScopedMcp } from "./mcp-http.ts";
 import type { EmbeddingProvider, EmbedInput, EmbedResult, ProviderAvailability } from "../core/src/embedding/provider.ts";
 import { encodeVector, normalize } from "../core/src/embedding/vector-codec.ts";
 
@@ -219,13 +221,84 @@ describe("must-fix 2: private_tags parsing", () => {
     expect(readPrivateTagsConfig(V)).toEqual({ kind: "absent" });
   });
 
-  test("indented or quoted keys outside a block scalar fail closed without raw duplication", () => {
+  test("indented keys refuse relocation; quoted keys retain raw text", () => {
     for (const key of ["  private_tags", "'private_tags'", '"private_tags"']) {
       const yaml = `description: |\n  notes\nname: x\n${key}: [capture]\n`;
       expect(parsePrivateTags(yaml)).toEqual({
-        kind: "invalid", reason: "private_tags key is indented or quoted", raw: "",
+        kind: "invalid", reason: "private_tags key is indented or quoted",
+        raw: key.startsWith(" ") ? "" : `${key}: [capture]`,
       });
     }
+  });
+
+  const unreadableMessage = "vault.yaml has an unreadable private_tags key; fix it by hand before editing this vault's config";
+
+  for (const quote of ['"', "'"]) {
+    for (const value of [" [secret]", "\n  - secret\n  # keep this comment\n  - capture", "\n- secret\n- capture"]) {
+      test(`quoted key survives a normal config update: ${quote} ${JSON.stringify(value)}`, () => {
+        const block = `${quote}private_tags${quote}:${value}`;
+        writeRawConfig(block + "\naudio_retention: keep\n");
+        expect(readPrivateTagsConfig(V).kind).toBe("invalid");
+        const config = readVaultConfig(V)!;
+        expect(config.private_tags_raw).toBe(block);
+        writeVaultConfig({ ...config, description: "edited" });
+        expect(readFileSync(vaultConfigPath(V), "utf-8")).toContain(block + "\n");
+        expect(readPrivateTagsConfig(V).kind).toBe("invalid");
+      });
+    }
+  }
+
+  test("indented key refuses a normal config update without changing disk", () => {
+    writeRawConfig("  private_tags: [secret]");
+    const before = readFileSync(vaultConfigPath(V), "utf-8");
+    expect(readPrivateTagsConfig(V).kind).toBe("invalid");
+    expect(() => writeVaultConfig({ ...readVaultConfig(V)!, description: "edited" })).toThrow(unreadableMessage);
+    expect(readFileSync(vaultConfigPath(V), "utf-8")).toBe(before);
+    expect(readPrivateTagsConfig(V).kind).toBe("invalid");
+  });
+
+  test("MCP description edit returns a tool error for an indented key", async () => {
+    writeRawConfig("  private_tags: [secret]");
+    const before = readFileSync(vaultConfigPath(V), "utf-8");
+    const res = await handleScopedMcp(new Request(`http://localhost/vault/${V}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "vault-info", arguments: { description: "edited" } } }),
+    }), V, authFor(null));
+    const body = await res.json() as any;
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain(unreadableMessage);
+    expect(readFileSync(vaultConfigPath(V), "utf-8")).toBe(before);
+  });
+
+  test("REST description edit returns 409 for an indented key", async () => {
+    writeRawConfig("  private_tags: [secret]");
+    const before = readFileSync(vaultConfigPath(V), "utf-8");
+    const config = readVaultConfig(V)!;
+    const res = await handleVault(new Request(`http://localhost/vault/${V}/api/vault`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ description: "edited" }),
+    }), getVaultStore(V), config, () => writeVaultConfig(config));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: unreadableMessage });
+    expect(readFileSync(vaultConfigPath(V), "utf-8")).toBe(before);
+  });
+
+  test("legacy YAML-key auth returns 409 when its timestamp write is refused", async () => {
+    writeVaultConfig({ ...baseConfig(), api_keys: [{ id: "legacy", label: "test", scope: "read",
+      key_hash: hashKey("legacy-test-key"), created_at: new Date().toISOString() }] });
+    const p = vaultConfigPath(V);
+    const before = readFileSync(p, "utf-8") + "  private_tags: [secret]\n";
+    writeFileSync(p, before);
+    const result = await authenticateVaultRequest(new Request("http://localhost", {
+      headers: { authorization: "Bearer legacy-test-key" },
+    }), readVaultConfig(V)!);
+    expect("error" in result).toBe(true);
+    if (!("error" in result)) throw new Error("expected authentication error");
+    expect(result.error.status).toBe(409);
+    expect(await result.error.json()).toEqual({ error: unreadableMessage });
+    expect(readFileSync(p, "utf-8")).toBe(before);
   });
 
   test("present-but-unreadable shapes are invalid, never []", () => {

@@ -1,3 +1,4 @@
+import { UnreadablePrivateTagsError } from "./config.ts";
 import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHistoryRow, ImportedHistoryUnrecoverableError } from "../core/src/history-import.js";
 /**
  * REST API route handlers for the multi-vault server.
@@ -4384,7 +4385,14 @@ export async function handleVault(
       dirty = true;
     }
 
-    if (dirty && persist) persist();
+    if (dirty && persist) {
+      try { persist(); } catch (err) {
+        if (err instanceof UnreadablePrivateTagsError) {
+          return json({ error: err.message }, 409);
+        }
+        throw err;
+      }
+    }
     return json(vaultResponse(vaultConfig));
   }
 
