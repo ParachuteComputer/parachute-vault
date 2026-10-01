@@ -339,7 +339,7 @@ describe("contract: error taxonomy — #554 (flipped from todo)", () => {
 });
 
 describe("contract: if_updated_at must be an ISO timestamp (vault#739)", () => {
-  const bad: unknown[] = [{}, ["2026-01-01T00:00:00.000Z"], "zzz", "", 12345];
+  const bad: unknown[] = [{}, ["2026-01-01T00:00:00.000Z"], "zzz", "", 12345, "January 1, 2020"];
 
   it("PATCH with a non-ISO if_updated_at returns 400 invalid_request, not 500, and writes nothing", async () => {
     const note = await store.createNote("original", { id: "n1" });

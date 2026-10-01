@@ -295,7 +295,9 @@ export function getNotes(db: Database, ids: string[]): Note[] {
  * doors surfaced as a generic 500. Doors call this first and answer 400.
  */
 export function isValidIfUpdatedAt(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && !Number.isNaN(new Date(value).getTime());
+  return typeof value === "string"
+    && /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(value)
+    && !Number.isNaN(new Date(value).getTime());
 }
 
 export const IF_UPDATED_AT_HINT =
