@@ -289,6 +289,19 @@ export function getNotes(db: Database, ids: string[]): Note[] {
 }
 
 /**
+ * vault#739: `if_updated_at` must be a string that parses to a real date.
+ * Anything else (`{}`, an array, `"zzz"`) used to reach `updateNote`'s
+ * `new Date(v).toISOString()` and throw a RangeError/TypeError, which the
+ * doors surfaced as a generic 500. Doors call this first and answer 400.
+ */
+export function isValidIfUpdatedAt(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && !Number.isNaN(new Date(value).getTime());
+}
+
+export const IF_UPDATED_AT_HINT =
+  "pass the note's updated_at exactly as you read it (an ISO-8601 timestamp, e.g. 2026-07-09T00:00:00.000Z)";
+
+/**
  * Thrown by `updateNote` when an `if_updated_at` precondition does not match
  * the note's current `updated_at`. The SELECT+check+UPDATE happens as one
  * atomic conditional UPDATE so two concurrent callers cannot both pass the
