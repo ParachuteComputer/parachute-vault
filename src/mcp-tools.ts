@@ -554,6 +554,10 @@ function applyTagScopeWrappers(
     return next;
   };
 
+  const isAggregateRow = (r: unknown): boolean =>
+    r !== null && typeof r === "object" && !Array.isArray(r)
+    && "group" in r && "value" in r && !("id" in r) && !("tags" in r);
+
   wrapReadTool(tools, "query-notes", async (orig, params) => {
     const allowed = await getAllowed();
     // Check history visibility before materialisation can throw a content error.
@@ -578,7 +582,10 @@ function applyTagScopeWrappers(
     // tag rollup's `group` values ARE tag names — the co-tag would surface
     // directly as a group. Scrub group NAMES here, the same way every other
     // tag-shaped output on this wrapper is scrubbed.
-    if ((params as any).aggregate) {
+    // vault#738: key on the RESULT shape (rollup rows), not on the params —
+    // any early-return mode core answers before aggregating (e.g. `id`) must
+    // still fall through to the per-note scope filter below.
+    if ((params as any).aggregate && Array.isArray(result) && result.every(isAggregateRow)) {
       const groupBy = (params as any).aggregate?.group_by;
       if (groupBy === "tag" && Array.isArray(result)) {
         return result.filter(
@@ -638,7 +645,10 @@ function applyTagScopeWrappers(
     if (result && typeof result === "object" && "id" in result && "tags" in result) {
       return noteWithinTagScope(result as any, allowed, rawTags)
         ? scrubNoteForScope(result)
-        : { error: "Note not found", error_type: "not_found", id: (result as any).id };
+        // vault#738: echo the caller's own reference, never the resolved
+        // ULID — otherwise a path/title lookup is an existence oracle that
+        // also hands back the out-of-scope note's canonical id.
+        : { error: "Note not found", error_type: "not_found", id: (params as any).id ?? null };
     }
     return result;
   });

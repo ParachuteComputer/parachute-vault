@@ -223,3 +223,44 @@ describe("MCP query-notes aggregate — mutual exclusivity with search/near/curs
     ).rejects.toThrow();
   });
 });
+
+describe("vault#738 — scoped query-notes: no existence oracle, no {id, aggregate} bypass", () => {
+  test("out-of-scope note by path or title answers not_found echoing the caller's reference, never the ULID", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+    const hidden = await store.createNote("# Private Title\nPRIVATE_CONTENT", { path: "private/target", tags: ["work"] });
+    const scopedTool = await queryNotesTool("journal", ["health"]);
+    for (const ref of ["private/target", "Private Title", hidden.id]) {
+      const result: any = await scopedTool.execute({ id: ref });
+      expect(result).toEqual({ error: "Note not found", error_type: "not_found", id: ref });
+      if (ref !== hidden.id) expect(JSON.stringify(result)).not.toContain(hidden.id);
+    }
+    // A name that resolves to nothing answers the same shape — indistinguishable.
+    const miss: any = await scopedTool.execute({ id: "private/nothing-here" });
+    expect(miss).toEqual({ error: "Note not found", error_type: "not_found", id: "private/nothing-here" });
+  });
+
+  test("{id, aggregate} is refused for scoped and unscoped sessions alike, and never returns the note", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+    const hidden = await store.createNote("PRIVATE_CONTENT", { path: "private/agg", tags: ["work"] });
+    for (const scope of [["health"], null]) {
+      const tool = await queryNotesTool("journal", scope);
+      let caught: any;
+      let result: unknown;
+      try { result = await tool.execute({ id: hidden.id, aggregate: { op: "count" } }); } catch (e) { caught = e; }
+      expect(result).toBeUndefined();
+      expect(caught?.error_type).toBe("invalid_query");
+      expect(caught?.field).toBe("aggregate");
+    }
+  });
+
+  test("in-scope note by path still resolves for a scoped session (control)", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+    const visible = await store.createNote("ok", { path: "health/visible", tags: ["health"] });
+    const scopedTool = await queryNotesTool("journal", ["health"]);
+    const result: any = await scopedTool.execute({ id: "health/visible" });
+    expect(result.id).toBe(visible.id);
+  });
+});

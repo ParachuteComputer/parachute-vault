@@ -718,6 +718,15 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         }
 
         // --- Single note by ID/path ---
+        // vault#738: `id` returns early below, so `{id, aggregate}` used to
+        // answer the single note while the scoped wrapper treated the result
+        // as a rollup and skipped its scope filter. Refuse the combination
+        // loudly, the same way `versions` refuses `id`.
+        if (params.id && params.aggregate !== undefined) {
+          throw new QueryError(`aggregate is incompatible with id — a rollup has no single note.`, "INVALID_QUERY", {
+            error_type: "invalid_query", field: "aggregate", hint: "drop `id` when using `aggregate`",
+          });
+        }
         if (params.id) {
           const note = resolveNote(db, params.id as string);
           if (!note) return { error: "Note not found", error_type: "not_found", id: params.id };
