@@ -157,6 +157,25 @@ is not broken. Unscoped SQL and responses remain unchanged.
 
 **Tag string is the authority.** A note's `note_tags` rows are what the auth check evaluates against. The `tags` row carries the schema (description, fields, relationships, parent_names) but doesn't gate the auth check directly. A tag string `#health/food` on a note participates in scope evaluation regardless of whether `health/food` has a `tags.parent_names` entry pointing at `health` (the string-form `/`-prefix hierarchy is sufficient — see §Storage details mechanism 2).
 
+## Private tags (deny wins) — hub door only
+
+> **Door status: enforced by the bun vault behind the hub only.** The hosted cloud door (parachute-cloud) honors `scoped_tags` but does **not** yet implement `private_tags`. The same scoped token can see more through cloud than through the hub. Until cloud implements or refuses the key ([vault#768](https://github.com/ParachuteComputer/parachute-vault/issues/768)), do not rely on `private_tags` for a vault served through cloud.
+
+`scoped_tags` is an allow-list with any-match: a note carrying an allowed tag is visible even if it also carries a private one. `private_tags` in `vault.yaml` adds a vault-level deny side ([vault#766](https://github.com/ParachuteComputer/parachute-vault/issues/766), [#767](https://github.com/ParachuteComputer/parachute-vault/pull/767), [#769](https://github.com/ParachuteComputer/parachute-vault/pull/769)):
+
+```yaml
+private_tags:
+  - capture
+  - transcript
+```
+
+- A tag-scoped token cannot see a note carrying a private tag (or a descendant of one, by declared hierarchy or by `/` prefix) **unless its own `scoped_tags` names that tag or an ancestor of it**. Deny wins over the allow-list otherwise.
+- It applies on every read path that already runs `noteWithinTagScope` (list, search, semantic, get, `near`, `expand_links`, aggregate, versions, find-path, attachments), and `list-tags` counts / `vault-info` map and stats subtract the hidden notes.
+- **Fail closed.** If the key is present but can't be read or parsed, a scoped token sees nothing in that vault (and a warning is logged). Unscoped tokens are never affected.
+- A scoped `doctor` run applies the same deny, so its findings never describe a hidden note. (A doctor finding for notes that carry both a private tag and a shareable one, proposed in #766, is not built yet.)
+
+Implementation reference: `src/tag-scope.ts` (`TagScopeSet.privateTags`, `tagDeniedByPrivateTags`, `noteWithinTagScope`).
+
 ## Lifecycle
 
 **Tag rename cascades** (Aaron's directive 2026-05-02). When operator runs `POST /api/tags/<old_name>/rename` with `{ new_name: <new_name> }`:
