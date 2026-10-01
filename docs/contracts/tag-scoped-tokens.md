@@ -169,9 +169,9 @@ private_tags:
   - transcript
 ```
 
-- A tag-scoped token cannot see a note carrying a private tag (or a descendant of one, by declared hierarchy or by `/` prefix) **unless its own `scoped_tags` names that tag or an ancestor of it**. Deny wins over the allow-list otherwise.
+- A tag-scoped token cannot see a note carrying a configured private tag or a descendant expanded through the declared hierarchy, unless that tag is covered by its own `scoped_tags` allowlist. Deny wins otherwise. The undeclared `/`-prefix fallback is currently narrower: it only checks the note tag's first path segment against the configured private tags. Use root-form private tags (e.g. `capture`), and explicitly declare descendant tags and their parent hierarchy; do not assume an undeclared nested private tag such as `capture/voice` protects `capture/voice/raw`, or that an undeclared nested allowlist exempts deeper tags.
 - It applies on every read path that already runs `noteWithinTagScope` (list, search, semantic, get, `near`, `expand_links`, aggregate, versions, find-path, attachments), and `list-tags` counts / `vault-info` map and stats subtract the hidden notes.
-- **Fail closed.** If the key is present but can't be read or parsed, a scoped token sees nothing in that vault (and a warning is logged). Unscoped tokens are never affected.
+- **Fail closed.** If configuration is unreadable, the key is present but cannot be parsed, or the store is not bound to a vault name, a scoped token sees nothing in that vault (and a warning is logged). A readable configuration without the key has no private-tag deny side. Unscoped tokens are never affected.
 - A scoped `doctor` run applies the same deny, so its findings never describe a hidden note. (A doctor finding for notes that carry both a private tag and a shareable one, proposed in #766, is not built yet.)
 
 Implementation reference: `src/tag-scope.ts` (`TagScopeSet.privateTags`, `tagDeniedByPrivateTags`, `noteWithinTagScope`).
