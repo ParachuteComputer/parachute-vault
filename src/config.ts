@@ -703,8 +703,17 @@ export function parsePrivateTags(yaml: string): PrivateTagsParse {
     .filter(({ l }) => /^private_tags\s*:/.test(l));
   if (keyLines.length === 0) {
     // An indented or quoted key is still an attempt to configure privacy.
-    const odd = lines.find((l) => /^\s*["']?private_tags["']?\s*:/.test(l));
-    return odd ? { kind: "invalid", reason: "private_tags key is indented or quoted", raw: odd } : { kind: "absent" };
+    let inBlockScalar = false;
+    const odd = lines.find((l) => {
+      // Indented text in a top-level literal/folded scalar is content, not
+      // a config key (notably descriptions written by serializeVaultConfig).
+      if (inBlockScalar && (l.trim() === "" || /^\s/.test(l))) return false;
+      inBlockScalar = /^[^\s:#][^:]*:[ \t]*[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(l);
+      return /^\s*["']?private_tags["']?\s*:/.test(l);
+    });
+    // This text belongs to its parent; re-emitting it as a standalone block
+    // would duplicate it and corrupt the config on every write.
+    return odd ? { kind: "invalid", reason: "private_tags key is indented or quoted", raw: "" } : { kind: "absent" };
   }
   const first = keyLines[0]!;
   // Collect the key's block: the key line plus every following line that is

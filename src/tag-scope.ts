@@ -67,6 +67,7 @@ const warnedFailClosed = new Set<string>();
 function warnFailClosed(vault: string, reason: string): void {
   const key = `${vault}\u0000${reason}`;
   if (warnedFailClosed.has(key)) return;
+  if (warnedFailClosed.size >= 1000) warnedFailClosed.clear();
   warnedFailClosed.add(key);
   console.warn(
     `[vault] private_tags for vault "${vault}" could not be read (${reason}); ` +

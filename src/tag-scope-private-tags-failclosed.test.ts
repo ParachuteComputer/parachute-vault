@@ -15,12 +15,13 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, rmSync, existsSync, writeFileSync } from "fs";
+import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
   writeVaultConfig,
   readVaultConfig,
+  readPrivateTagsConfig,
   parsePrivateTags,
   vaultConfigPath,
 } from "./config.ts";
@@ -193,6 +194,38 @@ describe("must-fix 2: private_tags parsing", () => {
     });
     expect(ok("private_tags:\n- capture\n- capture/voice\nname: x\n")).toEqual({ kind: "ok", tags: ["capture", "capture/voice"] });
     expect(ok("private_tags: []\n")).toEqual({ kind: "ok", tags: [] });
+  });
+
+  test("private_tags text inside top-level block scalars is not a key", () => {
+    for (const key of ["description", "instructions"]) {
+      for (const style of ["|", ">", "|-", ">+", "|2", ">2- # comment"]) {
+        const yaml = `${key}: ${style}\n  notes\n\n  private_tags: [x]\n  'private_tags': [y]\nname: x\n`;
+        expect(parsePrivateTags(yaml)).toEqual({ kind: "absent" });
+        expect(parsePrivateTags(yaml + "private_tags: [real]\n")).toEqual({ kind: "ok", tags: ["real"] });
+      }
+    }
+  });
+
+  test("description containing private_tags round-trips without stray lines", () => {
+    writeVaultConfig({ ...baseConfig(), description: "notes\nprivate_tags: [x]" });
+    expect(readPrivateTagsConfig(V)).toEqual({ kind: "absent" });
+    const config = readVaultConfig(V)!;
+    expect(config.private_tags_raw).toBeUndefined();
+    writeVaultConfig({ ...config, audio_retention: "keep" });
+    const first = readFileSync(vaultConfigPath(V), "utf-8");
+    writeVaultConfig(readVaultConfig(V)!);
+    expect(readFileSync(vaultConfigPath(V), "utf-8")).toBe(first);
+    expect(first.match(/private_tags:/g)).toHaveLength(1);
+    expect(readPrivateTagsConfig(V)).toEqual({ kind: "absent" });
+  });
+
+  test("indented or quoted keys outside a block scalar fail closed without raw duplication", () => {
+    for (const key of ["  private_tags", "'private_tags'", '"private_tags"']) {
+      const yaml = `description: |\n  notes\nname: x\n${key}: [capture]\n`;
+      expect(parsePrivateTags(yaml)).toEqual({
+        kind: "invalid", reason: "private_tags key is indented or quoted", raw: "",
+      });
+    }
   });
 
   test("present-but-unreadable shapes are invalid, never []", () => {
