@@ -7,7 +7,7 @@ import { historyImportRecoveryPath, readHistoryMirrorPhase } from "./mirror-conf
 import { selfRegister } from "./self-register.ts";
 import pkg from "../package.json";
 
-export const RENAME_HELP = `Usage: parachute-vault rename <old> <new> [--yes]
+export const RENAME_HELP = `Usage: parachute-vault rename <old> <new> [--yes] [--json]
 Without --yes, preview only. Stop the vault server before confirming; the hub
 stops/restarts the vault module around this call, just as for remove.
 Finish or cancel an unfinished history import before renaming.
@@ -64,12 +64,56 @@ export function renameVault(old: string, requested: string, yes: boolean, deps: 
   let moved = false;
   let db: Database | undefined;
   const changedGlobals = new Set<string>();
-  // Replace only references to the moved root or a vault route, with a boundary
-  // so renaming "work" never changes "workshop". External destinations stay put.
   const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rewrite = (s: string) => s
-    .replace(new RegExp(`${escape(from)}(?=/|["'\\s]|$)`, "g"), to)
-    .replace(new RegExp(`/vault/${escape(old)}(?=/|["'\\s?#]|$)`, "g"), `/vault/${name}`);
+  const rewritePath = (value: string) => value.replace(new RegExp(`^${escape(from)}(?=/|$)`), to);
+  const hubOrigins = new Set<string>();
+  for (const origin of [process.env.PARACHUTE_HUB_ORIGIN, ...(process.env.PARACHUTE_HUB_ORIGINS ?? "").split(",")]) {
+    try { if (origin?.trim()) hubOrigins.add(new URL(origin.trim()).origin); } catch { /* Ignore invalid origins. */ }
+  }
+  const rewriteUrl = (value: string) => value.replace(
+    new RegExp(`^(https?://[^/\\s\"'?#]+)/vault/${escape(old)}(?=/|[\"'\\s?#]|$)`),
+    (match, authority: string) => {
+      try {
+        const url = new URL(authority);
+        return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || hubOrigins.has(url.origin)
+          ? `${authority}/vault/${name}` : match;
+      } catch { return match; }
+    },
+  );
+  // Rewrite scalar values, not arbitrary substrings of serialized files. Keep
+  // comments, unknown keys, and line endings instead of reserializing the file.
+  const rewriteValues = (text: string, routes = false) => {
+    const rewrite = (value: string) => routes ? rewriteUrl(rewritePath(value)) : rewritePath(value);
+    return text.replace(
+      /"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|(^[ \t]*(?:[A-Za-z_][\w.-]*[=:][ \t]*|-[ \t]+(?:[A-Za-z_][\w.-]*:[ \t]*)?))([^"' \t\r\n][^\r\n]*)/gm,
+      (token, prefix: string | undefined, plain: string | undefined) => {
+        if (prefix !== undefined && plain !== undefined) {
+          const [, value, suffix] = /^(.*?)([ \t]+#.*|[ \t]*)$/.exec(plain)!;
+          return prefix + rewrite(value!) + suffix;
+        }
+        if (token.startsWith('"')) {
+          try {
+            const value = JSON.parse(token) as string;
+            const updated = rewrite(value);
+            return updated === value ? token : JSON.stringify(updated);
+          } catch { return token; }
+        }
+        const value = token.slice(1, -1).replace(/''/g, "'");
+        const updated = rewrite(value);
+        return updated === value ? token : `'${updated.replace(/'/g, "''")}'`;
+      },
+    );
+  };
+  const rewriteAction = (text: string) => {
+    try {
+      const action = JSON.parse(text);
+      if (typeof action?.webhook !== "string") return text;
+      const webhook = rewriteUrl(action.webhook);
+      if (webhook === action.webhook) return text;
+      action.webhook = webhook;
+      return JSON.stringify(action);
+    } catch { return text; }
+  };
   try {
     db = new Database(vaultDbPath(old), { readonly: true });
     db.prepare("VACUUM INTO ?").run(join(backup, "vault.db"));
@@ -81,7 +125,7 @@ export function renameVault(old: string, requested: string, yes: boolean, deps: 
     renameSync(from, to); moved = true;
     (deps.writeConfig ?? writeVaultConfig)({ ...config, name }, originals.get("vault.yaml")!.toString());
     for (const [file, body] of originals) {
-      if (file !== "vault.yaml") writeFileSync(join(to, file), rewrite(body.toString()));
+      if (file !== "vault.yaml") writeFileSync(join(to, file), rewriteValues(body.toString()));
     }
     db = new Database(vaultDbPath(name));
     db.exec("BEGIN IMMEDIATE");
@@ -90,6 +134,7 @@ export function renameVault(old: string, requested: string, yes: boolean, deps: 
     for (const table of ["tokens", "oauth_codes", "mcp_mint_ledger"]) {
       const columns = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
       if (columns.some(c => c.name === "vault_name")) db.query(`UPDATE ${table} SET vault_name=? WHERE vault_name=?`).run(name, old);
+      // oauth_codes.scope (singular, vestigial) is intentionally not rewritten.
       if (columns.some(c => c.name === "scopes")) {
         const rows = db.query(`SELECT rowid, scopes FROM ${table} WHERE scopes IS NOT NULL`).all() as { rowid: number; scopes: string }[];
         for (const row of rows) {
@@ -101,13 +146,16 @@ export function renameVault(old: string, requested: string, yes: boolean, deps: 
     for (const [table, column] of [["attachments", "path"], ["triggers", "action"]] as const) {
       if (!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) continue;
       const rows = db.query(`SELECT rowid, ${column} AS value FROM ${table}`).all() as { rowid: number; value: string }[];
-      for (const row of rows) if (rewrite(row.value) !== row.value) db.query(`UPDATE ${table} SET ${column}=? WHERE rowid=?`).run(rewrite(row.value), row.rowid);
+      for (const row of rows) {
+        const updated = table === "attachments" ? rewritePath(row.value) : rewriteAction(row.value);
+        if (updated !== row.value) db.query(`UPDATE ${table} SET ${column}=? WHERE rowid=?`).run(updated, row.rowid);
+      }
     }
     const global = readGlobalConfig();
     for (const path of globals.slice(0, 2)) {
       const body = snapshots.get(path);
       if (!body) continue;
-      let updated = rewrite(body.toString());
+      let updated = rewriteValues(body.toString(), true);
       // No other global config fields are maps keyed by vault name. Retain
       // unknown keys and legacy mirror config by editing the original YAML.
       if (path === globals[0] && global.default_vault === old) updated = updated.replace(/^default_vault:.*$/m, `default_vault: ${name}`);
@@ -119,7 +167,8 @@ export function renameVault(old: string, requested: string, yes: boolean, deps: 
     }
     changedGlobals.add(globals[2]!);
     const result = (deps.register ?? selfRegister)({ version: pkg.version, log: () => {}, warn: () => {} });
-    if (result.status !== "registered") throw new Error(`Service registration ${result.status}: ${result.reason}`);
+    if (result.status === "failed") throw new Error(`Service registration ${result.status}: ${result.reason}`);
+    if (result.status === "skipped") log(`Warning: service registration skipped: ${result.reason}`);
     db.exec("COMMIT");
     db.close(); db = undefined;
   } catch (error) {
@@ -144,5 +193,6 @@ export function renameVault(old: string, requested: string, yes: boolean, deps: 
     throw new Error(`Rename failed: ${error}. ${failures.length ? `Rollback incomplete: ${failures.join("; ")}` : moved ? "Rolled back." : "Vault not moved."} Backup: ${backup}`);
   }
   log(`Vault "${old}" renamed to "${name}".`);
+  log(`Once the rename is verified, you can delete the backup under .rename-backups/: ${backup}`);
   return backup;
 }

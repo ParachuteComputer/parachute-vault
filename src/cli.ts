@@ -259,9 +259,13 @@ switch (command) {
       console.log(RENAME_HELP);
     } else {
       try {
-        const names = cmdArgs.filter(arg => arg !== "--yes" && arg !== "-y");
+        const names = cmdArgs.filter(arg => arg !== "--yes" && arg !== "-y" && arg !== "--json");
         if (names.length !== 2 || names.some(arg => arg.startsWith("--"))) throw new Error(RENAME_HELP);
-        renameVault(names[0]!, names[1]!, cmdArgs.includes("--yes") || cmdArgs.includes("-y"));
+        const json = cmdArgs.includes("--json");
+        const backup = renameVault(names[0]!, names[1]!, cmdArgs.includes("--yes") || cmdArgs.includes("-y"), {
+          log: json ? console.error : console.log,
+        });
+        if (json && backup) console.log(JSON.stringify({ old: names[0], new: names[1]!.trim().toLowerCase(), backup_path: backup }));
       } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));
         process.exitCode = 1;
@@ -5144,7 +5148,7 @@ Vaults:
                                            note.
   parachute-vault list                     List all vaults
   parachute-vault remove <name> [--yes]    Remove a vault
-  parachute-vault rename <old> <new> [--yes]  Back up and rename a vault (see rename --help)
+  parachute-vault rename <old> <new> [--yes] [--json]  Back up and rename a vault (see rename --help)
   parachute-vault mcp-install [--mint|--token <t>]
                               [--scope vault:read|vault:write|vault:admin]
                               [--install-scope local|user|project]

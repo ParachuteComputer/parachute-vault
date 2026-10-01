@@ -1827,8 +1827,8 @@ export function writeVaultConfig(config: VaultConfig, nameOnlySource?: string): 
   // Rename changes only identity. Preserve even unknown fields and raw YAML
   // (including private_tags) that this version's serializer cannot round-trip.
   const yaml = nameOnlySource === undefined ? serializeVaultConfig(config)
-    : /^name:.*$/m.test(nameOnlySource)
-      ? nameOnlySource.replace(/^name:.*$/m, `name: ${config.name}`)
+    : /^name:[^\r\n]*/m.test(nameOnlySource)
+      ? nameOnlySource.replace(/^name:[^\r\n]*/m, `name: ${config.name}`)
       : `name: ${config.name}\n${nameOnlySource}`;
   writeFileSync(configPath, yaml);
 }

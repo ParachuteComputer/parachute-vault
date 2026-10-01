@@ -133,6 +133,8 @@ export function dirSize(dirPath: string, fs: UsageFs = realUsageFs): number {
     for (const entry of entries) {
       // Never follow symlinks — neither symlinked files nor symlinked dirs.
       if (entry.isSymbolicLink()) continue;
+      // Offline rename recovery snapshots are not live vault storage.
+      if (entry.isDirectory() && entry.name === ".rename-backups") continue;
       const childPath = join(current, entry.name);
       if (entry.isDirectory()) {
         stack.push(childPath);

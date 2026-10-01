@@ -178,3 +178,95 @@ test("repairs legacy absolute attachment paths without changing relative paths",
   try { expect(db.query("SELECT path FROM attachments").get()).toEqual({ path: join(assetsDir("after"), "2026/file.txt") }); }
   finally { db.close(); }
 });
+
+for (const old of ["data", "logs"]) {
+  test(`rename ${old} preserves sibling and external paths while rebasing only its moved root`, () => {
+    for (const name of [old, "other"]) {
+      writeVaultConfig({ name, description: "", api_keys: [], created_at: "now" });
+      new Database(vaultDbPath(name)).close();
+    }
+    const from = vaultDir(old), to = vaultDir("fresh");
+    const sibling = join(vaultDir("other"), "backups");
+    const external = `/mnt/x/vault/${old}/snap`;
+    const layout = join(home, "vault", old, "other", "backup");
+    const values = { sibling, external, layout, own: `${from}/backup`, root: from,
+      similar: `${from}x/backup`, prose: `keep ${from}/backup`, spaceSuffix: `${from} suffix`, embedded: `/mnt/prefix${from}/backup` };
+    const yaml = Object.entries(values).map(([key, value]) => `${key}: "${value}"\n`).join("");
+    writeGlobalConfig({ port: 1940, default_vault: old });
+    const globalPath = join(home, "vault/config.yaml");
+    writeFileSync(globalPath, readFileSync(globalPath, "utf8") + yaml);
+    writeFileSync(join(from, "mirror-config.yaml"), yaml);
+    writeFileSync(join(from, "history-mirror-state.json"), JSON.stringify({ phase: "retired", ...values }));
+    const env = `ASSETS_DIR=/srv/vault/${old}\nLOGS_DIR=${join(home, "vault/logs")}\nOWN=${from}/assets\n`;
+    writeFileSync(join(home, "vault/.env"), env);
+    renameVault(old, "fresh", true, quiet);
+    const expected = yaml.replace(`"${from}/backup"`, `"${to}/backup"`).replace(`"${from}"`, `"${to}"`);
+    expect(readFileSync(globalPath, "utf8")).toContain(expected);
+    expect(readFileSync(join(to, "mirror-config.yaml"), "utf8")).toBe(expected);
+    expect(JSON.parse(readFileSync(join(to, "history-mirror-state.json"), "utf8"))).toEqual({
+      phase: "retired", ...values, own: `${to}/backup`, root: to,
+    });
+    expect(readFileSync(join(home, "vault/.env"), "utf8")).toBe(env.replace(`OWN=${from}/`, `OWN=${to}/`));
+    expect(existsSync(vaultDbPath("other"))).toBe(true);
+  });
+}
+
+test("routes rebase only webhook URLs and URL config values on local or configured origins", async () => {
+  const f = await fixture();
+  const saved = process.env.PARACHUTE_HUB_ORIGIN;
+  process.env.PARACHUTE_HUB_ORIGIN = "https://hub.example";
+  const urls = [
+    "https://elsewhere.example/vault/before/api", "http://localhost/vault/before?x=1",
+    "http://127.0.0.1:1940/vault/before#fragment", "http://[::1]:1940/vault/before",
+    "https://hub.example/vault/before/api", "https://hub.example:444/vault/before/api",
+    "http://localhost/vault/beforex/api", "/srv/vault/before", "/srv/http://localhost/vault/before",
+    "http://localhost/other?next=http://localhost/vault/before",
+  ];
+  const expected = urls.map((url, i) => [1, 2, 3, 4].includes(i) ? url.replace("/vault/before", "/vault/after") : url);
+  try {
+    f.db.exec("DELETE FROM triggers");
+    urls.forEach((webhook, i) => f.db.query("INSERT INTO triggers(name,action,created_at,updated_at) VALUES(?,?,'now','now')")
+      .run(`t${i}`, JSON.stringify({ webhook, description: "http://localhost/vault/before" })));
+    f.db.close();
+    const configPath = join(home, "vault/config.yaml");
+    const yaml = urls.map((url, i) => `url${i}: "${url}"\n`).join("");
+    writeFileSync(configPath, readFileSync(configPath, "utf8") + yaml);
+    writeFileSync(join(vaultDir("before"), "history-mirror-state.json"), JSON.stringify({ phase: "retired", url: urls[1] }));
+    renameVault("before", "after", true, quiet);
+    const db = new Database(vaultDbPath("after"));
+    try {
+      const actions = db.query("SELECT action FROM triggers ORDER BY rowid").all() as { action: string }[];
+      expect(actions.map(row => JSON.parse(row.action).webhook)).toEqual(expected);
+      expect(actions.every(row => JSON.parse(row.action).description === "http://localhost/vault/before")).toBe(true);
+    } finally { db.close(); }
+    expected.forEach((url, i) => expect(readFileSync(configPath, "utf8")).toContain(`url${i}: "${url}"`));
+    expect(JSON.parse(readFileSync(join(vaultDir("after"), "history-mirror-state.json"), "utf8")).url).toBe(urls[1]);
+  } finally {
+    if (saved === undefined) delete process.env.PARACHUTE_HUB_ORIGIN; else process.env.PARACHUTE_HUB_ORIGIN = saved;
+  }
+});
+
+test("missing module manifest succeeds with a warning and cleanup reminder", async () => {
+  const f = await fixture(); f.db.close();
+  const messages: string[] = [];
+  const backup = renameVault("before", "after", true, {
+    log: message => messages.push(message), register: () => ({ status: "skipped", reason: "manifest absent" }),
+  });
+  expect(backup).toBeDefined();
+  expect(existsSync(vaultDbPath("after"))).toBe(true);
+  expect(messages.join("\n")).toContain("Warning: service registration skipped: manifest absent");
+  expect(messages.join("\n")).toContain("you can delete the backup under .rename-backups/");
+});
+
+test("--json emits one success object on stdout and human output on stderr", async () => {
+  const f = await fixture(); f.db.close();
+  const result = await cli("before", "after", "--yes", "--json");
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout.trim().split("\n")).toHaveLength(1);
+  const output = JSON.parse(result.stdout);
+  expect(output).toEqual({ old: "before", new: "after", backup_path: expect.any(String) });
+  expect(existsSync(join(output.backup_path, "vault.db"))).toBe(true);
+  expect(result.stderr).toContain(`Backup: ${output.backup_path}`);
+  expect(result.stderr).toContain('renamed to "after"');
+  expect(result.stderr).toContain("you can delete the backup");
+});
