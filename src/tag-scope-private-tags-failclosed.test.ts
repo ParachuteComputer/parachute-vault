@@ -208,6 +208,50 @@ describe("must-fix 2: private_tags parsing", () => {
     }
   });
 
+  for (const keys of [
+    ["private_tags", '"private_tags"'],
+    ['"private_tags"', "private_tags"],
+    ["private_tags", "'private_tags'"],
+    ["'private_tags'", "private_tags"],
+    ["private_tags", "private_tags"],
+    ['"private_tags"', "'private_tags'"],
+  ]) {
+    for (const values of [[" [a]", " [b]"], ["\n  - a\n  # preserve comment", "\n- b"]]) {
+      test(`duplicate keys survive repeated config writes: ${keys.join(" + ")} ${JSON.stringify(values)}`, () => {
+        const blocks = keys.map((key, i) => `${key}:${values[i]}`);
+        const raw = blocks.join("\n");
+        const expected = { kind: "invalid", reason: "private_tags key appears more than once", raw };
+        // Separate the blocks with another field to check collection in file order.
+        writeRawConfig(blocks.join("\naudio_retention: keep\n"));
+        expect(readPrivateTagsConfig(V)).toEqual(expected);
+        expect(readVaultConfig(V)!.private_tags_raw).toBe(raw);
+        writeVaultConfig({ ...readVaultConfig(V)!, description: "edited" });
+        const first = readFileSync(vaultConfigPath(V), "utf-8");
+        expect(first).toContain(raw + "\n");
+        expect(parsePrivateTags(first)).toEqual(expected);
+        expect(readPrivateTagsConfig(V)).toEqual(expected);
+        writeVaultConfig({ ...readVaultConfig(V)!, description: "edited" });
+        expect(readFileSync(vaultConfigPath(V), "utf-8")).toBe(first);
+      });
+    }
+  }
+
+  test("nested private_tags is not a duplicate of a column-0 key", () => {
+    for (const yaml of [
+      "private_tags: [a]\nfoo:\n  private_tags: [b]\n",
+      "foo:\n  private_tags: [b]\nprivate_tags: [a]\n",
+    ]) {
+      expect(parsePrivateTags(yaml)).toEqual({ kind: "ok", tags: ["a"] });
+    }
+    writeRawConfig("foo:\n  private_tags: [b]\n");
+    expect(readPrivateTagsConfig(V)).toEqual({
+      kind: "invalid", reason: "private_tags key is indented or quoted", raw: "",
+    });
+    const before = readFileSync(vaultConfigPath(V), "utf-8");
+    expect(() => writeVaultConfig({ ...readVaultConfig(V)!, description: "edited" })).toThrow(unreadableMessage);
+    expect(readFileSync(vaultConfigPath(V), "utf-8")).toBe(before);
+  });
+
   test("description containing private_tags round-trips without stray lines", () => {
     writeVaultConfig({ ...baseConfig(), description: "notes\nprivate_tags: [x]" });
     expect(readPrivateTagsConfig(V)).toEqual({ kind: "absent" });

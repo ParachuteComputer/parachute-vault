@@ -698,42 +698,41 @@ function stripYamlComment(s: string): string {
  */
 export function parsePrivateTags(yaml: string): PrivateTagsParse {
   const lines = yaml.split(/\r?\n/);
-  const keyLines = lines
-    .map((l, i) => ({ l, i }))
-    .filter(({ l }) => /^private_tags\s*:/.test(l));
-  let first = keyLines[0];
+  const keyLines: { l: string; i: number }[] = [];
+  let oddIndex = -1;
+  let inBlockScalar = false;
+  for (const [i, l] of lines.entries()) {
+    // Indented text in a top-level literal/folded scalar is content, not
+    // a config key (notably descriptions written by serializeVaultConfig).
+    if (inBlockScalar && (l.trim() === "" || /^\s/.test(l))) continue;
+    inBlockScalar = /^[^\s:#][^:]*:[ \t]*[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(l);
+    if (/^(?:private_tags|"private_tags"|'private_tags')\s*:/.test(l)) keyLines.push({ l, i });
+    if (oddIndex === -1 && /^\s*["']?private_tags["']?\s*:/.test(l)) oddIndex = i;
+  }
+  const first = keyLines[0];
   if (!first) {
-    // An indented or quoted key is still an attempt to configure privacy.
-    let inBlockScalar = false;
-    const oddIndex = lines.findIndex((l) => {
-      // Indented text in a top-level literal/folded scalar is content, not
-      // a config key (notably descriptions written by serializeVaultConfig).
-      if (inBlockScalar && (l.trim() === "" || /^\s/.test(l))) return false;
-      inBlockScalar = /^[^\s:#][^:]*:[ \t]*[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(l);
-      return /^\s*["']?private_tags["']?\s*:/.test(l);
-    });
     if (oddIndex === -1) return { kind: "absent" };
-    const l = lines[oddIndex]!;
     // Indented keys cannot be safely moved out of their parent. The writer
-    // refuses these; quoted column-0 keys can retain their entire block.
-    if (/^\s/.test(l)) {
-      return { kind: "invalid", reason: "private_tags key is indented or quoted", raw: "" };
+    // refuses these; nested keys are ignored when a column-0 key exists.
+    return { kind: "invalid", reason: "private_tags key is indented or quoted", raw: "" };
+  }
+  // Preserve every key's block in file order so a config write cannot turn
+  // duplicate keys into a single valid key and fail open.
+  const blocks = keyLines.map(({ l, i }) => {
+    const block: string[] = [l];
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = lines[j]!;
+      if (next.trim() === "" || /^\s/.test(next) || /^-(\s|$)/.test(next) || /^#/.test(next)) block.push(next);
+      else break;
     }
-    first = { l, i: oddIndex };
-  }
-  // Collect the key's block: the key line plus every following line that is
-  // blank, a comment, indented, or a column-0 `- item`.
-  const block: string[] = [first.l];
-  for (let i = first.i + 1; i < lines.length; i++) {
-    const l = lines[i]!;
-    if (l.trim() === "" || /^\s/.test(l) || /^-(\s|$)/.test(l) || /^#/.test(l)) block.push(l);
-    else break;
-  }
-  while (block.length > 1 && block[block.length - 1]!.trim() === "") block.pop();
-  const raw = block.join("\n");
+    while (block.length > 1 && block[block.length - 1]!.trim() === "") block.pop();
+    return block;
+  });
+  const block = blocks[0]!;
+  const raw = blocks.map((b) => b.join("\n")).join("\n");
   const invalid = (reason: string): PrivateTagsParse => ({ kind: "invalid", reason, raw });
-  if (keyLines.length === 0) return invalid("private_tags key is indented or quoted");
   if (keyLines.length > 1) return invalid("private_tags key appears more than once");
+  if (!/^private_tags\s*:/.test(first.l)) return invalid("private_tags key is indented or quoted");
 
   const inline = stripYamlComment(first.l.replace(/^private_tags\s*:/, "")).trim();
   const rest = block.slice(1).map((l) => stripYamlComment(l)).filter((l) => l.trim() !== "");
