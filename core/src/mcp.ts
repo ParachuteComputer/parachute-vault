@@ -1802,6 +1802,20 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             }))
           : [params];
 
+        // vault#739: a non-ISO `if_updated_at` used to throw a RangeError
+        // deep in updateNote (generic 500). Reject it up front, before any
+        // item is written.
+        for (const item of items) {
+          if (item && item.if_updated_at !== undefined && !noteOps.isValidIfUpdatedAt(item.if_updated_at)) {
+            throw new QueryError("if_updated_at must be an ISO-8601 timestamp string", "INVALID_REQUEST", {
+              error_type: "invalid_request",
+              field: "if_updated_at",
+              got: item.if_updated_at,
+              hint: noteOps.IF_UPDATED_AT_HINT,
+            });
+          }
+        }
+
         if (items.length > MAX_BATCH_SIZE) {
           throw new BatchTooLargeError(items.length);
         }

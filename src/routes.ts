@@ -50,7 +50,7 @@ import {
   narrowLinkWarningsForVisibility,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
-import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap, isValidIfUpdatedAt, IF_UPDATED_AT_HINT } from "../core/src/notes.ts";
 import { normalizePath } from "../core/src/paths.ts";
 import {
   parseContentRange,
@@ -1385,6 +1385,19 @@ function ambiguousPathResponse(e: any): Response | null {
       message: e.message,
     },
     409,
+  );
+}
+
+/** vault#739: 400 for an `if_updated_at` that isn't an ISO timestamp (was a 500). */
+function invalidIfUpdatedAtResponse(): Response {
+  return json(
+    {
+      error: "if_updated_at must be an ISO-8601 timestamp string",
+      error_type: "invalid_request",
+      field: "if_updated_at",
+      hint: IF_UPDATED_AT_HINT,
+    },
+    400,
   );
 }
 
@@ -2981,6 +2994,7 @@ async function handleNotesInner(
       const parsed = await parseJsonBody(req);
       if (!parsed.ok) return parsed.response;
       const body = parsed.body;
+      if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
       let selector: ReturnType<typeof parseHistorySelector>;
       try { selector = parseHistorySelector(body); } catch {
         return json({ error: "Invalid history selector", error_type: "invalid_request" }, 400);
@@ -3087,6 +3101,7 @@ async function handleNotesInner(
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
       const body = parsedBody.body as any;
+      if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
       const note = await resolveNote(store, idOrPath);
       if (!note) {
         // vault#309 — `if_missing: "create"` turns this PATCH into a
