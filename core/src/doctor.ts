@@ -154,6 +154,14 @@ export interface DoctorScanOpts {
    * each finding type is scoped.
    */
   allowedTags?: Set<string> | null;
+  /**
+   * Per-note visibility predicate over a note's FULL tag set (vault#766).
+   * The server layer builds it from `noteWithinTagScope`, so a note hidden
+   * by a private co-tag (deny wins) is out of scope here too. When omitted,
+   * a scoped run falls back to "any tag in `allowedTags`" (core callers
+   * without a server-layer scope). Ignored when `allowedTags` is null.
+   */
+  noteTagsInScope?: (tags: string[]) => boolean;
   deep?: boolean;
   history_after?: string;
   history_max_blobs?: number;
@@ -165,21 +173,27 @@ const MAX_EXEMPLARS = 5;
 
 /**
  * Build a per-note in-scope predicate for a tag-scoped doctor run (vault#552
- * auth fold). A note is in-scope iff at least one of its tags is in
- * `allowedTags`; an unscoped run (`allowedTags === null`) treats every note
+ * auth fold). A note is in-scope per `noteTagsInScope` (the server's
+ * `noteWithinTagScope`, which applies the private-tags deny — vault#766),
+ * else iff at least one of its tags is in `allowedTags`; an unscoped run (`allowedTags === null`) treats every note
  * as in-scope. Caches each note's tag lookup so repeated checks across scans
  * cost one query per note. Shared by the mixed-type-indexed-field and
  * dead-tag-metadata scans, both of which query notes vault-wide and must NOT
  * surface an out-of-scope note id (or count, or exemplar) to a scoped caller.
  */
-function makeNoteInScope(db: Database, allowedTags: Set<string> | null): (id: string) => boolean {
+function makeNoteInScope(
+  db: Database,
+  allowedTags: Set<string> | null,
+  noteTagsInScope?: (tags: string[]) => boolean,
+): (id: string) => boolean {
   if (!allowedTags) return () => true;
+  const admit = noteTagsInScope ?? ((tags: string[]) => tags.some((t) => allowedTags.has(t)));
   const cache = new Map<string, boolean>();
   return (id: string): boolean => {
     const cached = cache.get(id);
     if (cached !== undefined) return cached;
     const tags = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(id) as { tag_name: string }[]).map((r) => r.tag_name);
-    const inScope = tags.some((t) => allowedTags.has(t));
+    const inScope = admit(tags);
     cache.set(id, inScope);
     return inScope;
   };
@@ -191,9 +205,9 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
   const findings: DoctorFinding[] = [
     ...scanDanglingParentNames(db, allowedTags),
     ...scanParentNamesCycles(db, allowedTags),
-    ...scanMixedTypeIndexedFields(db, allowedTags),
+    ...scanMixedTypeIndexedFields(db, allowedTags, opts?.noteTagsInScope),
     ...scanOrphanedIndexedFieldDeclarers(db, allowedTags),
-    ...scanDeadTagMetadataReferences(db, allowedTags),
+    ...scanDeadTagMetadataReferences(db, allowedTags, opts?.noteTagsInScope),
     ...(allowedTags === null ? scanDeletedNoteHistory(db) : []),
     ...(allowedTags === null ? scanHistoryStorage(db) : []),
     ...(allowedTags === null ? scanDeltaOrphans(db) : []),
@@ -321,9 +335,13 @@ export function findMixedTypeIndexedFieldNotes(
   return rows.filter((r): r is MixedTypeIndexedFieldRow => r.jt !== null && !expected.has(r.jt));
 }
 
-function scanMixedTypeIndexedFields(db: Database, allowedTags: Set<string> | null): DoctorFinding[] {
+function scanMixedTypeIndexedFields(
+  db: Database,
+  allowedTags: Set<string> | null,
+  noteTagsInScope?: (tags: string[]) => boolean,
+): DoctorFinding[] {
   const findings: DoctorFinding[] = [];
-  const noteInScope = makeNoteInScope(db, allowedTags);
+  const noteInScope = makeNoteInScope(db, allowedTags, noteTagsInScope);
   for (const f of listIndexedFields(db)) {
     if (allowedTags && !f.declarerTags.some((t) => allowedTags.has(t))) continue;
 
@@ -386,7 +404,11 @@ function scanOrphanedIndexedFieldDeclarers(db: Database, allowedTags: Set<string
 // E. metadata values equal to a tag name that no longer exists (heuristic)
 // ---------------------------------------------------------------------------
 
-function scanDeadTagMetadataReferences(db: Database, allowedTags: Set<string> | null): DoctorFinding[] {
+function scanDeadTagMetadataReferences(
+  db: Database,
+  allowedTags: Set<string> | null,
+  noteTagsInScope?: (tags: string[]) => boolean,
+): DoctorFinding[] {
   const liveTags = new Set(
     (db.prepare("SELECT name FROM tags").all() as { name: string }[]).map((r) => r.name),
   );
@@ -427,7 +449,7 @@ function scanDeadTagMetadataReferences(db: Database, allowedTags: Set<string> | 
 
   // Tag-scope (vault#552 auth fold): a note is in-scope iff at least one of
   // its tags is in `allowedTags` (unscoped → every note in-scope).
-  const noteInScope = makeNoteInScope(db, allowedTags);
+  const noteInScope = makeNoteInScope(db, allowedTags, noteTagsInScope);
 
   const findings: DoctorFinding[] = [];
   for (const [key, valueMap] of byKey) {

@@ -337,3 +337,65 @@ describe("contract: error taxonomy — #554 (flipped from todo)", () => {
     expect(res.status).toBe(200);
   });
 });
+
+describe("contract: if_updated_at must be an ISO timestamp (vault#739)", () => {
+  const bad: unknown[] = [{}, ["2026-01-01T00:00:00.000Z"], "zzz", "", 12345, "January 1, 2020"];
+
+  it("PATCH with a non-ISO if_updated_at returns 400 invalid_request, not 500, and writes nothing", async () => {
+    const note = await store.createNote("original", { id: "n1" });
+    for (const value of bad) {
+      const res = await patch(note.id, { content: "changed", if_updated_at: value });
+      expect(res.status).toBe(400);
+      const body: any = await res.json();
+      expect(body.error_type).toBe("invalid_request");
+      expect(body.field).toBe("if_updated_at");
+      expect(typeof body.hint).toBe("string");
+    }
+    expect((await store.getNote(note.id))!.content).toBe("original");
+  });
+
+  it("POST /restore with a non-ISO if_updated_at returns 400 invalid_request", async () => {
+    const note = await store.createNote("v0", { id: "n1" });
+    await store.updateNote(note.id, { content: "v1" });
+    for (const value of bad) {
+      const res = await handleNotes(
+        new Request(`${BASE}/notes/${note.id}/restore`, {
+          method: "POST",
+          body: JSON.stringify({ version_ix: 0, if_updated_at: value }),
+        }),
+        store,
+        `/${note.id}/restore`,
+      );
+      expect(res.status).toBe(400);
+      const body: any = await res.json();
+      expect(body.error_type).toBe("invalid_request");
+      expect(body.field).toBe("if_updated_at");
+    }
+    expect((await store.getNote(note.id))!.content).toBe("v1");
+  });
+
+  it("a valid stale if_updated_at still returns 409 conflict (unchanged)", async () => {
+    const note = await store.createNote("original", { id: "n1" });
+    const res = await patch(note.id, { content: "changed", if_updated_at: "2020-01-01" });
+    expect(res.status).toBe(409);
+  });
+
+  it("MCP update-note rejects a non-ISO if_updated_at (single and batch) before writing", async () => {
+    const a = await store.createNote("a", { id: "a1" });
+    const b = await store.createNote("b", { id: "b1" });
+    const updateNote = generateMcpTools(store).find((t) => t.name === "update-note")!;
+    for (const params of [
+      { id: a.id, content: "x", if_updated_at: "zzz" },
+      { notes: [{ id: a.id, content: "x", force: true }, { id: b.id, content: "y", if_updated_at: {} }] },
+      { if_updated_at: ["nope"], notes: [{ id: a.id, content: "x" }] },
+    ]) {
+      let caught: any;
+      try { await updateNote.execute(params as any); } catch (e) { caught = e; }
+      expect(caught?.name).toBe("QueryError");
+      expect(caught.error_type).toBe("invalid_request");
+      expect(caught.field).toBe("if_updated_at");
+    }
+    expect((await store.getNote(a.id))!.content).toBe("a");
+    expect((await store.getNote(b.id))!.content).toBe("b");
+  });
+});

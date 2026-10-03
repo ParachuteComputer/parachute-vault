@@ -8,7 +8,7 @@
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
-import { getNote, getNoteTags, getVaultMap } from "../core/src/notes.ts";
+import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
 import {
@@ -23,6 +23,10 @@ import type { AuthResult } from "./auth.ts";
 import { refineMcpVia } from "./auth.ts";
 import {
   expandTokenTagScope,
+  scrubTagCountsForPrivateTags,
+  scopedCountFilter,
+  scopedStatsFilter,
+  doctorNoteTagsPredicate,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
   scopeQueryTagParam,
@@ -93,7 +97,8 @@ function filterProjectionByScope(
  * tags + descendants before rendering — symmetric with the JSON
  * `vault-info` wrapper, so a tag-scoped token never learns about
  * out-of-scope tags via the connect-time brief either. Aggregate counts
- * pass through unchanged (they were pre-existing leak surface; not new).
+ * stay vault-wide (pre-existing behaviour) EXCEPT that notes hidden by a
+ * private tag are subtracted, and `map` is scope-restricted (vault#766).
  *
  * Async because expanding the tag-scope allowlist hits the store's
  * hierarchy resolver. Returns the orientation block even when the vault
@@ -106,11 +111,20 @@ export async function getServerInstruction(
 ): Promise<string> {
   const config = readVaultConfig(vaultName);
   const store = getVaultStore(vaultName);
-  let projection = buildVaultProjection(store.db, { includeStats: true });
+  let projection: VaultProjection;
 
   if (auth?.scoped_tags && auth.scoped_tags.length > 0) {
     const allowed = await expandTokenTagScope(store, auth.scoped_tags);
+    // vault#766: the brief's counts (stats line, map) must not include notes
+    // a private tag hides from this token — build them scope-aware.
+    projection = buildVaultProjection(store.db, {
+      includeStats: true,
+      countScope: scopedCountFilter(store, allowed),
+      statsScope: scopedStatsFilter(store, allowed),
+    });
     if (allowed) projection = filterProjectionByScope(projection, allowed);
+  } else {
+    projection = buildVaultProjection(store.db, { includeStats: true });
   }
 
   return projectionToMarkdown({
@@ -540,6 +554,10 @@ function applyTagScopeWrappers(
     return next;
   };
 
+  const isAggregateRow = (r: unknown): boolean =>
+    r !== null && typeof r === "object" && !Array.isArray(r)
+    && "group" in r && "value" in r && !("id" in r) && !("tags" in r);
+
   wrapReadTool(tools, "query-notes", async (orig, params) => {
     const allowed = await getAllowed();
     // Check history visibility before materialisation can throw a content error.
@@ -547,6 +565,29 @@ function applyTagScopeWrappers(
     if (allowed && typeof historyId === "string") {
       const note = resolveNote(store.db, historyId);
       if (note && !noteWithinTagScope(note, allowed, rawTags)) return { error: "Note not found", error_type: "not_found", id: historyId };
+    }
+    // vault#738 review: scope before any note-dependent resolution/error
+    // path. Otherwise content-range validation and ambiguous-path candidates
+    // distinguish a hidden note from a missing one (and may expose ULIDs).
+    // Incompatible aggregate/versions combinations still reach core's loud
+    // parameter validation before any single-note lookup.
+    const singleRef = (params as any)?.id;
+    if (allowed && typeof singleRef === "string" && singleRef
+        && (params as any).aggregate === undefined && !(params as any).versions) {
+      try {
+        const note = resolveNote(store.db, singleRef);
+        if (!note || !noteWithinTagScope(note, allowed, rawTags)) {
+          return { error: "Note not found", error_type: "not_found", id: singleRef };
+        }
+      } catch (e: any) {
+        // Never surface global ambiguous-path candidates to a scoped caller.
+        // An ambiguous reference is deliberately unresolved; use an explicit
+        // note ID to address an in-scope candidate.
+        if (e?.code === "AMBIGUOUS_PATH") {
+          return { error: "Note not found", error_type: "not_found", id: singleRef };
+        }
+        throw e;
+      }
     }
     const result = await orig(scopeQueryTagParams(params, allowed));
     if (!allowed) return result;
@@ -564,7 +605,10 @@ function applyTagScopeWrappers(
     // tag rollup's `group` values ARE tag names — the co-tag would surface
     // directly as a group. Scrub group NAMES here, the same way every other
     // tag-shaped output on this wrapper is scrubbed.
-    if ((params as any).aggregate) {
+    // vault#738: key on the RESULT shape (rollup rows), not on the params —
+    // any early-return mode core answers before aggregating (e.g. `id`) must
+    // still fall through to the per-note scope filter below.
+    if ((params as any).aggregate && Array.isArray(result) && result.every(isAggregateRow)) {
       const groupBy = (params as any).aggregate?.group_by;
       if (groupBy === "tag" && Array.isArray(result)) {
         return result.filter(
@@ -624,7 +668,10 @@ function applyTagScopeWrappers(
     if (result && typeof result === "object" && "id" in result && "tags" in result) {
       return noteWithinTagScope(result as any, allowed, rawTags)
         ? scrubNoteForScope(result)
-        : { error: "Note not found", error_type: "not_found", id: (result as any).id };
+        // vault#738: echo the caller's own reference, never the resolved
+        // ULID — otherwise a path/title lookup is an existence oracle that
+        // also hands back the out-of-scope note's canonical id.
+        : { error: "Note not found", error_type: "not_found", id: (params as any).id ?? null };
     }
     return result;
   });
@@ -650,7 +697,7 @@ function applyTagScopeWrappers(
     }
     const result = await orig(params);
     if (Array.isArray(result)) {
-      return result.filter((t: any) => allowed.has(t.name));
+      return await scrubTagCountsForPrivateTags(store, result.filter((t: any) => allowed.has(t.name)), allowed);
     }
     // In-scope single-tag miss (nonexistent but allowlisted name): core's
     // tag_not_found may carry a vault-wide `did_you_mean` — keep it only
@@ -714,8 +761,14 @@ function applyTagScopeWrappers(
     // tag membership, not just a tag-name allowlist over a precomputed
     // rollup) — so re-run the cheap grouped-count query restricted to the
     // resolved allowlist instead of filtering `orig`'s unscoped result.
+    // vault#766: `scopedCountFilter` also drops notes hidden by a private
+    // tag (deny wins) and zeroes everything for a fail-closed scope.
     if (r.map) {
-      r.map = getVaultMap(store.db, { tagFilter: [...allowed] });
+      r.map = getVaultMap(store.db, scopedCountFilter(store, allowed));
+    }
+    if (r.stats) {
+      const statsScope = scopedStatsFilter(store, allowed);
+      if (statsScope) r.stats = getVaultStats(store.db, statsScope);
     }
     return r;
   });
@@ -912,7 +965,7 @@ function applyTagScopeWrappers(
     const allowed = await getAllowed();
     if (!allowed) return await orig(params);
     if (params.deep) return forbidden("deep history audit requires an unrestricted session");
-    return runDoctorScan(store.db, { allowedTags: allowed });
+    return runDoctorScan(store.db, { allowedTags: allowed, noteTagsInScope: doctorNoteTagsPredicate(allowed, rawTags) });
   });
 }
 

@@ -56,7 +56,9 @@ function uploadRequest(filename: string, mimeType: string): Request {
 
 /** Build the per-request TagScopeCtx the dispatcher hands handlers. */
 async function tagScopeCtx(store: Store, scopedTags: string[] | null): Promise<TagScopeCtx> {
-  return { allowed: await expandTokenTagScope(store, scopedTags), raw: scopedTags };
+  // Unbound in-memory store: pass private_tags explicitly (an unbound store
+  // fails closed for scoped tokens — vault#766).
+  return { allowed: await expandTokenTagScope(store, scopedTags, []), raw: scopedTags };
 }
 
 beforeAll(() => {

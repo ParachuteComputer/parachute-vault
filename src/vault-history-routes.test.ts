@@ -140,8 +140,10 @@ test("P5 REST restore rejects stale optimistic tokens without capture", async ()
     version_ix: 0,
     if_updated_at: 12345,
   });
-  expect(nonString.status).toBe(409);
-  expect(nonString.body.error_type).toBe("conflict");
+  // vault#739: malformed preconditions are invalid requests, not conflicts.
+  expect(nonString.status).toBe(400);
+  expect(nonString.body.error_type).toBe("invalid_request");
+  expect(nonString.body.field).toBe("if_updated_at");
   expect(await store.listNoteVersions(n.id)).toEqual(before);
   expect((await store.getNote(n.id))!.content).toBe("two");
 });
@@ -397,7 +399,7 @@ test("P20 REST recreates untagged at the tombstone path and guards conflicts", a
     (
       await call(n.id, "/restore", "POST", {
         version_ix: 0,
-        if_updated_at: "stale",
+        if_updated_at: "1999-01-01T00:00:00.000Z",
       })
     ).status,
   ).toBe(409);

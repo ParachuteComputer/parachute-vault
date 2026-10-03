@@ -21,7 +21,7 @@
  * audience to strict-check on the cross-vault surface.
  */
 
-import { readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
+import { UnreadablePrivateTagsError, readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
 import type { VaultConfig, StoredKey } from "./config.ts";
 import type { TokenPermission } from "./token-store.ts";
 import crypto from "node:crypto";
@@ -369,7 +369,12 @@ export async function authenticateVaultRequest(
   // Legacy: check per-vault keys from vault.yaml
   const vaultKey = validateKey(vaultConfig.api_keys, key);
   if (vaultKey) {
-    try { writeVaultConfig(vaultConfig); } catch {}
+    try { writeVaultConfig(vaultConfig); } catch (err) {
+      if (err instanceof UnreadablePrivateTagsError) {
+        return { error: Response.json({ error: err.message }, { status: 409 }) };
+      }
+      // Other last-used timestamp persistence failures remain best-effort.
+    }
     warnLegacyOnce(`yaml-vault:${vaultKey.key_hash}`, "vault.yaml api_keys");
     return legacyAuthResult(
       vaultKey.scope === "read" ? "read" : "full",

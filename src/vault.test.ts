@@ -90,7 +90,8 @@ async function edgeSuppressionFixture(door: "MCP" | "REST", name: string, scoped
   });
   const tools = door === "MCP" ? generateScopedMcpTools(vaultName, scoped ? authForTags(["work"]) as any : undefined) : [];
   const scope: TagScopeCtx = scoped
-    ? { allowed: await expandTokenTagScope(fixtureStore, ["work"]), raw: ["work"] }
+    // REST uses an unbound store: pass private_tags explicitly (fail-closed otherwise, vault#766).
+    ? { allowed: await expandTokenTagScope(fixtureStore, ["work"], door === "REST" ? [] : undefined), raw: ["work"] }
     : { allowed: null, raw: null };
   const restQuery = (params: Record<string, any>) => {
     const search = new URLSearchParams();
@@ -5133,7 +5134,9 @@ describe("HTTP tag-scope confidentiality (security review)", async () => {
   // Build a TagScopeCtx the same way routing.ts does, so handlers see the
   // exact shape a real tag-scoped request produces.
   async function scopeCtx(roots: string[]): Promise<TagScopeCtx> {
-    return { allowed: await expandTokenTagScope(store, roots), raw: roots };
+    // Unbound test store: pass private_tags explicitly (an unbound store fails
+    // closed for scoped tokens — vault#766).
+    return { allowed: await expandTokenTagScope(store, roots, []), raw: roots };
   }
   const NO_SCOPE: TagScopeCtx = { allowed: null, raw: null };
 
@@ -9364,7 +9367,7 @@ describe("handleVault: front-door structural map", async () => {
     await store.createNote("c", { tags: ["personal"], path: "Personal/Two" });
 
     const cfg = { name: "default" } as { name: string };
-    const scope: TagScopeCtx = { allowed: await expandTokenTagScope(store, ["work"]), raw: ["work"] };
+    const scope: TagScopeCtx = { allowed: await expandTokenTagScope(store, ["work"], []), raw: ["work"] };
     const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any, undefined, undefined, scope);
     const body = await res.json() as any;
 
@@ -9378,7 +9381,7 @@ describe("handleVault: front-door structural map", async () => {
     await store.createNote("a", { tags: ["work"], path: "Work/One" });
 
     const cfg = { name: "default" } as { name: string };
-    const scope: TagScopeCtx = { allowed: await expandTokenTagScope(store, ["nonexistent"]), raw: ["nonexistent"] };
+    const scope: TagScopeCtx = { allowed: await expandTokenTagScope(store, ["nonexistent"], []), raw: ["nonexistent"] };
     const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any, undefined, undefined, scope);
     const body = await res.json() as any;
 

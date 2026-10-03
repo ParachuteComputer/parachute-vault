@@ -90,7 +90,7 @@ import {
   type WriteCtx,
 } from "./routes.ts";
 import { handleTriggers } from "./triggers-api.ts";
-import { expandTokenTagScope } from "./tag-scope.ts";
+import { expandTokenTagScope, scopedStatsFilter } from "./tag-scope.ts";
 import {
   handleProtectedResource,
   handleRootProtectedResource,
@@ -656,7 +656,10 @@ export async function route(
     if (req.method !== "GET") {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
-    const stats = await store.getVaultStats();
+    // vault#766: a scoped caller's stats exclude notes a private tag hides.
+    const stats = await store.getVaultStats(
+      scopedStatsFilter(store, await expandTokenTagScope(store, auth.scoped_tags)),
+    );
     return Response.json({
       name: vaultName,
       description: vaultConfig.description,
@@ -690,7 +693,9 @@ export async function route(
       );
     }
     const fresh = new URL(req.url).searchParams.get("fresh") === "1";
-    const stats = await store.getVaultStats();
+    const stats = await store.getVaultStats(
+      scopedStatsFilter(store, await expandTokenTagScope(store, auth.scoped_tags)),
+    );
     return Response.json(buildUsageReport(vaultName, stats, { fresh }));
   }
 

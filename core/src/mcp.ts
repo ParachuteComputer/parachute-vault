@@ -718,6 +718,15 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         }
 
         // --- Single note by ID/path ---
+        // vault#738: `id` returns early below, so `{id, aggregate}` used to
+        // answer the single note while the scoped wrapper treated the result
+        // as a rollup and skipped its scope filter. Refuse the combination
+        // loudly, the same way `versions` refuses `id`.
+        if (params.id && params.aggregate !== undefined) {
+          throw new QueryError(`aggregate is incompatible with id — a rollup has no single note.`, "INVALID_QUERY", {
+            error_type: "invalid_query", field: "aggregate", hint: "drop `id` when using `aggregate`",
+          });
+        }
         if (params.id) {
           const note = resolveNote(db, params.id as string);
           if (!note) return { error: "Note not found", error_type: "not_found", id: params.id };
@@ -1801,6 +1810,20 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               ...item,
             }))
           : [params];
+
+        // vault#739: a non-ISO `if_updated_at` used to throw a RangeError
+        // deep in updateNote (generic 500). Reject it up front, before any
+        // item is written.
+        for (const item of items) {
+          if (item && item.if_updated_at !== undefined && !noteOps.isValidIfUpdatedAt(item.if_updated_at)) {
+            throw new QueryError("if_updated_at must be an ISO-8601 timestamp string", "INVALID_REQUEST", {
+              error_type: "invalid_request",
+              field: "if_updated_at",
+              got: item.if_updated_at,
+              hint: noteOps.IF_UPDATED_AT_HINT,
+            });
+          }
+        }
 
         if (items.length > MAX_BATCH_SIZE) {
           throw new BatchTooLargeError(items.length);

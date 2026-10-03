@@ -1,8 +1,9 @@
 import { describe, test, expect } from "bun:test";
-import { statSync } from "fs";
+import { statSync, readFileSync } from "fs";
 import { join } from "path";
 import {
   writeVaultConfig,
+  vaultDir,
   readVaultConfig,
   writeGlobalConfig,
   readGlobalConfig,
@@ -805,4 +806,10 @@ describe("formatMigrationFailure", () => {
     expect(msg).toContain("weird string");
     expect(msg).not.toContain("mount boundary");
   });
+});
+
+test("name-only YAML update preserves CRLF and indented name text", () => {
+  const source = "name: before\r\ndescription: |\r\n  name: keep\r\nfuture: value\r\n";
+  writeVaultConfig({ name: "crlf-rename", description: "", api_keys: [], created_at: "now" }, source);
+  expect(readFileSync(join(vaultDir("crlf-rename"), "vault.yaml"), "utf8")).toBe(source.replace("name: before", "name: crlf-rename"));
 });

@@ -1,3 +1,4 @@
+import { UnreadablePrivateTagsError } from "./config.ts";
 import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHistoryRow, ImportedHistoryUnrecoverableError } from "../core/src/history-import.js";
 /**
  * REST API route handlers for the multi-vault server.
@@ -49,7 +50,7 @@ import {
   narrowLinkWarningsForVisibility,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
-import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap, isValidIfUpdatedAt, IF_UPDATED_AT_HINT } from "../core/src/notes.ts";
 import { normalizePath } from "../core/src/paths.ts";
 import {
   parseContentRange,
@@ -83,6 +84,10 @@ import {
   filterHydratedLinksByTagScope,
   filterNotesByTagScope,
   noteWithinTagScope,
+  scrubTagCountsForPrivateTags,
+  scopedCountFilter,
+  scopedStatsFilter,
+  doctorNoteTagsPredicate,
   scopeQueryTags,
   scrubIndexedFieldConflictError,
   scrubNotesTagsByScope,
@@ -1380,6 +1385,19 @@ function ambiguousPathResponse(e: any): Response | null {
       message: e.message,
     },
     409,
+  );
+}
+
+/** vault#739: 400 for an `if_updated_at` that isn't an ISO timestamp (was a 500). */
+function invalidIfUpdatedAtResponse(): Response {
+  return json(
+    {
+      error: "if_updated_at must be an ISO-8601 timestamp string",
+      error_type: "invalid_request",
+      field: "if_updated_at",
+      hint: IF_UPDATED_AT_HINT,
+    },
+    400,
   );
 }
 
@@ -2976,6 +2994,7 @@ async function handleNotesInner(
       const parsed = await parseJsonBody(req);
       if (!parsed.ok) return parsed.response;
       const body = parsed.body;
+      if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
       let selector: ReturnType<typeof parseHistorySelector>;
       try { selector = parseHistorySelector(body); } catch {
         return json({ error: "Invalid history selector", error_type: "invalid_request" }, 400);
@@ -3082,6 +3101,7 @@ async function handleNotesInner(
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
       const body = parsedBody.body as any;
+      if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
       const note = await resolveNote(store, idOrPath);
       if (!note) {
         // vault#309 — `if_missing: "create"` turns this PATCH into a
@@ -3636,7 +3656,7 @@ export async function handleTags(
 
     const tags = await store.listTags();
     const filtered = tagScope.allowed
-      ? tags.filter((t) => tagScope.allowed!.has(t.name))
+      ? await scrubTagCountsForPrivateTags(store, tags.filter((t) => tagScope.allowed!.has(t.name)), tagScope.allowed)
       : tags;
     if (parseBool(parseQuery(url, "include_schema"), false)) {
       const records = new Map(
@@ -4290,9 +4310,12 @@ export async function handleVault(
     result.map =
       tagScope.raw === null
         ? getVaultMap(store.db)
-        : getVaultMap(store.db, { tagFilter: [...(tagScope.allowed ?? [])] });
+        : getVaultMap(store.db, scopedCountFilter(store, tagScope.allowed));
     if (parseBool(parseQuery(url, "include_stats"), false)) {
-      result.stats = await store.getVaultStats();
+      // vault#766: subtract notes a private tag hides from a scoped caller.
+      result.stats = await store.getVaultStats(
+        tagScope.raw === null ? undefined : scopedStatsFilter(store, tagScope.allowed),
+      );
     }
     return json(result);
   }
@@ -4377,7 +4400,14 @@ export async function handleVault(
       dirty = true;
     }
 
-    if (dirty && persist) persist();
+    if (dirty && persist) {
+      try { persist(); } catch (err) {
+        if (err instanceof UnreadablePrivateTagsError) {
+          return json({ error: err.message }, 409);
+        }
+        throw err;
+      }
+    }
     return json(vaultResponse(vaultConfig));
   }
 
@@ -4467,7 +4497,7 @@ export async function handleDoctor(
   if ((after !== undefined && !/^[a-f0-9]{64}$/.test(after)) ||
       (maxBlobs !== undefined && (!Number.isInteger(maxBlobs) || maxBlobs < 1 || maxBlobs > 500)) ||
       (budgetMs !== undefined && (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > 1000))) return json({ error: "invalid history audit bounds or cursor" }, 400);
-  const report = await store.doctor({ allowedTags: tagScope.allowed, deep, history_after: after, history_max_blobs: maxBlobs, history_budget_ms: budgetMs });
+  const report = await store.doctor({ allowedTags: tagScope.allowed, noteTagsInScope: doctorNoteTagsPredicate(tagScope.allowed, tagScope.raw), deep, history_after: after, history_max_blobs: maxBlobs, history_budget_ms: budgetMs });
   return json(report);
 }
 

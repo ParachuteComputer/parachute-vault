@@ -12,18 +12,16 @@
  * live verification recorded in the PR body; the full browser E2E is Phase 4.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { Database } from "bun:sqlite";
+import { rmSync } from "fs";
 import { SqliteStore } from "../core/src/store.ts";
-import { HookRegistry } from "../core/src/hooks.ts";
-import type { VaultConfig } from "./config.ts";
+import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
+import { vaultDir, writeVaultConfig, type VaultConfig } from "./config.ts";
 import type { AuthResult } from "./auth.ts";
 import { SubscriptionManager } from "./subscriptions.ts";
 import { createSubscribeWsBinding, isWebSocketUpgrade, type SubscribeWsData } from "./ws-server.ts";
 
-const VAULT = "testvault";
+const VAULT = `ws-subscribe-${crypto.randomUUID()}`;
 
-let db: Database;
-let hooks: HookRegistry;
 let store: SqliteStore;
 let manager: SubscriptionManager;
 let servers: Array<ReturnType<typeof Bun.serve>> = [];
@@ -172,10 +170,10 @@ function settle(): Promise<void> {
 }
 
 beforeEach(() => {
-  db = new Database(":memory:");
-  hooks = new HookRegistry({ concurrency: 4, logger: { error() {} } });
-  store = new SqliteStore(db, { hooks });
-  manager = new SubscriptionManager(hooks, { resolveVault: () => VAULT });
+  // Production scope resolution requires a store bound to a vault name.
+  writeVaultConfig(vaultConfig);
+  store = getVaultStore(VAULT);
+  manager = new SubscriptionManager(store.hooks, { resolveVault: () => VAULT });
   servers = [];
 });
 
@@ -183,7 +181,8 @@ afterEach(async () => {
   for (const s of servers) s.stop(true);
   await settle();
   manager.shutdown();
-  db.close();
+  clearVaultStoreCache();
+  rmSync(vaultDir(VAULT), { recursive: true, force: true });
 });
 
 describe("WS live-query — handshake + snapshot", () => {
