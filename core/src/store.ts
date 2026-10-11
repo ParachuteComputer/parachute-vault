@@ -31,6 +31,7 @@ import {
   pathResolutionKeys,
   requeueInboundWikilinksForDelete,
 } from "./wikilinks.js";
+import { normalizePath } from "./paths.js";
 import { chunkForInClause } from "./sql-in.js";
 import { timestampToMs } from "./cursor.js";
 import { afterCommit, transaction } from "./txn.js";
@@ -697,6 +698,9 @@ export class BunSqliteStore implements Store {
         if (cascadePlan && oldPath && oldPath !== note.path) {
           this.cascadeRename(cascadePlan, note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null });
         }
+        if (oldPath && oldPath !== note.path) {
+          this.repairReferenceFieldPaths(note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null });
+        }
         resolveUnresolvedWikilinks(this.db, note.path, id);
         // vault#581 — a rename is one of the two ways an ambiguity stops being
         // ambiguous (the other is a delete). Sweep the OLD path's keys as well
@@ -843,6 +847,70 @@ export class BunSqliteStore implements Store {
         syncWikilinks(this.db, sourceId, updated);
         refreshCompactState(this.db, sourceId);
       }
+    }
+  }
+
+  /**
+   * Rename repair for `type: "reference"` metadata values. The reference
+   * field's graph edge survives a repath (it targets the note id), but the
+   * metadata STRING that names the note by path would go stale and miss
+   * `metadata: {field: {in: [...paths]}}` queries. For every non-wikilink
+   * edge targeting the renamed note whose relationship is a field declared
+   * `type: "reference"` on a tag the source carries, rewrite scalar / array
+   * elements equal to the old path (normalised, case-insensitive) to the new
+   * path. Ids and titles are left alone. Same policy as `cascadeRename`: a
+   * store-level index repair with no tag-scope filtering, version-captured
+   * (`cascade-rename`), attributed, and bumping `updated_at`. Runs in the
+   * caller's transaction; the indexed generated columns recompute from the
+   * metadata JSON on write.
+   */
+  private repairReferenceFieldPaths(note: Note, oldPath: string, attr: { actor: string | null; via: string | null }): void {
+    if (!note.path) return;
+    const oldKey = normalizePath(oldPath)?.toLowerCase();
+    if (!oldKey) return;
+    const rows = this.db.prepare(
+      "SELECT DISTINCT source_id, relationship FROM links WHERE target_id = ? AND relationship != 'wikilink' AND source_id != ?",
+    ).all(note.id, note.id) as { source_id: string; relationship: string }[];
+    if (rows.length === 0) return;
+
+    const fieldsBySource = new Map<string, Set<string>>();
+    for (const r of rows) {
+      let set = fieldsBySource.get(r.source_id);
+      if (!set) fieldsBySource.set(r.source_id, (set = new Set()));
+      set.add(r.relationship);
+    }
+
+    const matches = (v: unknown): boolean =>
+      typeof v === "string" && normalizePath(v)?.toLowerCase() === oldKey;
+
+    for (const [sourceId, relationships] of fieldsBySource) {
+      const source = noteOps.getNote(this.db, sourceId);
+      if (!source?.metadata) continue;
+      const resolution = resolveNoteSchemas(this.getSchemaConfig(), { tags: source.tags ?? [] });
+      if (resolution.mergedFields.size === 0) continue;
+
+      let next: Record<string, unknown> | undefined;
+      for (const field of relationships) {
+        if (resolution.mergedFields.get(field)?.spec.type !== "reference") continue;
+        const value = source.metadata[field];
+        let repaired: unknown = value;
+        if (Array.isArray(value)) {
+          if (!value.some(matches)) continue;
+          repaired = value.map((v) => (matches(v) ? note.path : v));
+        } else if (matches(value)) {
+          repaired = note.path;
+        } else {
+          continue;
+        }
+        next ??= { ...source.metadata };
+        next[field] = repaired;
+      }
+      if (!next) continue;
+
+      const prior = readPriorNoteRow(this.db, sourceId);
+      if (prior) captureVersion(this.db, prior, { ...attr, op: "cascade-rename", policy: this.historyPolicy });
+      noteOps.updateNote(this.db, sourceId, { metadata: next, actor: attr.actor, via: attr.via });
+      refreshCompactState(this.db, sourceId);
     }
   }
 
