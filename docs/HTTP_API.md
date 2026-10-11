@@ -1202,7 +1202,7 @@ Query params:
     neighborhood id set is resolved first (tag-scope wall at every hop) and
     scopes the rollup before all other filters; the rollup spans the whole
     set (no LIMIT truncation). Subtree rollup, one request:
-    `GET /notes?tag=task&meta[status]=open&near[note_id]=<X>&near[relationship]=parent&near[direction]=inbound&near[depth]=5&near[then][relationship]=node&near[then][direction]=inbound&aggregate[group_by]=owner&aggregate[op]=count`. Bun REST used to silently
+    `GET /notes?tag=task&meta[state]=open&near[note_id]=<X>&near[relationship]=parent&near[direction]=inbound&near[depth]=5&near[then][relationship]=node&near[then][direction]=inbound&aggregate[group_by]=owner&aggregate[op]=count`. Bun REST used to silently
     ignore `aggregate[...]` under `search=` and return note rows; the bun
     door now rejects.
   - **Cloud-door coverage (vault#626).** Both cloud doors serve the
