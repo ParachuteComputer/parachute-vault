@@ -2033,6 +2033,41 @@ async function handleNotesInner(
           ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy())
           : []),
       ];
+      // Resolve the neighborhood before ordering and pagination.
+      const nearNoteId = parseQuery(url, "near[note_id]");
+      if (nearNoteId) {
+        const anchor = await resolveNote(store, nearNoteId);
+        if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
+        // Tag-scope: anchor must itself be visible to this token.
+        if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
+          return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
+        }
+        const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
+        const relationship = parseQuery(url, "near[relationship]") ?? undefined;
+        const directionRaw = parseQuery(url, "near[direction]") ?? "both";
+        if (!["inbound", "outbound", "both"].includes(directionRaw)) return json({ error: "Invalid near direction", error_type: "invalid_query" }, 400);
+        const direction = directionRaw as "inbound" | "outbound" | "both";
+        // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
+        // find-path): for a tag-scoped token the BFS refuses to traverse
+        // THROUGH out-of-scope notes — scope is a wall, not a sieve. So a token
+        // scoped to ["work"] can't reach an in-scope note at depth 2 via a
+        // #personal intermediary at depth 1; that note is simply unreachable.
+        // The `filterNotesByTagScope` pass below still runs (defense in depth),
+        // but the wall makes it redundant for the `near[]` result set.
+        // Unscoped tokens (`tagScope.raw === null`) install no predicate → the
+        // FULL graph is walked exactly as before, behavior unchanged.
+        const isTraversable = tagScope.raw
+          ? (id: string) =>
+              noteWithinTagScope(
+                { id, tags: getNoteTags(db, id) } as Note,
+                tagScope.allowed,
+                tagScope.raw,
+              )
+          : undefined;
+        const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship, direction, isTraversable });
+        queryOpts.ids = [anchor.id, ...traversed.map((t) => t.noteId)];
+      }
+
       let results: Note[];
       let nextCursor: string | null = null;
       try {
@@ -2078,7 +2113,7 @@ async function handleNotesInner(
         throw e;
       }
       // Truncation-honesty (vault contracts-brief V1.3): captured BEFORE
-      // near/tag-scope filtering, which can only shrink the set further —
+      // tag-scope filtering, which can only shrink the set further —
       // this reflects whether the underlying store query actually hit its
       // `limit` (i.e. there may be more rows the caller never saw). Cursor
       // mode is exempt — it already carries `next_cursor` as the honest
@@ -2087,42 +2122,6 @@ async function handleNotesInner(
       // paging, not hitting an accidental full default page.
       if (!cursorMode && queryOpts.offset === undefined && results.length === queryOpts.limit) {
         queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
-      }
-
-      // Near-scope filter (graph neighborhood)
-      const nearNoteId = parseQuery(url, "near[note_id]");
-      if (nearNoteId) {
-        const anchor = await resolveNote(store, nearNoteId);
-        if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
-        // Tag-scope: anchor must itself be visible to this token.
-        if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
-          return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
-        }
-        const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
-        const relationship = parseQuery(url, "near[relationship]") ?? undefined;
-        const directionRaw = parseQuery(url, "near[direction]") ?? "both";
-        if (!["inbound", "outbound", "both"].includes(directionRaw)) return json({ error: "Invalid near direction", error_type: "invalid_query" }, 400);
-        const direction = directionRaw as "inbound" | "outbound" | "both";
-        // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
-        // find-path): for a tag-scoped token the BFS refuses to traverse
-        // THROUGH out-of-scope notes — scope is a wall, not a sieve. So a token
-        // scoped to ["work"] can't reach an in-scope note at depth 2 via a
-        // #personal intermediary at depth 1; that note is simply unreachable.
-        // The `filterNotesByTagScope` pass below still runs (defense in depth),
-        // but the wall makes it redundant for the `near[]` result set.
-        // Unscoped tokens (`tagScope.raw === null`) install no predicate → the
-        // FULL graph is walked exactly as before, behavior unchanged.
-        const isTraversable = tagScope.raw
-          ? (id: string) =>
-              noteWithinTagScope(
-                { id, tags: getNoteTags(db, id) } as Note,
-                tagScope.allowed,
-                tagScope.raw,
-              )
-          : undefined;
-        const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship, direction, isTraversable });
-        const nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
-        results = results.filter((n) => nearScope.has(n.id));
       }
 
       // Tag-scope: drop any result outside the allowlist before shaping

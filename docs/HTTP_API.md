@@ -1224,6 +1224,8 @@ Query params:
     this anchor.
   - `near[depth]=N` — default 2, capped at 5.
   - `near[relationship]=cites` — restrict the walked edges.
+  - `near[direction]=` — both (default) | inbound = notes that link TO the current note (e.g. children via parent) | outbound = notes the current note links to. Applies at every hop.
+  - Neighborhood scope applies before ordering, limit, and offset, together with tag and metadata filters.
 
 - **Sort + paging**
   - `sort=asc|desc` — by `created_at`. Default `asc`. (vault#555 fix — this
