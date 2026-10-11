@@ -206,11 +206,20 @@ export class BunSqliteStore implements Store {
    * layer can surface `validation_status` on create/update responses
    * without re-importing the config loader.
    */
-  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): ValidationStatus | null {
+  validateNoteAgainstSchemas(
+    note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+    opts?: { isVisible?: (note: Note) => boolean },
+  ): ValidationStatus | null {
     return runValidateNote(this.getSchemaConfig(), note, (value) => {
       // Same id → path/basename/title resolution the reference auto-link uses.
       const hit = resolveLinkTargetDetailed(this.db, value);
       if (!hit.resolved || !hit.note_id) return { status: "unresolved" };
+      // Tag-scoped caller: a target it cannot see is indistinguishable from a
+      // missing one (no tag/existence oracle for invisible notes).
+      if (opts?.isVisible) {
+        const target = noteOps.getNote(this.db, hit.note_id);
+        if (!target || !opts.isVisible(target)) return { status: "unresolved" };
+      }
       const rows = this.db
         .prepare("SELECT tag_name FROM note_tags WHERE note_id = ?")
         .all(hit.note_id) as { tag_name: string }[];

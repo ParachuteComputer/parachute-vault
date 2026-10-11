@@ -9481,9 +9481,26 @@ describe("reference target_tags", async () => {
     await store.createNote("s", { path: "N/s", tags: ["server"] });
     const tools = generateMcpTools(store);
     const cn = tools.find((x: any) => x.name === "create-note")!;
-    await expect(cn.execute({ content: "t", tags: ["task"], metadata: { node: "P/bob" } })).rejects.toThrow(/target_tag_mismatch|schema_validation/);
+    await expect(cn.execute({ content: "t", tags: ["task"], metadata: { node: "P/bob" } })).rejects.toMatchObject({ name: "SchemaValidationError", code: "SCHEMA_VALIDATION", violations: [expect.objectContaining({ field: "node", reason: "target_tag_mismatch", strict: true })] });
     await cn.execute({ content: "t2", tags: ["task"], metadata: { node: "N/s" } });
     await cn.execute({ content: "t3", tags: ["task"], metadata: { node: "N/nowhere" } });
+  });
+  it("ambiguous target is unresolved (advisory), never rejected, even when strict", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"], strict: true } },
+    });
+    await store.createNote("a", { path: "A/dup", tags: ["person"] });
+    await store.createNote("b", { path: "B/dup", tags: ["person"] });
+    const cn = generateMcpTools(store).find((x: any) => x.name === "create-note")!;
+    const r: any = await cn.execute({ content: "t", tags: ["task"], metadata: { node: "dup" } });
+    expect(r.validation_status.warnings.map((w: any) => w.reason)).toEqual(["unresolved_reference"]);
+  });
+  it("messages never include the target's own tag list", async () => {
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "P/bob" } });
+    const w = warnsOf(t, "target_tag_mismatch")[0];
+    expect(w.message).not.toContain("person");
+    expect(w.message).toContain("node");
   });
   it("unresolved target: advisory unresolved_reference, never strict, link still queued", async () => {
     await store.upsertTagRecord("task", {

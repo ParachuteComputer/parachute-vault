@@ -745,7 +745,7 @@ export interface Store {
   // `_default` is the implicit universal parent. Returns null when no
   // ancestor declares any fields. The underlying resolver is in-memory after
   // the first lazy load.
-  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): ValidationStatus | null;
+  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }, opts?: { isVisible?: (note: Note) => boolean }): ValidationStatus | null;
 
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;

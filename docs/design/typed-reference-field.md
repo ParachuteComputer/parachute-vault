@@ -160,6 +160,26 @@ All of the above are covered in `core/src/core.test.ts` under the same
 `describe("typed reference field", …)` block (search `cardinality:'many'`,
 `backfills links for existing notes`, `BLOCKER`, and `NIT 3`).
 
+## `target_tags` — opt-in target-type validation
+
+A `reference` field may declare `target_tags: ["node", ...]`. The referenced
+note must then carry one of those tags, or a subtype of one.
+
+- **Subtypes.** Only `parent_names` descendants count (`server` with
+  `parent_names: ["node"]` satisfies `["node"]`). Namespaced children
+  (`node/archived`) do **not**.
+- **Severity.** Mismatch → `target_tag_mismatch`: advisory, or a
+  `schema_validation` rejection when the field is `strict: true`. The message
+  names only the expected `target_tags`, never the target's own tags.
+- **Unresolved is never rejected, even when strict.** A value that resolves to
+  no note (missing, ambiguous, or not yet created) gives an advisory
+  `unresolved_reference`; the queued forward-ref still backfills later.
+- **Tag scope.** For a tag-scoped caller, a target outside the token's scope
+  is treated exactly like an unresolved one (same check as expand/near
+  visibility), so the response is indistinguishable from a missing note and
+  reveals neither its existence nor its tags. Unscoped callers are unchanged.
+- Fields without `target_tags` behave as before (no new warnings).
+
 ## Known gaps (deliberately out of scope for this PR)
 
 1. **No inline `unresolved_link` warning on the response.** Structured

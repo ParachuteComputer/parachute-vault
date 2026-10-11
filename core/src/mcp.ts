@@ -612,6 +612,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     metadata?: Record<string, unknown>;
   }): void => {
     enforceStrictWrite(store, shape, {
+      isVisible: expandVisibility,
       bypass: strictBypass,
       onBypass: onStrictBypass
         ? (violations) =>
@@ -751,7 +752,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               path: note.path,
               tags: note.tags,
               metadata: note.metadata as Record<string, unknown> | undefined,
-            });
+            }, expandVisibility ? { isVisible: expandVisibility } : undefined);
             if (status) result.validation_status = status;
           }
           if (expandCtx && includeContent && typeof result.content === "string") {
@@ -1320,7 +1321,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                 path: n.path,
                 tags: n.tags,
                 metadata: n.metadata as Record<string, unknown> | undefined,
-              }),
+              }, expandVisibility ? { isVisible: expandVisibility } : undefined),
             ]),
           );
           for (const n of output as any[]) {
@@ -1751,7 +1752,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // `if_exists` actually engaged — the default "error" path's response
         // shape is untouched.
         const final = refreshed.map((n) => {
-          const validated = attachValidationStatus(store, db, n);
+          const validated = attachValidationStatus(store, db, n, expandVisibility);
           const warnings = linkWarningsByNote.get(n.id);
           const existed = existedMap.get(n.id);
           let out: Note & { warnings?: QueryWarning[]; existed?: boolean } = validated;
@@ -2283,7 +2284,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // branch.
         const includeContent = params.include_content !== false;
         const final = updated.map((n) => {
-          const validated = attachValidationStatus(store, db, n);
+          const validated = attachValidationStatus(store, db, n, expandVisibility);
           const created = createdIds.has(n.id);
           // Echo hydrated links when this note was flagged for it (mutated
           // its links or `include_links` was set). Additive key, present only
@@ -3063,9 +3064,9 @@ export function defaultForField(field: { default?: unknown }): unknown {
 export function enforceStrictWrite(
   store: Store,
   shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
-  opts?: { bypass?: boolean; onBypass?: (violations: ValidationWarning[]) => void },
+  opts?: { bypass?: boolean; onBypass?: (violations: ValidationWarning[]) => void; isVisible?: (note: Note) => boolean },
 ): ValidationWarning[] {
-  const status = store.validateNoteAgainstSchemas(shape);
+  const status = store.validateNoteAgainstSchemas(shape, opts?.isVisible ? { isVisible: opts.isVisible } : undefined);
   const violations = strictViolations(status);
   if (violations.length === 0) return [];
   if (opts?.bypass !== true) throw new SchemaValidationError(violations);
@@ -3073,14 +3074,14 @@ export function enforceStrictWrite(
   return violations;
 }
 
-export function attachValidationStatus(store: Store, _db: Database, note: Note): Note {
+export function attachValidationStatus(store: Store, _db: Database, note: Note, isVisible?: (note: Note) => boolean): Note {
   // Short-circuit cheaply: when no tag declares fields, the resolver
   // returns null without us paying a re-read of the note.
   const status = store.validateNoteAgainstSchemas({
     path: note.path,
     tags: note.tags,
     metadata: note.metadata as Record<string, unknown> | undefined,
-  });
+  }, isVisible ? { isVisible } : undefined);
   if (!status) return note;
   return { ...note, validation_status: status } as Note & { validation_status: typeof status };
 }

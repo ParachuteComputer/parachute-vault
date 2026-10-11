@@ -617,7 +617,7 @@ export function validateNote(
             field: fieldName,
             schema: sourceTag,
             reason: "target_tag_mismatch",
-            message: `'${fieldName}' value "${v}" must reference a note tagged one of [${spec.target_tags.join(", ")}] (tag '${sourceTag}'); target carries [${hit.tags.join(", ")}]`,
+            message: `'${fieldName}' value "${v}" must reference a note tagged one of [${spec.target_tags.join(", ")}] (tag '${sourceTag}')`,
             ...strictFlag,
           });
         }

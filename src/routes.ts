@@ -131,6 +131,8 @@ export type WriteCtx = {
   bypassStrict?: boolean;
 };
 
+const vis = (t: TagScopeCtx) => { const v = buildExpandVisibility(t.allowed, t.raw); return v ? { isVisible: v } : undefined; };
+
 const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
 
 /**
@@ -144,8 +146,10 @@ function gateStrictWrite(
   store: Store,
   writeCtx: WriteCtx,
   shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): void {
   enforceStrictWrite(store, shape, {
+    isVisible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
     bypass: writeCtx.bypassStrict === true,
     onBypass: (violations: ValidationWarning[]) => {
       logStrictBypass({
@@ -2203,7 +2207,7 @@ async function handleNotesInner(
                 path: n.path,
                 tags: n.tags,
                 metadata: n.metadata as Record<string, unknown> | undefined,
-              }),
+              }, vis(tagScope)),
               tagScope.allowed,
               tagScope.raw,
             ),
@@ -2454,7 +2458,7 @@ async function handleNotesInner(
         const incomingTags: string[] = item.tags ?? [];
         const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
-        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata });
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata }, tagScope);
 
         // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
         // core UPDATE on the tag/link mutation too, not just `updates` — a
@@ -2543,7 +2547,7 @@ async function handleNotesInner(
             path: item.path,
             tags: item.tags,
             metadata: item.metadata,
-          });
+          }, tagScope);
           let note: Note;
           try {
             note = await store.createNote(item.content ?? "", {
@@ -2698,7 +2702,7 @@ async function handleNotesInner(
       // attached ONLY for items whose `if_exists` actually engaged — the
       // default "error" path's response shape is untouched.
       const final = refreshed.map((n) => {
-        const validated = attachValidationStatus(store, db, n);
+        const validated = attachValidationStatus(store, db, n, buildExpandVisibility(tagScope.allowed, tagScope.raw));
         const warnings = narrowWriteWarnings(db, linkWarningsByNote.get(n.id) ?? [], tagScope);
         const existed = existedMap.get(n.id);
         let out: any = validated;
@@ -3009,12 +3013,12 @@ async function handleNotesInner(
         gateStrictWrite(store, writeCtx, {
           path: note ? note.path : latestTombstone(db, id)?.path,
           tags: note?.tags ?? [], metadata: version.metadata,
-        });
+        }, tagScope);
         const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
           ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
         });
-        let validated: any = attachValidationStatus(store, db, restored);
+        let validated: any = attachValidationStatus(store, db, restored, buildExpandVisibility(tagScope.allowed, tagScope.raw));
         validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
         if (validated.validation_status) {
           const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
@@ -3062,7 +3066,7 @@ async function handleNotesInner(
           path: note.path,
           tags: note.tags,
           metadata: note.metadata as Record<string, unknown> | undefined,
-        }),
+        }, vis(tagScope)),
         tagScope.allowed,
         tagScope.raw,
       );
@@ -3150,7 +3154,7 @@ async function handleNotesInner(
             path: createOpts.path ?? undefined,
             tags: createOpts.tags,
             metadata: createOpts.metadata,
-          });
+          }, tagScope);
           const created = await store.createNote(content, createOpts);
           if (tagsArr.length > 0) {
             await applySchemaDefaults(store, db, [created.id], tagsArr);
@@ -3195,7 +3199,7 @@ async function handleNotesInner(
           const scopedCreateWarnings = narrowWriteWarnings(db, createWarnings, tagScope);
           const final = await store.getNote(created.id);
           if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
-          let validated: any = attachValidationStatus(store, db, final);
+          let validated: any = attachValidationStatus(store, db, final, buildExpandVisibility(tagScope.allowed, tagScope.raw));
           if (scopedCreateWarnings.length > 0) validated.warnings = scopedCreateWarnings;
           // Tag-scope (vault#568): scrub the echoed note so create-then-read
           // returns the SAME shape. A scoped token may legitimately attach an
@@ -3436,7 +3440,7 @@ async function handleNotesInner(
         const projectedMeta = stBody !== undefined
           ? { ...baseMeta, [stBody.field as string]: stBody.to }
           : baseMeta;
-        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta });
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta }, tagScope);
       }
 
       // vault#555 fix 2 — tag and link mutations must bump `updated_at` too,
@@ -3517,7 +3521,7 @@ async function handleNotesInner(
       if (contentChanged) {
         linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
       }
-      let validated: any = attachValidationStatus(store, db, updatedNote);
+      let validated: any = attachValidationStatus(store, db, updatedNote, buildExpandVisibility(tagScope.allowed, tagScope.raw));
       // Tag-scope (vault#568): the update response echoes the STORED note, so
       // without this a scoped caller could recover a co-tagged note's full tag
       // set with a no-op PATCH — the read-path scrub would be trivially
