@@ -2100,6 +2100,9 @@ async function handleNotesInner(
         }
         const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
         const relationship = parseQuery(url, "near[relationship]") ?? undefined;
+        const directionRaw = parseQuery(url, "near[direction]") ?? "both";
+        if (!["inbound", "outbound", "both"].includes(directionRaw)) return json({ error: "Invalid near direction", error_type: "invalid_query" }, 400);
+        const direction = directionRaw as "inbound" | "outbound" | "both";
         // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
         // find-path): for a tag-scoped token the BFS refuses to traverse
         // THROUGH out-of-scope notes — scope is a wall, not a sieve. So a token
@@ -2117,7 +2120,7 @@ async function handleNotesInner(
                 tagScope.raw,
               )
           : undefined;
-        const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship, isTraversable });
+        const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship, direction, isTraversable });
         const nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
         results = results.filter((n) => nearScope.has(n.id));
       }

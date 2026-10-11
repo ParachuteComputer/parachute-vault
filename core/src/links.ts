@@ -385,10 +385,12 @@ export interface TraversalNode {
 export function traverseLinks(
   db: Database,
   noteId: string,
-  opts?: { max_depth?: number; relationship?: string; isTraversable?: (noteId: string) => boolean },
+  opts?: { max_depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both"; isTraversable?: (noteId: string) => boolean },
 ): TraversalNode[] {
   const maxDepth = opts?.max_depth ?? 2;
   const relFilter = opts?.relationship;
+  const direction = opts?.direction ?? "both";
+  if (!["outbound", "inbound", "both"].includes(direction)) throw new Error("Invalid traversal direction");
   const isTraversable = opts?.isTraversable;
   const visited = new Set<string>([noteId]);
   const results: TraversalNode[] = [];
@@ -400,7 +402,9 @@ export function traverseLinks(
     for (const currentId of frontier) {
       // Outbound links
       let outbound: LinkRow[];
-      if (relFilter) {
+      if (direction === "inbound") {
+        outbound = [];
+      } else if (relFilter) {
         outbound = db.prepare(
           "SELECT * FROM links WHERE source_id = ? AND relationship = ?",
         ).all(currentId, relFilter) as LinkRow[];
@@ -429,7 +433,9 @@ export function traverseLinks(
 
       // Inbound links
       let inbound: LinkRow[];
-      if (relFilter) {
+      if (direction === "outbound") {
+        inbound = [];
+      } else if (relFilter) {
         inbound = db.prepare(
           "SELECT * FROM links WHERE target_id = ? AND relationship = ?",
         ).all(currentId, relFilter) as LinkRow[];

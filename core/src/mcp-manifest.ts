@@ -204,6 +204,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
               note_id: { type: "string", description: "Anchor note ID, path, or (fallback) H1 title" },
               depth: { type: "number", description: "Max hops from anchor (default 2, max 5)" },
               relationship: { type: "string", description: "Only follow links with this relationship" },
+              direction: { type: "string", enum: ["inbound", "outbound", "both"], description: "Traversal direction at every hop (default both). Inbound parent follows children; use tag node, then metadata node in their paths to select tasks." },
             },
             required: ["note_id"],
             description: "Scope results to notes within N hops of an anchor note",

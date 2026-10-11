@@ -1304,7 +1304,7 @@ export class BunSqliteStore implements Store {
 
   // ---- Deeper Link Queries ----
 
-  async traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }) {
+  async traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both" }) {
     return linkOps.traverseLinks(this.db, noteId, opts);
   }
 

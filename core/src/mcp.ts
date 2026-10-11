@@ -799,13 +799,15 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // in depth), but the wall makes it redundant for `near[]`.
         let nearScope: Set<string> | null = null;
         if (params.near) {
-          const near = params.near as { note_id: string; depth?: number; relationship?: string };
+          const near = params.near as { note_id: string; depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both" };
+          if (near.direction !== undefined && !["inbound", "outbound", "both"].includes(near.direction)) return { error: "Invalid near.direction", error_type: "invalid_query" };
           const anchor = resolveNote(db, near.note_id);
           if (!anchor) return { error: "Anchor note not found", error_type: "not_found", note_id: near.note_id };
           const depth = Math.min(near.depth ?? 2, 5);
           const traversed = linkOps.traverseLinks(db, anchor.id, {
             max_depth: depth,
             relationship: near.relationship,
+            direction: near.direction,
             isTraversable: nearTraversable,
           });
           nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);

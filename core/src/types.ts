@@ -667,7 +667,7 @@ export interface Store {
   batchUntag(noteIds: string[], tags: string[]): Promise<number>;
 
   // Deeper link queries
-  traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }): Promise<{ noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[]>;
+  traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both" }): Promise<{ noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[]>;
   findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): Promise<FindPathResult | null>;
 
   // Tag schemas — schema-only facade (description + fields). Back-compat
