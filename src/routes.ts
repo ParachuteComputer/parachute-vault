@@ -1903,6 +1903,52 @@ async function handleNotesInner(
         );
       }
 
+      // Resolve the neighborhood before ordering and pagination.
+      const nearNoteId = parseQuery(url, "near[note_id]");
+      if (nearNoteId) {
+        const anchor = await resolveNote(store, nearNoteId);
+        if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
+        // Tag-scope: anchor must itself be visible to this token.
+        if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
+          return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
+        }
+        const nearSpec: linkOps.NearSpec = {
+          depth: parseInt10(parseQuery(url, "near[depth]")) ?? undefined,
+          relationship: parseQuery(url, "near[relationship]") ?? undefined,
+          direction: (parseQuery(url, "near[direction]") ?? "both") as linkOps.NearSpec["direction"],
+        };
+        const thenRel = parseQuery(url, "near[then][relationship]");
+        const thenDir = parseQuery(url, "near[then][direction]");
+        const thenDepth = parseInt10(parseQuery(url, "near[then][depth]"));
+        if (thenRel !== null || thenDir !== null || thenDepth != null) {
+          nearSpec.then = {
+            relationship: thenRel ?? undefined,
+            direction: (thenDir ?? "both") as linkOps.NearSpec["direction"],
+            depth: thenDepth ?? undefined,
+          };
+        }
+        const nearErr = linkOps.validateNearSpec(nearSpec);
+        if (nearErr) return json({ error: nearErr, code: "INVALID_QUERY", error_type: "invalid_query", field: "near" }, 400);
+        // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
+        // find-path): for a tag-scoped token the BFS refuses to traverse
+        // THROUGH out-of-scope notes — scope is a wall, not a sieve. So a token
+        // scoped to ["work"] can't reach an in-scope note at depth 2 via a
+        // #personal intermediary at depth 1; that note is simply unreachable.
+        // The `filterNotesByTagScope` pass below still runs (defense in depth),
+        // but the wall makes it redundant for the `near[]` result set.
+        // Unscoped tokens (`tagScope.raw === null`) install no predicate → the
+        // FULL graph is walked exactly as before, behavior unchanged.
+        const isTraversable = tagScope.raw
+          ? (id: string) =>
+              noteWithinTagScope(
+                { id, tags: getNoteTags(db, id) } as Note,
+                tagScope.allowed,
+                tagScope.raw,
+              )
+          : undefined;
+        queryOpts.ids = [...linkOps.resolveNearScope(db, anchor.id, nearSpec, isTraversable)];
+      }
+
       // Aggregation / rollup mode (top new-feature ask from a UX round).
       // Mutually exclusive with cursor/near — a rollup returns one row per
       // group, not a paginated/graph-scoped note list — so reject those
@@ -1920,18 +1966,6 @@ async function handleNotesInner(
               error_type: "invalid_query",
               field: "aggregate",
               hint: "drop `cursor` when using `aggregate`",
-            },
-            400,
-          );
-        }
-        if (nearNoteIdEarly) {
-          return json(
-            {
-              error: "aggregate is incompatible with near (graph neighborhood).",
-              code: "INVALID_QUERY",
-              error_type: "invalid_query",
-              field: "aggregate",
-              hint: "drop `near` when using `aggregate`",
             },
             400,
           );
@@ -2033,41 +2067,6 @@ async function handleNotesInner(
           ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy())
           : []),
       ];
-      // Resolve the neighborhood before ordering and pagination.
-      const nearNoteId = parseQuery(url, "near[note_id]");
-      if (nearNoteId) {
-        const anchor = await resolveNote(store, nearNoteId);
-        if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
-        // Tag-scope: anchor must itself be visible to this token.
-        if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
-          return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
-        }
-        const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
-        const relationship = parseQuery(url, "near[relationship]") ?? undefined;
-        const directionRaw = parseQuery(url, "near[direction]") ?? "both";
-        if (!["inbound", "outbound", "both"].includes(directionRaw)) return json({ error: "Invalid near direction", error_type: "invalid_query" }, 400);
-        const direction = directionRaw as "inbound" | "outbound" | "both";
-        // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
-        // find-path): for a tag-scoped token the BFS refuses to traverse
-        // THROUGH out-of-scope notes — scope is a wall, not a sieve. So a token
-        // scoped to ["work"] can't reach an in-scope note at depth 2 via a
-        // #personal intermediary at depth 1; that note is simply unreachable.
-        // The `filterNotesByTagScope` pass below still runs (defense in depth),
-        // but the wall makes it redundant for the `near[]` result set.
-        // Unscoped tokens (`tagScope.raw === null`) install no predicate → the
-        // FULL graph is walked exactly as before, behavior unchanged.
-        const isTraversable = tagScope.raw
-          ? (id: string) =>
-              noteWithinTagScope(
-                { id, tags: getNoteTags(db, id) } as Note,
-                tagScope.allowed,
-                tagScope.raw,
-              )
-          : undefined;
-        const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship, direction, isTraversable });
-        queryOpts.ids = [anchor.id, ...traversed.map((t) => t.noteId)];
-      }
-
       let results: Note[];
       let nextCursor: string | null = null;
       try {

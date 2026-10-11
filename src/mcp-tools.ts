@@ -589,6 +589,16 @@ function applyTagScopeWrappers(
         throw e;
       }
     }
+    // Anchor must itself be visible (mirrors REST): otherwise a near walk
+    // rooted at a hidden note would count/return visible notes beneath it.
+    const nearRef = (params as any)?.near?.note_id;
+    if (allowed && typeof nearRef === "string") {
+      let anchor: Note | null = null;
+      try { anchor = resolveNote(store.db, nearRef); } catch { anchor = null; }
+      if (!anchor || !noteWithinTagScope(anchor, allowed, rawTags)) {
+        return { error: "Anchor note not found", error_type: "not_found", note_id: nearRef };
+      }
+    }
     const result = await orig(scopeQueryTagParams(params, allowed));
     if (!allowed) return result;
     // `aggregate` mode returns `[{group, value}]` rollup rows — no `.tags`

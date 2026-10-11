@@ -213,14 +213,12 @@ describe("MCP query-notes aggregate — mutual exclusivity with search/near/curs
     ).rejects.toThrow();
   });
 
-  test("aggregate + near is rejected", async () => {
+  test("aggregate + near composes (anchor + neighborhood id set)", async () => {
     seedVault("journal");
     const store = getVaultStore("journal");
     const anchor = await store.createNote("anchor");
     const tool = await queryNotesTool("journal", null);
-    await expect(
-      tool.execute({ near: { note_id: anchor.id }, aggregate: { group_by: "tag", op: "count" } }),
-    ).rejects.toThrow();
+    expect(await tool.execute({ near: { note_id: anchor.id }, aggregate: { op: "count" } })).toEqual([{ group: null, value: 1 }]);
   });
 });
 

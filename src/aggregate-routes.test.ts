@@ -141,13 +141,12 @@ describe("REST GET /notes — aggregate errors", () => {
     expect(body.field).toBe("aggregate");
   });
 
-  it("400s when aggregate is combined with near", async () => {
+  it("aggregate + near is allowed (composes as an id-set scope)", async () => {
     await store.upsertTagRecord("task", { fields: { status: { type: "string", indexed: true } } });
     const anchor = await store.createNote("anchor", { tags: ["task"], metadata: { status: "open" } });
     const res = await get(`?aggregate[group_by]=status&aggregate[op]=count&near[note_id]=${anchor.id}`);
-    expect(res.status).toBe(400);
-    const body: any = await res.json();
-    expect(body.field).toBe("aggregate");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([{ group: "open", value: 1 }]);
   });
 
   it("400s when aggregate is combined with search (no silent fall-through to rows)", async () => {

@@ -475,6 +475,62 @@ export function traverseLinks(
   return results;
 }
 
+export interface NearSpec {
+  depth?: number;
+  relationship?: string;
+  direction?: "outbound" | "inbound" | "both";
+  /** Optional second hop: re-walk from every note in the first neighborhood. */
+  then?: { depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both" };
+}
+
+const NEAR_DIRECTIONS = ["inbound", "outbound", "both"];
+
+/** Returns an error message for a malformed `near` spec, else null. */
+export function validateNearSpec(near: NearSpec): string | null {
+  if (near.direction !== undefined && !NEAR_DIRECTIONS.includes(near.direction)) return "Invalid near.direction";
+  if (near.then !== undefined) {
+    if (typeof near.then !== "object" || near.then === null || Array.isArray(near.then)) return "Invalid near.then";
+    if (near.then.direction !== undefined && !NEAR_DIRECTIONS.includes(near.then.direction)) return "Invalid near.then.direction";
+  }
+  return null;
+}
+
+/**
+ * Resolve a `near` spec to the set of allowed note ids. Without `then`: the
+ * anchor plus its directed neighborhood (depth capped at 5). With `then`: the
+ * first neighborhood (anchor included) is the frontier of a second directed
+ * walk; the result is the notes that second walk reaches (so "tasks whose
+ * `node` points into the subtree"). `isTraversable` (tag-scope wall) applies
+ * at every hop of both walks. Cycles are harmless: each walk has a visited set.
+ */
+export function resolveNearScope(
+  db: Database,
+  anchorId: string,
+  near: NearSpec,
+  isTraversable?: (noteId: string) => boolean,
+): Set<string> {
+  const first = new Set<string>([
+    anchorId,
+    ...traverseLinks(db, anchorId, {
+      max_depth: Math.min(near.depth ?? 2, 5),
+      relationship: near.relationship,
+      direction: near.direction,
+      isTraversable,
+    }).map((t) => t.noteId),
+  ]);
+  if (!near.then) return first;
+  const second = new Set<string>();
+  for (const id of first) {
+    for (const t of traverseLinks(db, id, {
+      max_depth: Math.min(near.then.depth ?? 1, 5),
+      relationship: near.then.relationship,
+      direction: near.then.direction,
+      isTraversable,
+    })) second.add(t.noteId);
+  }
+  return second;
+}
+
 /** Hydrated find-path result — see `hydratePathResult` for field semantics. */
 export interface FindPathResult {
   /** Note IDs, source → target (unchanged shape — back-compat). */

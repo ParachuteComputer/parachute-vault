@@ -799,18 +799,12 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // in depth), but the wall makes it redundant for `near[]`.
         let nearScope: Set<string> | null = null;
         if (params.near) {
-          const near = params.near as { note_id: string; depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both" };
-          if (near.direction !== undefined && !["inbound", "outbound", "both"].includes(near.direction)) return { error: "Invalid near.direction", error_type: "invalid_query" };
+          const near = params.near as { note_id: string } & linkOps.NearSpec;
+          const nearErr = linkOps.validateNearSpec(near);
+          if (nearErr) return { error: nearErr, error_type: "invalid_query" };
           const anchor = resolveNote(db, near.note_id);
           if (!anchor) return { error: "Anchor note not found", error_type: "not_found", note_id: near.note_id };
-          const depth = Math.min(near.depth ?? 2, 5);
-          const traversed = linkOps.traverseLinks(db, anchor.id, {
-            max_depth: depth,
-            relationship: near.relationship,
-            direction: near.direction,
-            isTraversable: nearTraversable,
-          });
-          nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
+          nearScope = linkOps.resolveNearScope(db, anchor.id, near, nearTraversable);
         }
 
         // --- Cursor mode (vault#313) ---
@@ -859,7 +853,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         }
 
         // --- Aggregation / rollup mode (top new-feature ask from a UX round) ---
-        // Mutually exclusive with `search`/`near`/`cursor`/`semantic` — a rollup returns
+        // Mutually exclusive with `search`/`cursor`/`semantic` (it composes with `near`) — a rollup returns
         // one row per group, not a paginated / graph-scoped / ranked note
         // list — so reject those combos loudly before touching the DB.
         if (params.aggregate) {
@@ -868,13 +862,6 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               `aggregate is incompatible with full-text search — pick one.`,
               "INVALID_QUERY",
               { error_type: "invalid_query", field: "aggregate", hint: "drop `search` when using `aggregate`" },
-            );
-          }
-          if (params.near) {
-            throw new QueryError(
-              `aggregate is incompatible with near (graph neighborhood).`,
-              "INVALID_QUERY",
-              { error_type: "invalid_query", field: "aggregate", hint: "drop `near` when using `aggregate`" },
             );
           }
           if (typeof params.cursor === "string") {
@@ -912,6 +899,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const aggExcludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
           const aggExcludeTags = normalizeTags(aggExcludeTagsRaw);
           const aggFilterOpts: QueryOpts = {
+            // near (+ optional `then`) → id set, pushed into SQL before every
+            // other filter; the rollup spans the whole set (no LIMIT).
+            ids: nearScope ? [...nearScope] : undefined,
             tags: aggTags,
             tagMatch: (params.tag_match as "all" | "any") ?? (aggTags && aggTags.length > 1 ? "any" : undefined),
             expand,

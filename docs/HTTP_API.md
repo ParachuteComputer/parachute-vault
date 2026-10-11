@@ -87,7 +87,7 @@ Version history is the first self-hosted-first feature tracked in this table.
 | `include_ambiguous_links` | honored | honored | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7) |
 | `exclude_path_prefix` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
 | repeated `?tag=a&tag=b` (also `exclude_tag`, `exclude_path_prefix`) | accumulates (`getAll` + comma-list) | accumulates (`getAll` + comma-list) | vault#659 on bun; [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
-| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | honored; same four exclusions as bun (`search`, `semantic`, `cursor`, `near` → 400 `invalid_query`) | [cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291) (B2) |
+| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | honored; same exclusions as bun (`search`, `semantic`, `cursor` → 400 `invalid_query`) | [cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291) (B2) |
 | `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | honored (`error`/`ignore`/`update`/`replace`); `existed` returned only in the three engaged modes | [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
 | `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | honored — `{created, ids, failed}`; `created` excludes collision hits, `failed` is always `[]` | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7), [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
 | `search_mode` | honored (`literal`/`advanced`) | 200 + `unsupported_param` warning | cloud v1 is literal-only |
@@ -1195,18 +1195,22 @@ Query params:
     `{group: null, value: ...}` row — standard SQL `GROUP BY` behavior, not
     silently dropped from the rollup. Ungrouped count always uses this
     same `{group: null}` row for the total.
-  - **Mutually exclusive with `cursor`, `near[...]`, `search`, and
-    `semantic`** — a rollup has no pagination watermark, graph-neighborhood,
-    or ranked-search shape to compose with; combining any of them is
-    `400 invalid_query` (`field: "aggregate"`). Bun REST used to silently
+  - **Mutually exclusive with `cursor`, `search`, and `semantic`** — a
+    rollup has no pagination watermark or ranked-search shape to compose
+    with; combining any of them is `400 invalid_query`
+    (`field: "aggregate"`). It **does** compose with `near[...]`: the
+    neighborhood id set is resolved first (tag-scope wall at every hop) and
+    scopes the rollup before all other filters; the rollup spans the whole
+    set (no LIMIT truncation). Subtree rollup, one request:
+    `GET /notes?tag=task&meta[status]=open&near[note_id]=<X>&near[relationship]=parent&near[direction]=inbound&near[depth]=5&near[then][relationship]=node&near[then][direction]=inbound&aggregate[group_by]=owner&aggregate[op]=count`. Bun REST used to silently
     ignore `aggregate[...]` under `search=` and return note rows; the bun
     door now rejects.
   - **Cloud-door coverage (vault#626).** Both cloud doors serve the
     rollup: MCP `query-notes` uses the core-driven aggregate surface, and
     REST parses `aggregate[...]` since cloud B2
     ([cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291)).
-    REST enforces the same four exclusions as bun: `search`, `semantic`,
-    `cursor`, and `near` combined with aggregation return
+    REST enforces the same exclusions as bun: `search`, `semantic`, and
+    `cursor` combined with aggregation return
     `400 invalid_query` (`field: "aggregate"`). The promoted vault-core
     pin also supplies the ungrouped filtered total to both cloud surfaces.
   - **Tag-scope respected.** A tag-scoped token's rollup is computed only
@@ -1225,7 +1229,8 @@ Query params:
   - `near[depth]=N` — default 2, capped at 5.
   - `near[relationship]=cites` — restrict the walked edges.
   - `near[direction]=` — both (default) | inbound = notes that link TO the current note (e.g. children via parent) | outbound = notes the current note links to. Applies at every hop.
-  - Neighborhood scope applies before ordering, limit, and offset, together with tag and metadata filters.
+  - `near[then][relationship|direction|depth]=` — optional second hop. A second directed walk starts from EVERY note in the first neighborhood (anchor included) and the result is the notes it reaches. `then` defaults: direction both, depth 1 (max 5). Use for "A's subtree via `parent`, then notes whose `node` link points into it". Cycles are safe (visited sets); tag-scope wall applies at every hop of both walks, and a scoped token anchoring on an invisible note gets 404.
+  - Neighborhood scope applies before ordering, limit, and offset, together with tag and metadata filters; under `aggregate` it scopes the whole rollup.
 
 - **Sort + paging**
   - `sort=asc|desc` — by `created_at`. Default `asc`. (vault#555 fix — this
