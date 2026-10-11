@@ -1964,10 +1964,10 @@ async function handleNotesInner(
       // Aggregation / rollup mode (top new-feature ask from a UX round).
       // Mutually exclusive with cursor/search/semantic — a rollup returns one
       // row per group, not a paginated note list — so reject those
-      // combos loudly. It composes with `near`: the neighborhood id set scopes
-      // the rollup (vault#779). before touching the DB, then short-circuit: none of
-      // the normal-query output machinery below (expand, include_links,
-      // metadata filtering, ...) applies to rollup rows.
+      // combos loudly before touching the DB. It composes with `near`: the
+      // neighborhood id set scopes the rollup (vault#779). After the rollup we
+      // short-circuit: none of the normal-query output machinery below
+      // (expand, include_links, metadata filtering, ...) applies to rollup rows.
       const aggregateParsed = parseAggregateParam(url);
       if (aggregateParsed.error) return aggregateParsed.error;
       if (aggregateParsed.aggregate) {
