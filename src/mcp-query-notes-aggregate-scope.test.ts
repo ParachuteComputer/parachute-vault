@@ -196,7 +196,7 @@ describe("MCP query-notes aggregate — count without group_by (vault#626)", () 
   });
 });
 
-describe("MCP query-notes aggregate — mutual exclusivity with search/near/cursor", () => {
+describe("MCP query-notes aggregate — mutual exclusivity with search/cursor (composes with near)", () => {
   test("aggregate + search is rejected", async () => {
     seedVault("journal");
     const tool = await queryNotesTool("journal", null);

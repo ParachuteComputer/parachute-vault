@@ -888,6 +888,8 @@ export class BunSqliteStore implements Store {
       if (!source?.metadata) continue;
       const resolution = resolveNoteSchemas(this.getSchemaConfig(), { tags: source.tags ?? [] });
       if (resolution.mergedFields.size === 0) continue;
+      // Skip sources whose tags declare no reference fields at all.
+      if (![...relationships].some((f) => resolution.mergedFields.get(f)?.spec.type === "reference")) continue;
 
       let next: Record<string, unknown> | undefined;
       for (const field of relationships) {

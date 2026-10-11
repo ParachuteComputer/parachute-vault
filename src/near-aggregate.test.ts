@@ -164,10 +164,37 @@ test("existing behaviour unchanged: near without aggregate returns notes; aggreg
   expect(bad.status).toBe(400);
 });
 
-test("`then` validation: needs near, bad direction, depth capped", async () => {
+test("`then` validation: bad direction is a 400 (MCP + REST)", async () => {
   const { store, R } = await seed();
   const r1: any = await tool(null).execute({ near: { note_id: R.id, then: { direction: "sideways" } }, aggregate: { op: "count" } });
   expect(r1.error_type).toBe("invalid_query");
   const r2 = await rest(store, restParams(R.id, { "near[then][direction]": "sideways" }));
   expect(r2.status).toBe(400);
+});
+
+test("REST near[then][...] without near[note_id] is a 400 with a clear message", async () => {
+  const { store } = await seed();
+  const p = new URLSearchParams({ tag: "task", "near[then][direction]": "inbound" });
+  const res = await rest(store, p);
+  expect(res.status).toBe(400);
+  const body: any = await res.json();
+  expect(body.error_type).toBe("invalid_query");
+  expect(body.field).toBe("near");
+  expect(body.error).toContain("near[note_id]");
+});
+
+test("scoped-token rename repairs reference metadata (store-level, like the wikilink cascade)", async () => {
+  const store = getVaultStore("na");
+  await store.upsertTagRecord("task", { fields: { node: { type: "reference" } } });
+  const parent = await store.createNote("p", { path: "Projects/Old", tags: ["work"] });
+  const child = await store.createNote("c", { tags: ["task"], metadata: { node: "Projects/Old" } });
+  const update = (() => {
+    const auth: AuthResult = {
+      permission: "full", scopes: ["vault:na:write"], legacyDerived: false,
+      scoped_tags: ["work"], vault_name: null, caller_jti: null, actor: "test", via: "api",
+    };
+    return generateScopedMcpTools("na", auth).find((t) => t.name === "update-note")!;
+  })();
+  await update.execute({ id: parent.id, path: "Projects/New", force: true });
+  expect((await store.getNote(child.id))!.metadata!.node).toBe("Projects/New");
 });

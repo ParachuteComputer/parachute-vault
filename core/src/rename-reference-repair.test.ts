@@ -125,4 +125,22 @@ describe("rename repairs reference-field metadata (path change)", () => {
     await store.updateNote(parent.id, { path: "Projects/Old", content: "edit" });
     expect((await store.getNote(child.id))!.updatedAt).toBe(before.updatedAt);
   });
+
+  it("repairs two notes renamed in sequence (batch/folder style), including a chained rename", async () => {
+    const a = await store.createNote("a", { path: "Projects/A" });
+    const b = await store.createNote("b", { path: "Projects/B" });
+    const child = await store.createNote("c", {
+      tags: ["task"],
+      metadata: { node: "Projects/A", deps: ["Projects/B", "Projects/A"] },
+    });
+    await store.updateNote(a.id, { path: "Archive/A" });
+    await store.updateNote(b.id, { path: "Archive/B" });
+    let m = (await store.getNote(child.id))!.metadata!;
+    expect(m.node).toBe("Archive/A");
+    expect(m.deps).toEqual(["Archive/B", "Archive/A"]);
+    await store.updateNote(a.id, { path: "Archive/A2" });
+    m = (await store.getNote(child.id))!.metadata!;
+    expect(m.node).toBe("Archive/A2");
+    expect(m.deps).toEqual(["Archive/B", "Archive/A2"]);
+  });
 });

@@ -1905,6 +1905,18 @@ async function handleNotesInner(
 
       // Resolve the neighborhood before ordering and pagination.
       const nearNoteId = parseQuery(url, "near[note_id]");
+      if (!nearNoteId) {
+        const orphan = ["near[then][relationship]", "near[then][direction]", "near[then][depth]"].find((k) => parseQuery(url, k) !== null);
+        if (orphan) {
+          return json({
+            error: `${orphan} requires near[note_id] — the second hop needs a first-hop anchor.`,
+            code: "INVALID_QUERY",
+            error_type: "invalid_query",
+            field: "near",
+            hint: "pass near[note_id]=<anchor> or drop near[then][...]",
+          }, 400);
+        }
+      }
       if (nearNoteId) {
         const anchor = await resolveNote(store, nearNoteId);
         if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
@@ -1950,9 +1962,10 @@ async function handleNotesInner(
       }
 
       // Aggregation / rollup mode (top new-feature ask from a UX round).
-      // Mutually exclusive with cursor/near — a rollup returns one row per
-      // group, not a paginated/graph-scoped note list — so reject those
-      // combos loudly before touching the DB, then short-circuit: none of
+      // Mutually exclusive with cursor/search/semantic — a rollup returns one
+      // row per group, not a paginated note list — so reject those
+      // combos loudly. It composes with `near`: the neighborhood id set scopes
+      // the rollup (vault#779). before touching the DB, then short-circuit: none of
       // the normal-query output machinery below (expand, include_links,
       // metadata filtering, ...) applies to rollup rows.
       const aggregateParsed = parseAggregateParam(url);

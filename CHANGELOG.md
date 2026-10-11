@@ -4,6 +4,18 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- `query-notes` / `GET /notes`: `near.direction` (`both` | `inbound` | `outbound`, applied at every hop) for directed graph traversal (#777), with the REST `near` scope now applied before pagination (#778).
+- `near.then` / `near[then][relationship|direction|depth]`: optional second hop that walks from every first-hop note (anchor included), enabling a subtree rollup in one request (#779).
+- `aggregate` now composes with `near` (the neighborhood id set scopes the rollup before every other filter); it remains exclusive with `search`, `cursor` and `semantic` (#779).
+
+### Changed
+- MCP `query-notes` with a tag-scoped token anchoring `near` on a note it cannot see now returns `not_found`, matching REST (previously it walked from the hidden anchor and returned visible neighbours) (#779).
+- REST `near[then][...]` without `near[note_id]` now returns `400 invalid_query` (`field: "near"`) instead of being silently ignored; the invalid-direction message is now `Invalid near.direction` with `code`/`field` (#779).
+- **Rename repair behaviour:** renaming a note now also rewrites `type: "reference"` metadata values (scalar or many-arrays) in other notes that named it by its old path, in the same transaction as the wikilink cascade. Repaired notes get a `cascade-rename` version and a bumped `updated_at` but, like the wikilink cascade, do not fire `updated` webhooks/hooks (#781).
+
 ## [0.7.9] - 2026-09-22
 
 **Stable promotion of 0.7.9-rc.9.** No new code. Suffix-drop only. npm `@rc`

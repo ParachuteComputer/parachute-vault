@@ -87,7 +87,7 @@ Version history is the first self-hosted-first feature tracked in this table.
 | `include_ambiguous_links` | honored | honored | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7) |
 | `exclude_path_prefix` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
 | repeated `?tag=a&tag=b` (also `exclude_tag`, `exclude_path_prefix`) | accumulates (`getAll` + comma-list) | accumulates (`getAll` + comma-list) | vault#659 on bun; [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
-| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | honored; same exclusions as bun (`search`, `semantic`, `cursor` → 400 `invalid_query`) | [cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291) (B2) |
+| `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | honored; same exclusions as bun (`search`, `semantic`, `cursor` → 400 `invalid_query`); `aggregate`+`near` only after cloud repins the vault | [cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291) (B2) |
 | `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | honored (`error`/`ignore`/`update`/`replace`); `existed` returned only in the three engaged modes | [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
 | `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | honored — `{created, ids, failed}`; `created` excludes collision hits, `failed` is always `[]` | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7), [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
 | `search_mode` | honored (`literal`/`advanced`) | 200 + `unsupported_param` warning | cloud v1 is literal-only |
@@ -1202,9 +1202,11 @@ Query params:
     neighborhood id set is resolved first (tag-scope wall at every hop) and
     scopes the rollup before all other filters; the rollup spans the whole
     set (no LIMIT truncation). Subtree rollup, one request:
-    `GET /notes?tag=task&meta[state]=open&near[note_id]=<X>&near[relationship]=parent&near[direction]=inbound&near[depth]=5&near[then][relationship]=node&near[then][direction]=inbound&aggregate[group_by]=owner&aggregate[op]=count`. Bun REST used to silently
-    ignore `aggregate[...]` under `search=` and return note rows; the bun
-    door now rejects.
+    `GET /notes?tag=task&meta[state]=open&near[note_id]=<X>&near[relationship]=parent&near[direction]=inbound&near[depth]=5&near[then][relationship]=node&near[then][direction]=inbound&aggregate[group_by]=owner&aggregate[op]=count`. Bun REST now rejects
+    `aggregate[...]` combined with `search=` (`400 invalid_query`); earlier
+    builds silently ignored `aggregate` there and returned plain note rows.
+    `near[then][...]` without `near[note_id]` is a `400 invalid_query`
+    (`field: "near"`), not silently ignored.
   - **Cloud-door coverage (vault#626).** Both cloud doors serve the
     rollup: MCP `query-notes` uses the core-driven aggregate surface, and
     REST parses `aggregate[...]` since cloud B2
@@ -1213,6 +1215,9 @@ Query params:
     `cursor` combined with aggregation return
     `400 invalid_query` (`field: "aggregate"`). The promoted vault-core
     pin also supplies the ungrouped filtered total to both cloud surfaces.
+    `aggregate` + `near[...]` (including `near[then]`) works on the bun door
+    now; the cloud door supports it only after cloud repins the vault-core
+    version that includes it.
   - **Tag-scope respected.** A tag-scoped token's rollup is computed only
     over notes it can see — exactly like a normal query — AND, under
     `group_by: "tag"`, group NAMES themselves are scrubbed to the token's
@@ -1709,6 +1714,17 @@ is ignored.
 (when any tag declares fields) plus `created: true|false`.
 `include_content: false` returns the lean `NoteIndex` shape with the same
 attached fields.
+
+**Rename side effects (path change).** Besides rewriting `[[wikilinks]]` in
+other notes' content, a rename repairs `type: "reference"` metadata values
+(scalar or cardinality-many arrays) in other notes that name the renamed note
+by its OLD path: they are rewritten to the new path (ids and titles are left
+alone; only fields declared `reference` on a tag the source note carries).
+Repaired notes get a version snapshot (`cascade-rename`) and a bumped
+`updated_at`, but, exactly like the wikilink cascade, they do **not** fire
+`updated` webhooks/hooks — only the renamed note dispatches. Consumers that
+mirror reference metadata must re-read, or watch the renamed note's event.
+Both cascades are store-level and not tag-scope filtered.
 
 Error shapes (`error_type` — see the "Error taxonomy" section above for the full field contract):
 
