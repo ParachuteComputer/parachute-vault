@@ -16,7 +16,11 @@ one-command setup; one Bun server (port 1940) hosts many vaults, each its own SQ
 
 - Bun for everything (`Bun.serve`, `bun:sqlite`, `Bun.$`, `bun test`). No Node.js.
 - Bare primitives: vaults start blank — clients bring their own tag schema. Opt-in seed
-  packs live in `core/src/seed-packs.ts` (`add-pack <name>`).
+  packs live in `core/src/seed-packs.ts` (`add-pack <name>`). External data packs
+  use `packs add|list|remove` (see `docs/external-packs.md`); state is in each
+  vault's `packs/`, migrated from legacy `modules/`. Connector/views declarations
+  are inert hub module data. SQLite data_version invalidates schema/hierarchy
+  caches after external CLI writes, without restarting the daemon.
 - `[[wikilinks]]` in content are parsed and maintained as links automatically; paths are
   normalized + UNIQUE and drive wikilink resolution.
 - `vault.yaml`'s description is served as the MCP session instruction — the vault teaches

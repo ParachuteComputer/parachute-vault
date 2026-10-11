@@ -1,5 +1,8 @@
-/** External module lifecycle. Connector declarations are data, never executed. */
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, statSync } from "node:fs";
+/** External packs contain data shapes: tags, fields and starter notes.
+ * `connector` and `views` are accepted as inert data belonging to a hub module;
+ * the vault never executes connectors or installs interfaces.
+ */
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, statSync, rmdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Store, TagRecord } from "../core/src/types.ts";
 import type { SeedPack, SeedPackTag } from "../core/src/seed-packs.ts";
@@ -8,7 +11,7 @@ import { validatePath } from "../core/src/notes.ts";
 import { validateFieldName } from "../core/src/indexed-fields.ts";
 import { collectOwnFieldDefaultAndTypeViolations } from "../core/src/tag-schemas.ts";
 
-export interface ModuleManifest extends SeedPack {
+export interface PackManifest extends SeedPack {
   id: string;
   version: string;
   requires?: string[];
@@ -24,19 +27,19 @@ function strings(v: unknown): v is string[] {
   return Array.isArray(v) && v.every(x => typeof x === "string" && x.length > 0);
 }
 function check(ok: unknown, message: string): asserts ok {
-  if (!ok) throw new Error(`Invalid module: ${message}`);
+  if (!ok) throw new Error(`Invalid pack: ${message}`);
 }
 function keys(v: Record<string, any>, allowed: string[]) {
   check(Object.keys(v).every(k => allowed.includes(k)), `unknown keys: ${Object.keys(v).filter(k => !allowed.includes(k)).join(", ")}`);
 }
-export function validateManifest(v: unknown): ModuleManifest {
+export function validateManifest(v: unknown): PackManifest {
   check(object(v), "manifest must be an object");
   keys(v, ["id", "name", "version", "description", "requires", "tags", "notes", "views", "connector"]);
   check(typeof v.id === "string" && ID.test(v.id), "id must be a lowercase slug");
   check(typeof v.version === "string" && VERSION.test(v.version), "version must be stable MAJOR.MINOR.PATCH");
   check(typeof v.name === "string" && v.name.length > 0 && typeof v.description === "string", "name/description required");
   check(Array.isArray(v.tags) && Array.isArray(v.notes), "tags/notes must be arrays");
-  check(v.requires === undefined || (strings(v.requires) && v.requires.every(x => ID.test(x) && x !== v.id)), "requires must be module ids (no self dependency)");
+  check(v.requires === undefined || (strings(v.requires) && v.requires.every(x => ID.test(x) && x !== v.id)), "requires must be pack ids (no self dependency)");
   const names = new Set<string>(), paths = new Set<string>();
   for (const tag of v.tags) {
     check(object(tag), "tag must be an object");
@@ -78,10 +81,27 @@ export function validateManifest(v: unknown): ModuleManifest {
     check(strings(c.scope.tags) && c.scope.tags.length > 0 && strings(c.scope.verbs) && c.scope.verbs.length > 0 && c.scope.verbs.every(x => ["read", "write"].includes(x)), "connector requires explicit tags and read/write verbs");
     check(strings(c.publishes), "connector publishes must be strings");
   }
-  return v as ModuleManifest;
+  return v as PackManifest;
 }
 const MAX_BYTES = 1024 * 1024;
-export async function loadManifest(source: string): Promise<ModuleManifest> {
+/** Migrate legacy registrations once. Conflicting files are never overwritten.
+ * A partial migration is safe to retry; refuse an active legacy operation. */
+export function migratePackState(vaultDir: string): string {
+  const dir = join(vaultDir, "packs"), legacy = join(vaultDir, "modules");
+  if (!existsSync(legacy)) return dir;
+  if (existsSync(join(legacy, ".lock"))) throw new Error("Legacy pack operation locked; retry after it finishes");
+  if (!existsSync(dir)) { renameSync(legacy, dir); return dir; }
+  if (existsSync(join(dir, ".lock"))) throw new Error("Pack operation locked; retry migration after it finishes");
+  const entries = readdirSync(legacy);
+  for (const name of entries) {
+    if (existsSync(join(dir, name))) throw new Error(`Pack migration conflict: ${name}; both registrations preserved`);
+  }
+  for (const name of entries) renameSync(join(legacy, name), join(dir, name));
+  rmdirSync(legacy);
+  return dir;
+}
+
+export async function loadManifest(source: string): Promise<PackManifest> {
   let body: string;
   if (/^https?:\/\//.test(source)) {
     const response = await fetch(source, { signal: AbortSignal.timeout(15000) });
@@ -96,8 +116,8 @@ export async function loadManifest(source: string): Promise<ModuleManifest> {
   } else {
     let path = resolve(source);
     if (statSync(path).isDirectory()) {
-      const found = ["module.yaml", "module.json"].map(n => join(path, n)).find(existsSync);
-      if (!found) throw new Error(`No module.yaml or module.json in ${path}`);
+      const found = ["pack.yaml", "pack.json", "module.yaml", "module.json"].map(n => join(path, n)).find(existsSync);
+      if (!found) throw new Error(`No pack.yaml or pack.json (or legacy module.yaml/module.json) in ${path}`);
       path = found;
     }
     if (statSync(path).size > MAX_BYTES) throw new Error("Manifest exceeds 1 MiB");
@@ -117,8 +137,8 @@ function equal(a: unknown, b: unknown) { return JSON.stringify(canonical(a)) ===
 function shape(t: SeedPackTag | TagRecord) {
   return { description: t.description ?? "", fields: t.fields ?? {}, parent_names: t.parent_names ?? [] };
 }
-interface State { format: 1; manifest: ModuleManifest; active: boolean; complete: boolean; owned: Record<string, ReturnType<typeof shape>> }
-function statePath(dir: string, id: string) { check(ID.test(id), "invalid module id"); return join(dir, `${id}.json`); }
+interface State { format: 1; manifest: PackManifest; active: boolean; complete: boolean; owned: Record<string, ReturnType<typeof shape>> }
+function statePath(dir: string, id: string) { check(ID.test(id), "invalid pack id"); return join(dir, `${id}.json`); }
 function readState(dir: string, id: string): State | null {
   const file = statePath(dir, id);
   if (!existsSync(file)) return null;
@@ -134,19 +154,19 @@ function save(dir: string, s: State) {
   writeFileSync(`${file}.tmp`, content, { mode: 0o600 });
   renameSync(`${file}.tmp`, file);
 }
-function moduleStates(dir: string): State[] {
+function packStates(dir: string): State[] {
   if (!existsSync(dir)) return [];
   return readdirSync(dir).filter(n => n.endsWith(".json")).map(n => readState(dir, n.slice(0, -5))!);
 }
-export function listModules(dir: string) {
-  return moduleStates(dir).filter(s => s.active && s.complete).map(s => ({ id: s.manifest.id, version: s.manifest.version }));
+export function listPacks(dir: string) {
+  return packStates(dir).filter(s => s.active && s.complete).map(s => ({ id: s.manifest.id, version: s.manifest.version }));
 }
 function compareVersion(a: string, b: string) {
   const aa = a.split(".").map(BigInt), bb = b.split(".").map(BigInt);
   for (let i = 0; i < 3; i++) if (aa[i] !== bb[i]) return aa[i]! > bb[i]! ? 1 : -1;
   return 0;
 }
-export async function installModule(store: Store, dir: string, manifest: ModuleManifest): Promise<string[]> {
+export async function installPack(store: Store, dir: string, manifest: PackManifest): Promise<string[]> {
   validateManifest(manifest);
   const old = readState(dir, manifest.id);
   if (old?.active) {
@@ -154,7 +174,7 @@ export async function installModule(store: Store, dir: string, manifest: ModuleM
     if (version < 0) throw new Error("Downgrade refused");
     if (version === 0 && !equal(manifest, old.manifest)) throw new Error("Manifest changed without a version bump");
   }
-  for (const dep of manifest.requires ?? []) if (!readState(dir, dep)?.complete || !readState(dir, dep)?.active) throw new Error(`Missing required module: ${dep}`);
+  for (const dep of manifest.requires ?? []) if (!readState(dir, dep)?.complete || !readState(dir, dep)?.active) throw new Error(`Missing required pack: ${dep}`);
   const state: State = { format: 1, manifest, active: true, complete: !!(old?.active && old.complete && equal(old.manifest, manifest)), owned: { ...(old?.owned ?? {}) } };
   const log: string[] = [];
   // Save progress after each item: retries preserve ownership of completed writes.
@@ -185,16 +205,16 @@ export async function installModule(store: Store, dir: string, manifest: ModuleM
   state.complete = true; save(dir, state);
   return log;
 }
-export async function removeModule(store: Store, dir: string, id: string): Promise<string[]> {
+export async function removePack(store: Store, dir: string, id: string): Promise<string[]> {
   const state = readState(dir, id);
-  if (!state?.active) return [`= module ${id} absent`];
-  for (const other of moduleStates(dir).filter(s => s.active)) {
+  if (!state?.active) return [`= pack ${id} absent`];
+  for (const other of packStates(dir).filter(s => s.active)) {
     if (other.manifest.id !== id && other.manifest.requires?.includes(id)) throw new Error(`Required by ${other.manifest.id}`);
   }
   const log: string[] = [];
   for (const [tag, snapshot] of Object.entries(state.owned)) {
     const current = await store.getTagRecord(tag);
-    const shared = moduleStates(dir).some(s => s.active && s.manifest.id !== id && s.manifest.tags.some(t => t.name === tag));
+    const shared = packStates(dir).some(s => s.active && s.manifest.id !== id && s.manifest.tags.some(t => t.name === tag));
     if (current && equal(shape(current), snapshot) && !shared) {
       // Keep tag identity and assignments. Clear only schema/hierarchy we own.
       await store.upsertTagRecord(tag, { fields: null, parent_names: null }); state.owned[tag] = shape((await store.getTagRecord(tag))!); save(dir, state); log.push(`- schema ${tag}`);

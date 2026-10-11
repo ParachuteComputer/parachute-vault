@@ -981,6 +981,14 @@ wizard, `parachute init --vault-name <name>`, or `parachute-vault create
 **Railway** ($5/mo) — Deploy from GitHub, persistent volume, public URL.
 **Fly.io** ($3-5/mo) — `fly launch --copy-config && fly volumes create vault_data --size 1 && fly deploy`
 
+### Data packs
+
+Install external tags, fields and starter notes with `parachute-vault packs add
+<file|dir|URL>`, inspect them with `packs list`, and unregister them with
+`packs remove <id>`. `add-pack <path>` remains an alias; built-in pack names
+still work. A running daemon picks up schema changes automatically. See
+[external packs](docs/external-packs.md) for manifests, migration and ownership.
+
 ## Requirements
 
 - **Bun** — `curl -fsSL https://bun.sh/install | bash` ([bun.sh](https://bun.sh)).

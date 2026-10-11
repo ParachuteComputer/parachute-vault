@@ -107,9 +107,23 @@ export class BunSqliteStore implements Store {
   // parent_names, schema validation via `fields`. Null means "not yet
   // loaded or invalidated"; the next read rebuilds. We invalidate
   // synchronously inside the writers that mutate the source rows so reads
-  // after writes always see the post-write state.
+  // after writes always see the post-write state. External commits are
+  // detected via SQLite data_version at each accessor.
   private _tagHierarchy: TagHierarchy | null = null;
   private _schemaConfig: ResolvedSchemas | null = null;
+  private configDataVersion: number | undefined;
+
+  /** SQLite data_version changes on commits by OTHER connections (e.g. CLI
+   * pack installation). Check at both cache accessors so validation, defaults,
+   * reference fields and scope/hierarchy expansion see external writes too.
+   * Local writers keep their existing synchronous invalidation. */
+  private refreshExternalConfigWrites(): void {
+    const { data_version } = this.db.query("PRAGMA data_version").get() as { data_version: number };
+    if (this.configDataVersion !== data_version) {
+      this.rebuildConfigCaches();
+      this.configDataVersion = data_version;
+    }
+  }
 
   /**
    * The active `EmbeddingProvider` (EXPERIMENTAL — semantic search MVP),
@@ -169,6 +183,7 @@ export class BunSqliteStore implements Store {
    * object as READ-ONLY — it's the shared cache, invalidated by writers.
    */
   getTagHierarchy(): TagHierarchy {
+    this.refreshExternalConfigWrites();
     if (!this._tagHierarchy) this._tagHierarchy = loadTagHierarchy(this.db);
     return this._tagHierarchy;
   }
@@ -178,6 +193,7 @@ export class BunSqliteStore implements Store {
    * the tag hierarchy cache.
    */
   private getSchemaConfig(): ResolvedSchemas {
+    this.refreshExternalConfigWrites();
     if (!this._schemaConfig) this._schemaConfig = loadSchemaConfig(this.db);
     return this._schemaConfig;
   }
