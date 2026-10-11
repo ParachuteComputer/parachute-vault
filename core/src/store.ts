@@ -30,6 +30,7 @@ import {
   noteResolutionKeys,
   pathResolutionKeys,
   requeueInboundWikilinksForDelete,
+  resolveLinkTargetDetailed,
 } from "./wikilinks.js";
 import { normalizePath } from "./paths.js";
 import { chunkForInClause } from "./sql-in.js";
@@ -206,7 +207,15 @@ export class BunSqliteStore implements Store {
    * without re-importing the config loader.
    */
   validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): ValidationStatus | null {
-    return runValidateNote(this.getSchemaConfig(), note);
+    return runValidateNote(this.getSchemaConfig(), note, (value) => {
+      // Same id → path/basename/title resolution the reference auto-link uses.
+      const hit = resolveLinkTargetDetailed(this.db, value);
+      if (!hit.resolved || !hit.note_id) return { status: "unresolved" };
+      const rows = this.db
+        .prepare("SELECT tag_name FROM note_tags WHERE note_id = ?")
+        .all(hit.note_id) as { tag_name: string }[];
+      return { status: "resolved", tags: rows.map((r) => r.tag_name) };
+    });
   }
 
   /**

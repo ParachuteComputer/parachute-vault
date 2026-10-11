@@ -64,6 +64,11 @@ export interface TagFieldSchema {
    * declared", never as a stored `null`.
    */
   default?: unknown;
+  /**
+   * `type: "reference"` only. Opt-in: the referenced note must carry one of
+   * these tags (or a subtype via `parent_names`). See schema-defaults.ts.
+   */
+  target_tags?: string[];
 }
 
 /**
@@ -313,6 +318,27 @@ export function validateFieldType(field: string, spec: TagFieldSchema): TagField
   };
 }
 
+/** `target_tags` must be a non-empty array of non-empty strings, and only on `reference` fields. */
+export function validateTargetTags(field: string, spec: TagFieldSchema): TagFieldViolation | null {
+  if (spec.target_tags === undefined) return null;
+  const tt = spec.target_tags as unknown;
+  if (!Array.isArray(tt) || tt.length === 0 || !tt.every((t) => typeof t === "string" && t.trim() !== "")) {
+    return {
+      field,
+      reason: "invalid_target_tags",
+      message: `field "${field}" target_tags must be a non-empty array of tag names`,
+    };
+  }
+  if (spec.type !== "reference") {
+    return {
+      field,
+      reason: "invalid_target_tags",
+      message: `field "${field}" declares target_tags but has type "${spec.type}" — target_tags only applies to type "reference"`,
+    };
+  }
+  return null;
+}
+
 /**
  * Combined own-field `default` + `type` violation collection — no cross-tag
  * lookups needed, so no `db` parameter (unlike
@@ -332,6 +358,8 @@ export function collectOwnFieldDefaultAndTypeViolations(
     if (typeViolation) violations.push(typeViolation);
     const defaultViolation = validateFieldDefault(fieldName, spec);
     if (defaultViolation) violations.push(defaultViolation);
+    const ttViolation = validateTargetTags(fieldName, spec);
+    if (ttViolation) violations.push(ttViolation);
   }
   return violations;
 }
@@ -630,7 +658,8 @@ export interface TagFieldViolation {
     | "unsupported_indexed_type"
     | "invalid_field_name"
     | "invalid_default"
-    | "invalid_type";
+    | "invalid_type"
+    | "invalid_target_tags";
   message: string;
   /**
    * The conflicting declarer tag — present on the cross-tag reasons

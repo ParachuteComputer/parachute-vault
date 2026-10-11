@@ -102,6 +102,15 @@ export interface SchemaField {
    * metadata fields).
    */
   cardinality?: "one" | "many";
+  /**
+   * `type: "reference"` only. Opt-in target-type check: the note the value
+   * resolves to must carry at least one of these tags (or a descendant of one,
+   * via `parent_names`). Violation → `target_tag_mismatch` (advisory; a hard
+   * rejection when the field is `strict: true`). A value that doesn't resolve
+   * to a note yet (queued forward-ref, or ambiguous) → `unresolved_reference`,
+   * which is ALWAYS advisory — queued references must keep working.
+   */
+  target_tags?: string[];
 }
 
 /**
@@ -137,6 +146,8 @@ export interface ValidationWarning {
     | "enum_mismatch"
     | "missing_required"
     | "cardinality_mismatch"
+    | "target_tag_mismatch"
+    | "unresolved_reference"
     | "schema_conflict";
   message: string;
   /**
@@ -188,6 +199,10 @@ function parseFieldsJson(raw: string | null): Record<string, SchemaField> {
     if (f.strict === true) field.strict = true;
     if (f.required === true) field.required = true;
     if (f.cardinality === "one" || f.cardinality === "many") field.cardinality = f.cardinality;
+    if (Array.isArray(f.target_tags)) {
+      const tt = f.target_tags.filter((x): x is string => typeof x === "string" && x.length > 0);
+      if (tt.length > 0) field.target_tags = tt;
+    }
     fields[k] = field;
   }
   return fields;
@@ -400,6 +415,7 @@ export function normalizeDateFields(
 function fieldSpecsEqual(a: SchemaField, b: SchemaField): boolean {
   if (a.type !== b.type) return false;
   if (!stringArraysEqual(a.enum, b.enum)) return false;
+  if (!stringArraysEqual(a.target_tags, b.target_tags)) return false;
   return true;
 }
 
@@ -478,6 +494,26 @@ function valueMatchesType(value: unknown, type: SchemaField["type"], cardinality
 }
 
 /**
+ * Resolves a `reference` field value to the tags of the note it points at.
+ * Supplied by the store (needs DB access); when omitted, `target_tags` is not
+ * checked. `unresolved` covers both "no such note yet" and "ambiguous".
+ */
+export type ReferenceTargetLookup = (
+  value: string,
+) => { status: "resolved"; tags: string[] } | { status: "unresolved" };
+
+/** True when any of `noteTags` is, or descends (via parent_names) from, one of `targetTags`. */
+function tagsSatisfyTargets(resolved: ResolvedSchemas, noteTags: string[], targetTags: string[]): boolean {
+  const wanted = new Set(targetTags);
+  for (const t of noteTags) {
+    const chain: string[] = [];
+    walkAncestors(t, resolved, new Set(), chain);
+    if (chain.some((c) => wanted.has(c))) return true;
+  }
+  return false;
+}
+
+/**
  * Validate a note's metadata against the merged schema. Returns null when no
  * ancestor declares any fields (so the caller can omit `validation_status`
  * entirely). Otherwise returns the status with conflict warnings prepended,
@@ -506,6 +542,7 @@ function valueMatchesType(value: unknown, type: SchemaField["type"], cardinality
 export function validateNote(
   resolved: ResolvedSchemas,
   note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+  ctx?: ReferenceTargetLookup,
 ): ValidationStatus | null {
   const resolution = resolveNoteSchemas(resolved, note);
   if (resolution.mergedFields.size === 0) return null;
@@ -560,6 +597,31 @@ export function validateNote(
         message: `'${fieldName}' must be one of [${spec.enum.join(", ")}] (tag '${sourceTag}')`,
         ...strictFlag,
       });
+    }
+
+    if (spec.type === "reference" && spec.target_tags && spec.target_tags.length > 0 && ctx) {
+      const values = Array.isArray(value) ? value : [value];
+      for (const v of values) {
+        if (typeof v !== "string" || v.trim() === "") continue; // shape errors are type_mismatch's job
+        const hit = ctx(v);
+        if (hit.status === "unresolved") {
+          // Always advisory (never `strict`): a queued forward-ref is a supported state.
+          warnings.push({
+            field: fieldName,
+            schema: sourceTag,
+            reason: "unresolved_reference",
+            message: `'${fieldName}' value "${v}" does not resolve to a note yet, so target_tags [${spec.target_tags.join(", ")}] could not be checked (tag '${sourceTag}')`,
+          });
+        } else if (!tagsSatisfyTargets(resolved, hit.tags, spec.target_tags)) {
+          warnings.push({
+            field: fieldName,
+            schema: sourceTag,
+            reason: "target_tag_mismatch",
+            message: `'${fieldName}' value "${v}" must reference a note tagged one of [${spec.target_tags.join(", ")}] (tag '${sourceTag}'); target carries [${hit.tags.join(", ")}]`,
+            ...strictFlag,
+          });
+        }
+      }
     }
 
     if (spec.cardinality) {

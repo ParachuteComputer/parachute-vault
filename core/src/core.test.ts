@@ -9432,3 +9432,104 @@ describe("validatePath — reject NUL / '..' at the write surface", () => {
     expect(() => validatePath("   ")).not.toThrow(); // normalizes to null
   });
 });
+
+describe("reference target_tags", async () => {
+  let store: SqliteStore;
+  let N: any;
+  beforeEach(async () => {
+    store = new SqliteStore(new Database(":memory:"));
+    await store.upsertTagRecord("node", {});
+    await store.upsertTagRecord("server", { parent_names: ["node"] });
+    await store.upsertTagRecord("person", {});
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"] } },
+    });
+  });
+  const warnsOf = (n: any, reason: string) =>
+    (store.validateNoteAgainstSchemas({ tags: n.tags, metadata: n.metadata })?.warnings ?? []).filter((w) => w.reason === reason);
+
+  it("accepts a target carrying the right tag", async () => {
+    await store.createNote("x", { path: "N/a", tags: ["node"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "N/a" } });
+    expect(warnsOf(t, "target_tag_mismatch")).toHaveLength(0);
+  });
+  it("accepts a subtype via parent_names", async () => {
+    await store.createNote("x", { path: "N/s", tags: ["server"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "N/s" } });
+    expect(warnsOf(t, "target_tag_mismatch")).toHaveLength(0);
+  });
+  it("warns (advisory) on the wrong type", async () => {
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "P/bob" } });
+    const w = warnsOf(t, "target_tag_mismatch");
+    expect(w).toHaveLength(1);
+    expect(w[0].strict).toBeUndefined();
+  });
+  it("marks the warning strict when the field is strict", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"], strict: true } },
+    });
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "P/bob" } });
+    expect(warnsOf(t, "target_tag_mismatch")[0].strict).toBe(true);
+  });
+  it("strict field: create-note rejects a wrong-type target, accepts subtype, tolerates unresolved", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"], strict: true } },
+    });
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    await store.createNote("s", { path: "N/s", tags: ["server"] });
+    const tools = generateMcpTools(store);
+    const cn = tools.find((x: any) => x.name === "create-note")!;
+    await expect(cn.execute({ content: "t", tags: ["task"], metadata: { node: "P/bob" } })).rejects.toThrow(/target_tag_mismatch|schema_validation/);
+    await cn.execute({ content: "t2", tags: ["task"], metadata: { node: "N/s" } });
+    await cn.execute({ content: "t3", tags: ["task"], metadata: { node: "N/nowhere" } });
+  });
+  it("unresolved target: advisory unresolved_reference, never strict, link still queued", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"], strict: true } },
+    });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "N/later" } });
+    const w = warnsOf(t, "unresolved_reference");
+    expect(w).toHaveLength(1);
+    expect(w[0].strict).toBeUndefined();
+    const later = await store.createNote("x", { path: "N/later", tags: ["node"] });
+    expect(warnsOf(await store.getNote(t.id), "unresolved_reference")).toHaveLength(0);
+    expect(later).toBeTruthy();
+  });
+  it("no change for reference fields without target_tags", async () => {
+    await store.upsertTagRecord("plain", { fields: { ref: { type: "reference" } } });
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["plain"], metadata: { ref: "P/bob" } });
+    expect(store.validateNoteAgainstSchemas({ tags: t.tags, metadata: t.metadata })?.warnings).toEqual([]);
+  });
+  it("checks each element of a cardinality:many field", async () => {
+    await store.upsertTagRecord("multi", {
+      fields: { nodes: { type: "reference", cardinality: "many", target_tags: ["node"] } },
+    });
+    await store.createNote("x", { path: "N/a", tags: ["node"] });
+    await store.createNote("y", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["multi"], metadata: { nodes: ["N/a", "P/bob"] } });
+    expect(warnsOf(t, "target_tag_mismatch")).toHaveLength(1);
+  });
+  it("read-time validation_status (query-notes) shows it", async () => {
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    await store.createNote("t", { path: "T/1", tags: ["task"], metadata: { node: "P/bob" } });
+    const tools = generateMcpTools(store);
+    const q = tools.find((x: any) => x.name === "query-notes")!;
+    const r: any = await q.execute({ id: "T/1" });
+    expect(r.validation_status.warnings.map((w: any) => w.reason)).toContain("target_tag_mismatch");
+  });
+  it("update-tag rejects malformed target_tags", async () => {
+    const tools = generateMcpTools(store);
+    const ut = tools.find((x: any) => x.name === "update-tag")!;
+    await expect(ut.execute({ tag: "bad", fields: { f: { type: "reference", target_tags: "node" } } })).rejects.toThrow(/target_tags/);
+    await expect(ut.execute({ tag: "bad", fields: { f: { type: "string", target_tags: ["node"] } } })).rejects.toThrow(/target_tags/);
+  });
+  it("list-tags schema output exposes target_tags", async () => {
+    const tools = generateMcpTools(store);
+    const lt = tools.find((x: any) => x.name === "list-tags")!;
+    const r: any = await lt.execute({ tag: "task" });
+    expect(r.fields.node.target_tags).toEqual(["node"]);
+  });
+});
