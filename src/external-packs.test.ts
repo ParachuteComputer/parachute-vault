@@ -89,6 +89,16 @@ describe("external packs", () => {
       expect(() => validateManifest({ ...pack(), ...patch })).toThrow();
     }
   });
+  test("reference fields may declare target_tags (vault#780); malformed target_tags rejected", async () => {
+    const withTargets = (spec: any): PackManifest => ({ ...pack(), tags: [{ name: "node", description: "Node" }, { name: "event", description: "Events", fields: { start: { type: "date", indexed: true }, node: spec } }] });
+    expect(() => validateManifest(withTargets({ type: "reference", indexed: true, target_tags: ["node"] }))).not.toThrow();
+    for (const bad of [{ type: "reference", target_tags: [] }, { type: "reference", target_tags: "node" }, { type: "reference", target_tags: [1] }, { type: "string", target_tags: ["node"] }]) {
+      expect(() => validateManifest(withTargets(bad))).toThrow();
+    }
+    await installPack(store, dir, withTargets({ type: "reference", target_tags: ["node"] }));
+    const schema: any = await store.getTagSchema("event");
+    expect(schema.fields.node.target_tags).toEqual(["node"]);
+  });
   test("JSON, YAML, directory, URL and HTTP failures", async () => {
     const p = pack(); writeFileSync(join(dir, "module.json"), JSON.stringify(p));
     expect(await loadManifest(dir)).toEqual(p);

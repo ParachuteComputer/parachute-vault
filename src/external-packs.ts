@@ -52,11 +52,12 @@ export function validateManifest(v: unknown): PackManifest {
       for (const [name, spec] of Object.entries(tag.fields)) {
         validateFieldName(name);
         check(object(spec) && typeof spec.type === "string", "field type required");
-        keys(spec, ["type", "description", "enum", "indexed", "strict", "required", "cardinality", "default"]);
+        keys(spec, ["type", "description", "enum", "indexed", "strict", "required", "cardinality", "default", "target_tags"]);
         for (const flag of ["indexed", "strict", "required"]) check(spec[flag] === undefined || typeof spec[flag] === "boolean", `${flag} must be boolean`);
         check(spec.description === undefined || typeof spec.description === "string", "field description must be text");
         check(spec.enum === undefined || strings(spec.enum), "enum must be strings");
         check(spec.cardinality === undefined || ["one", "many"].includes(spec.cardinality), "invalid cardinality");
+        check(spec.target_tags === undefined || (strings(spec.target_tags) && spec.target_tags.length > 0 && spec.type === "reference"), "target_tags must be a non-empty string array on a reference field");
       }
       check(collectOwnFieldDefaultAndTypeViolations(tag.fields).length === 0, "invalid field type/default");
     }
