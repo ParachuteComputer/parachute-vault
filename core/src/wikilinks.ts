@@ -292,9 +292,9 @@ export function resolveWikilink(db: Database, target: string): string | null {
     WHERE path IS NOT NULL
       AND (
         path = ? COLLATE NOCASE
-        OR path LIKE ? COLLATE NOCASE
+        OR lower(substr(path, -length(?))) = lower(?)
       )
-  `).all(target, `%/${target}`) as { id: string }[];
+  `).all(target, `/${target}`, `/${target}`) as { id: string }[];
 
   if (basename.length === 1) return basename[0]!.id;
   if (basename.length > 1) return null; // ambiguous basename — don't fall through to title
@@ -357,9 +357,9 @@ export function resolveWikilinkDetailed(db: Database, target: string): WikilinkR
     WHERE path IS NOT NULL
       AND (
         path = ? COLLATE NOCASE
-        OR path LIKE ? COLLATE NOCASE
+        OR lower(substr(path, -length(?))) = lower(?)
       )
-  `).all(target, `%/${target}`) as { id: string; path: string }[];
+  `).all(target, `/${target}`, `/${target}`) as { id: string; path: string }[];
 
   if (basename.length === 1) {
     return { resolved: true, note_id: basename[0]!.id, path: basename[0]!.path, candidates: [] };
@@ -1006,7 +1006,7 @@ export function resolveUnresolvedWikilinks(
     rows = db.prepare(`
       SELECT source_id, target_path, relationship FROM unresolved_wikilinks
       WHERE target_path = ? COLLATE NOCASE
-         OR ? LIKE '%/' || target_path
+         OR lower(substr(?, -(length(target_path) + 1))) = lower('/' || target_path)
          OR target_path = ? COLLATE NOCASE
          OR target_path = ? COLLATE NOCASE
          OR target_path = ?
